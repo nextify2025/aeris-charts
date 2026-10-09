@@ -20,7 +20,7 @@ use aeris_charts_render::draw_list::LineStyle;
 use aeris_charts_render::shape::{self, Point};
 
 use super::super::geometry::CURVE_TOLERANCE;
-use super::super::parts::{text_on, DrawingParts, PartContext, PartLabel, PartStroke};
+use super::super::parts::{DrawingParts, PartContext, PartLabel, PartStroke, text_on};
 use super::super::{Drawing, DrawingTextHAlign, DrawingTextVAlign};
 use crate::{ChartEngine, DrawingKind, DrawingPropertyDescriptor, DrawingPropertyType};
 

@@ -17,16 +17,16 @@ use aeris_charts_render::line::{
 use std::fmt::Write;
 
 use super::{POSITION_ENTRY, PRIMARY};
-use crate::drawings::handles::{handle_set, DrawingHandle, HandleShape};
+use crate::drawings::handles::{DrawingHandle, HandleShape, handle_set};
 use crate::drawings::kinds::patterns_elliott_cycles::{self, PatternLayer};
-use crate::drawings::kinds::projection_annotations::{self, built_in_icon_parts, DrawingIcon};
+use crate::drawings::kinds::projection_annotations::{self, DrawingIcon, built_in_icon_parts};
 use crate::drawings::kinds::{channels, fibonacci, lines, pitchforks_gann, shapes};
 use crate::drawings::{
-    arrow_cap_triangle, cap_radius, closed_outline, curve_clip, ellipse_outline, level_band_pairs,
-    resolve_drawing_geometry, Drawing, DrawingBodyGeometry, DrawingGeometryOptions,
-    DrawingHandleMode, DrawingId, DrawingKind, DrawingPart, DrawingParts, DrawingTextHAlign,
-    DrawingTextLayout, FibonacciArcGeometry, PartContext, PositionGeometry, PositionZone,
-    TextBlock, TimeLevelGeometry, TEXT_CHROME_PAD, TEXT_PAD, TREND_TEXT_PLACEHOLDER,
+    Drawing, DrawingBodyGeometry, DrawingGeometryOptions, DrawingHandleMode, DrawingId,
+    DrawingKind, DrawingPart, DrawingParts, DrawingTextHAlign, DrawingTextLayout,
+    FibonacciArcGeometry, PartContext, PositionGeometry, PositionZone, TEXT_CHROME_PAD, TEXT_PAD,
+    TREND_TEXT_PLACEHOLDER, TextBlock, TimeLevelGeometry, arrow_cap_triangle, cap_radius,
+    closed_outline, curve_clip, ellipse_outline, level_band_pairs, resolve_drawing_geometry,
 };
 use crate::{ChartEngine, FibonacciLabelVAlign};
 use aeris_charts_core::model::plot_list::PlotValueIndex;
@@ -229,8 +229,10 @@ mod trend_label_tests {
                     let (from_x, from_y) = (x - start.0, y - start.1);
                     assert!((from_x * ux + from_y * uy - expected_distance).abs() < 1e-9);
                     assert!((from_x * uy - from_y * ux - expected_normal).abs() < 1e-9);
-                    assert!((-std::f64::consts::FRAC_PI_2..=std::f64::consts::FRAC_PI_2)
-                        .contains(&angle));
+                    assert!(
+                        (-std::f64::consts::FRAC_PI_2..=std::f64::consts::FRAC_PI_2)
+                            .contains(&angle)
+                    );
                 }
             }
         }
@@ -364,13 +366,13 @@ impl ChartEngine {
             }
             write!(label, "{:.1}%", value * 100.0).expect("formatting a String cannot fail");
         }
-        if drawing.level_show_prices {
-            if let Some(price) = price.filter(|price| price.is_finite()) {
-                if !label.is_empty() {
-                    label.push_str(" · ");
-                }
-                label.push_str(&self.price_formatter.format(price));
+        if drawing.level_show_prices
+            && let Some(price) = price.filter(|price| price.is_finite())
+        {
+            if !label.is_empty() {
+                label.push_str(" · ");
             }
+            label.push_str(&self.format_drawing_price(drawing, price));
         }
         (!label.is_empty()).then_some(label)
     }
@@ -662,195 +664,183 @@ impl ChartEngine {
         *preview_start = (out.len(), points.len());
         // Live brush stroke: the decimated points so far paint as the same smooth curve the
         // commit will store, so what the user sees while dragging is what they get.
-        if let Some(capture) = self.brush_capture() {
-            if capture.pane_index == pane_index && capture.points.len() >= 2 {
-                let px: Option<Vec<(f64, f64)>> = capture
-                    .points
-                    .iter()
-                    .map(|&point| self.drawing_to_px(pane_index, point))
-                    .collect();
-                if let Some(px) = px {
-                    let px: Vec<(f64, f64)> =
-                        px.into_iter().map(|(x, y)| (x * hpr, y * vpr)).collect();
-                    self.build_drawing_prims(&capture.options, &px, pane_w_px, vpr, out, points);
-                }
+        if let Some(capture) = self.brush_capture()
+            && capture.pane_index == pane_index
+            && capture.points.len() >= 2
+        {
+            let px: Option<Vec<(f64, f64)>> = capture
+                .points
+                .iter()
+                .map(|&point| self.drawing_to_px(pane_index, point))
+                .collect();
+            if let Some(px) = px {
+                let px: Vec<(f64, f64)> = px.into_iter().map(|(x, y)| (x * hpr, y * vpr)).collect();
+                self.build_drawing_prims(&capture.options, &px, pane_w_px, vpr, out, points);
             }
         }
         // Interactive creation: committed anchors plus the preview point render as a tentative
         // drawing, with handles on the committed anchors (the reference rectangle-drawing-tool's
         // PreviewRectangle — same geometry, shown while placing).
-        if let Some(pending) = self.pending_drawing() {
-            if pending.drawing.pane_index == pane_index {
-                let mut anchors = pending.drawing.points.clone();
-                let is_sequence = pending.drawing.kind.spec().placement.is_sequence();
-                if let Some(preview) = pending.preview {
-                    if is_sequence || anchors.len() < pending.drawing.kind.anchor_count() {
-                        anchors.push(preview);
-                        // The preview already keeps a linked coordinate shared, as the result will.
-                        let last = anchors.len() - 1;
-                        pending
-                            .drawing
-                            .kind
-                            .spec()
-                            .anchor_link
-                            .apply(&mut anchors, last);
+        if let Some(pending) = self.pending_drawing()
+            && pending.drawing.pane_index == pane_index
+        {
+            let mut anchors = pending.drawing.points.clone();
+            let is_sequence = pending.drawing.kind.spec().placement.is_sequence();
+            if let Some(preview) = pending.preview
+                && (is_sequence || anchors.len() < pending.drawing.kind.anchor_count())
+            {
+                anchors.push(preview);
+                // The preview already keeps a linked coordinate shared, as the result will.
+                let last = anchors.len() - 1;
+                pending
+                    .drawing
+                    .kind
+                    .spec()
+                    .anchor_link
+                    .apply(&mut anchors, last);
+            }
+            // Families that resolve partial anchors preview from the second anchor on, and
+            // so do the patterns and Elliott waves: their legs, labels, ratios and fills
+            // resolve from any prefix of their anchors (owner decision P5).
+            let kind = pending.drawing.kind;
+            let partial = anchors.len() >= 2
+                && (kind
+                    .spec()
+                    .family
+                    .is_some_and(|family| family.partial_preview)
+                    || kind.vertex_labels().is_some());
+            let ready = if is_sequence {
+                anchors.len() >= pending.drawing.kind.anchor_count()
+            } else {
+                anchors.len() == pending.drawing.kind.anchor_count() || partial
+            };
+            if ready {
+                // Semantic statistics (measure direction, labels, angles) and derived
+                // geometry read the full placed-plus-preview anchor set, exactly as the
+                // commit will store it.
+                let mut preview_drawing = pending.drawing.clone();
+                preview_drawing.points.clone_from(&anchors);
+                // A tool placed through points on its geometry previews the anchors its
+                // clicks will store (an arc ends first, a curve through its on-curve
+                // points); its handles stay on the placed clicks.
+                let through = shapes::places_through(kind) && anchors.len() == kind.anchor_count();
+                if through {
+                    // A click without px previews nothing (the commit refuses it too).
+                    preview_drawing.points =
+                        shapes::placement_anchors(self, &preview_drawing, &anchors)
+                            .unwrap_or_default();
+                }
+                if preview_drawing.kind == DrawingKind::AnchoredText {
+                    // Anchored text paints at its screen position, which follows the
+                    // pointer while placing exactly as the commit will set it.
+                    if let Some((sx, sy)) = anchors.last().and_then(|&point| {
+                        self.anchored_text_screen_position(
+                            pane_index,
+                            preview_drawing.price_scale,
+                            point,
+                        )
+                    }) {
+                        preview_drawing.screen_x = sx;
+                        preview_drawing.screen_y = sy;
                     }
                 }
-                // Families that resolve partial anchors preview from the second anchor on, and
-                // so do the patterns and Elliott waves: their legs, labels, ratios and fills
-                // resolve from any prefix of their anchors (owner decision P5).
-                let kind = pending.drawing.kind;
-                let partial = anchors.len() >= 2
-                    && (kind
-                        .spec()
-                        .family
-                        .is_some_and(|family| family.partial_preview)
-                        || kind.vertex_labels().is_some());
-                let ready = if is_sequence {
-                    anchors.len() >= pending.drawing.kind.anchor_count()
-                } else {
-                    anchors.len() == pending.drawing.kind.anchor_count() || partial
-                };
-                if ready {
-                    // Semantic statistics (measure direction, labels, angles) and derived
-                    // geometry read the full placed-plus-preview anchor set, exactly as the
-                    // commit will store it.
-                    let mut preview_drawing = pending.drawing.clone();
-                    preview_drawing.points.clone_from(&anchors);
-                    // A tool placed through points on its geometry previews the anchors its
-                    // clicks will store (an arc ends first, a curve through its on-curve
-                    // points); its handles stay on the placed clicks.
-                    let through =
-                        shapes::places_through(kind) && anchors.len() == kind.anchor_count();
-                    if through {
-                        // A click without px previews nothing (the commit refuses it too).
-                        preview_drawing.points =
-                            shapes::placement_anchors(self, &preview_drawing, &anchors)
-                                .unwrap_or_default();
+                if let Some(media) = self.drawing_render_px(&preview_drawing) {
+                    let px: Vec<(f64, f64)> =
+                        media.iter().map(|&(x, y)| (x * hpr, y * vpr)).collect();
+                    if preview_drawing.kind.spec().handles == DrawingHandleMode::RectangleBounds
+                        && let Some(fill) = preview_drawing.preview_fill_color.clone()
+                    {
+                        preview_drawing.fill_color = Some(fill);
                     }
-                    if preview_drawing.kind == DrawingKind::AnchoredText {
-                        // Anchored text paints at its screen position, which follows the
-                        // pointer while placing exactly as the commit will set it.
-                        if let Some((sx, sy)) = anchors.last().and_then(|&point| {
-                            self.anchored_text_screen_position(
-                                pane_index,
-                                preview_drawing.price_scale,
-                                point,
-                            )
-                        }) {
-                            preview_drawing.screen_x = sx;
-                            preview_drawing.screen_y = sy;
-                        }
+                    self.build_drawing_prims(&preview_drawing, &px, pane_w_px, vpr, out, points);
+                    if pending.drawing.kind.spec().handles == DrawingHandleMode::RectangleBounds {
+                        // the public reference shows all eight anchors while the rectangle is being
+                        // drawn (committed corner + live preview corner), not only after
+                        // the commit.
+                        let handles = handle_set(DrawingHandleMode::RectangleBounds, &px);
+                        build_handles(&handles, vpr, self.anchor_fill(), out);
+                    } else if through {
+                        // Discs on the clicks placed so far, not on the stored anchors
+                        // (control points off the curve).
+                        let placed = pending
+                            .drawing
+                            .points
+                            .iter()
+                            .map(|&point| {
+                                self.drawing_point_px(&pending.drawing, point)
+                                    .map(|(x, y)| (x * hpr, y * vpr))
+                            })
+                            .collect::<Option<Vec<_>>>()
+                            .unwrap_or_default();
+                        build_anchor_handles(&placed, vpr, self.anchor_fill(), out);
+                    } else {
+                        // The placed anchors' handles, where the family paints them on the
+                        // previewed geometry; derived handles wait for the committed
+                        // drawing, and derived render points (a regression's fitted band)
+                        // never become handles.
+                        let placed = pending.drawing.points.len();
+                        let anchor_px = &media[..preview_drawing.points.len().min(media.len())];
+                        let handles: Vec<(f64, f64)> = self
+                            .drawing_handle_set(&preview_drawing, anchor_px)
+                            .into_iter()
+                            .filter(|handle| {
+                                matches!(
+                                    handle.part,
+                                    crate::DrawingDragPart::Anchor(index) if index < placed
+                                )
+                            })
+                            .map(|handle| (handle.point.0 * hpr, handle.point.1 * vpr))
+                            .collect();
+                        build_anchor_handles(&handles, vpr, self.anchor_fill(), out);
                     }
-                    if let Some(media) = self.drawing_render_px(&preview_drawing) {
-                        let px: Vec<(f64, f64)> =
-                            media.iter().map(|&(x, y)| (x * hpr, y * vpr)).collect();
-                        if preview_drawing.kind.spec().handles == DrawingHandleMode::RectangleBounds
-                        {
-                            if let Some(fill) = preview_drawing.preview_fill_color.clone() {
-                                preview_drawing.fill_color = Some(fill);
-                            }
-                        }
-                        self.build_drawing_prims(
-                            &preview_drawing,
-                            &px,
-                            pane_w_px,
-                            vpr,
+                }
+            } else if !anchors.is_empty() {
+                // Fewer anchors than the tool needs: a two-anchor kind before the preview
+                // resolves shows its first anchor as a handle alone; a tool of three or more
+                // anchors between clicks also runs a guide polyline in the drawing's stroke
+                // through its placed anchors to the pointer, so every click leaves visible
+                // ink.
+                let px: Option<Vec<(f64, f64)>> = anchors
+                    .iter()
+                    .map(|&point| {
+                        self.drawing_to_px_for(pane_index, pending.drawing.price_scale, point)
+                            .map(|(x, y)| (x * hpr, y * vpr))
+                    })
+                    .collect();
+                if let (Some(px), Some(pane)) = (px, self.panes.get(pane_index)) {
+                    if px.len() >= 2 {
+                        let clip = aeris_charts_render::shape::Rect {
+                            left: 0.0,
+                            top: pane.top * vpr,
+                            right: f64::from(pane_w_px),
+                            bottom: (pane.top + pane.height) * vpr,
+                        };
+                        push_clipped_stroke(
                             out,
                             points,
+                            &px,
+                            clip,
+                            (
+                                (pending.drawing.width * vpr) as f32,
+                                pending.drawing.style,
+                                pending.drawing.stroke_color(),
+                            ),
+                            &mut Vec::new(),
                         );
-                        if pending.drawing.kind.spec().handles == DrawingHandleMode::RectangleBounds
-                        {
-                            // the public reference shows all eight anchors while the rectangle is being
-                            // drawn (committed corner + live preview corner), not only after
-                            // the commit.
-                            let handles = handle_set(DrawingHandleMode::RectangleBounds, &px);
-                            build_handles(&handles, vpr, self.anchor_fill(), out);
-                        } else if through {
-                            // Discs on the clicks placed so far, not on the stored anchors
-                            // (control points off the curve).
-                            let placed = pending
-                                .drawing
-                                .points
-                                .iter()
-                                .map(|&point| {
-                                    self.drawing_point_px(&pending.drawing, point)
-                                        .map(|(x, y)| (x * hpr, y * vpr))
-                                })
-                                .collect::<Option<Vec<_>>>()
-                                .unwrap_or_default();
-                            build_anchor_handles(&placed, vpr, self.anchor_fill(), out);
-                        } else {
-                            // The placed anchors' handles, where the family paints them on the
-                            // previewed geometry; derived handles wait for the committed
-                            // drawing, and derived render points (a regression's fitted band)
-                            // never become handles.
-                            let placed = pending.drawing.points.len();
-                            let anchor_px = &media[..preview_drawing.points.len().min(media.len())];
-                            let handles: Vec<(f64, f64)> = self
-                                .drawing_handle_set(&preview_drawing, anchor_px)
-                                .into_iter()
-                                .filter(|handle| {
-                                    matches!(
-                                        handle.part,
-                                        crate::DrawingDragPart::Anchor(index) if index < placed
-                                    )
-                                })
-                                .map(|handle| (handle.point.0 * hpr, handle.point.1 * vpr))
-                                .collect();
-                            build_anchor_handles(&handles, vpr, self.anchor_fill(), out);
-                        }
                     }
-                } else if !anchors.is_empty() {
-                    // Fewer anchors than the tool needs: a two-anchor kind before the preview
-                    // resolves shows its first anchor as a handle alone; a tool of three or more
-                    // anchors between clicks also runs a guide polyline in the drawing's stroke
-                    // through its placed anchors to the pointer, so every click leaves visible
-                    // ink.
-                    let px: Option<Vec<(f64, f64)>> = anchors
-                        .iter()
-                        .map(|&point| {
-                            self.drawing_to_px_for(pane_index, pending.drawing.price_scale, point)
-                                .map(|(x, y)| (x * hpr, y * vpr))
-                        })
-                        .collect();
-                    if let (Some(px), Some(pane)) = (px, self.panes.get(pane_index)) {
-                        if px.len() >= 2 {
-                            let clip = aeris_charts_render::shape::Rect {
-                                left: 0.0,
-                                top: pane.top * vpr,
-                                right: f64::from(pane_w_px),
-                                bottom: (pane.top + pane.height) * vpr,
-                            };
-                            push_clipped_stroke(
-                                out,
-                                points,
-                                &px,
-                                clip,
-                                (
-                                    (pending.drawing.width * vpr) as f32,
-                                    pending.drawing.style,
-                                    pending.drawing.stroke_color(),
-                                ),
-                                &mut Vec::new(),
-                            );
-                        }
-                        let placed = pending.drawing.points.len().clamp(1, px.len());
-                        build_anchor_handles(&px[..placed], vpr, self.anchor_fill(), out);
-                    }
+                    let placed = pending.drawing.points.len().clamp(1, px.len());
+                    build_anchor_handles(&px[..placed], vpr, self.anchor_fill(), out);
                 }
             }
         }
         // The transient Shift-click measure paints the date-and-price range geometry without
         // handles; it is never a committed drawing.
-        if let Some(session) = self.measure_session() {
-            if session.drawing.pane_index == pane_index {
-                if let Some(px) = self.drawing_px(&session.drawing) {
-                    let px: Vec<(f64, f64)> =
-                        px.into_iter().map(|(x, y)| (x * hpr, y * vpr)).collect();
-                    self.build_drawing_prims(&session.drawing, &px, pane_w_px, vpr, out, points);
-                }
-            }
+        if let Some(session) = self.measure_session()
+            && session.drawing.pane_index == pane_index
+            && let Some(px) = self.drawing_px(&session.drawing)
+        {
+            let px: Vec<(f64, f64)> = px.into_iter().map(|(x, y)| (x * hpr, y * vpr)).collect();
+            self.build_drawing_prims(&session.drawing, &px, pane_w_px, vpr, out, points);
         }
     }
 
@@ -1280,15 +1270,15 @@ impl ChartEngine {
                             color: level_color,
                         });
                     }
-                    if level.label_visible {
-                        if let Some(label) = self.fibonacci_level_label(
+                    if level.label_visible
+                        && let Some(label) = self.fibonacci_level_label(
                             drawing,
                             ((x0, y0), (x1, y1)),
                             level.value,
                             vpr,
-                        ) {
-                            self.push_level_label(drawing, label, level_color, vpr, out);
-                        }
+                        )
+                    {
+                        self.push_level_label(drawing, label, level_color, vpr, out);
                     }
                 }
             }
@@ -1333,12 +1323,11 @@ impl ChartEngine {
                         style,
                         color: level_color,
                     });
-                    if level.label_visible {
-                        if let Some(label) =
+                    if level.label_visible
+                        && let Some(label) =
                             self.time_level_label(drawing, time, x, level.value, vpr)
-                        {
-                            self.push_level_label(drawing, label, level_color, vpr, out);
-                        }
+                    {
+                        self.push_level_label(drawing, label, level_color, vpr, out);
                     }
                 }
             }
@@ -1456,10 +1445,10 @@ impl ChartEngine {
                             color: level_color,
                         });
                     }
-                    if level.label_visible {
-                        if let Some(label) = self.arc_level_label(drawing, arcs, level.value, vpr) {
-                            self.push_level_label(drawing, label, level_color, vpr, out);
-                        }
+                    if level.label_visible
+                        && let Some(label) = self.arc_level_label(drawing, arcs, level.value, vpr)
+                    {
+                        self.push_level_label(drawing, label, level_color, vpr, out);
                     }
                 }
             }
@@ -1526,19 +1515,19 @@ impl ChartEngine {
                     .unwrap_or(Color::rgba(color.r(), color.g(), color.b(), 24));
                 let mut previous_x: Option<f64> = None;
                 cycles.for_each_visible_line(|index, x| {
-                    if drawing.fill_enabled && index % 2 != 0 {
-                        if let Some(prior_x) = previous_x {
-                            out.push(Prim::Rect {
-                                rect: IRect {
-                                    x: prior_x.min(x).round() as i32,
-                                    y: cycles.pane_top.round().max(0.0) as i32,
-                                    w: (x - prior_x).abs().round().max(1.0) as i32,
-                                    h: (cycles.pane_bottom - cycles.pane_top).round().max(1.0)
-                                        as i32,
-                                },
-                                color: fill,
-                            });
-                        }
+                    if drawing.fill_enabled
+                        && index % 2 != 0
+                        && let Some(prior_x) = previous_x
+                    {
+                        out.push(Prim::Rect {
+                            rect: IRect {
+                                x: prior_x.min(x).round() as i32,
+                                y: cycles.pane_top.round().max(0.0) as i32,
+                                w: (x - prior_x).abs().round().max(1.0) as i32,
+                                h: (cycles.pane_bottom - cycles.pane_top).round().max(1.0) as i32,
+                            },
+                            color: fill,
+                        });
                     }
                     previous_x = Some(x);
                 });
@@ -1598,7 +1587,7 @@ impl ChartEngine {
             }
             DrawingBodyGeometry::PriceLabel { x, y } => {
                 let label = if drawing.text.is_empty() {
-                    self.price_formatter.format(drawing.points[0].price)
+                    self.format_drawing_price(drawing, drawing.points[0].price)
                 } else {
                     drawing.text.clone()
                 };
@@ -1712,48 +1701,48 @@ impl ChartEngine {
                     let mut prior_fan: Option<(f64, f64)> = None;
                     for level in drawing.gann_fans.iter().filter(|level| level.visible) {
                         let (fan_start, end) = grid.fan_segment(level.value, drawing.level_reverse);
-                        if level.fill_between {
-                            if let Some(previous) = prior_fan {
-                                out.push(Prim::Triangle {
-                                    a: [fan_start.0 as f32, fan_start.1 as f32],
-                                    b: [previous.0 as f32, previous.1 as f32],
-                                    c: [end.0 as f32, end.1 as f32],
-                                    color: Self::drawing_level_fill(level, color),
-                                });
-                            }
+                        if level.fill_between
+                            && let Some(previous) = prior_fan
+                        {
+                            out.push(Prim::Triangle {
+                                a: [fan_start.0 as f32, fan_start.1 as f32],
+                                b: [previous.0 as f32, previous.1 as f32],
+                                c: [end.0 as f32, end.1 as f32],
+                                color: Self::drawing_level_fill(level, color),
+                            });
                         }
                         prior_fan = Some(end);
                     }
                     let mut prior_arc: Option<f64> = None;
                     for level in drawing.gann_arcs.iter().filter(|level| level.visible) {
-                        if level.fill_between {
-                            if let Some(previous) = prior_arc {
-                                let upper_first = points.len() as u32;
-                                for step in 0..=32 {
-                                    let p = grid.arc_point(
-                                        previous,
-                                        f64::from(step) / 32.0,
-                                        drawing.level_reverse,
-                                    );
-                                    points.push([p.0 as f32, p.1 as f32]);
-                                }
-                                let lower_first = points.len() as u32;
-                                for step in 0..=32 {
-                                    let p = grid.arc_point(
-                                        level.value,
-                                        f64::from(step) / 32.0,
-                                        drawing.level_reverse,
-                                    );
-                                    points.push([p.0 as f32, p.1 as f32]);
-                                }
-                                out.push(Prim::BandFill {
-                                    upper_first,
-                                    lower_first,
-                                    point_count: 33,
-                                    line_type: LineType::Simple,
-                                    fill: Self::drawing_level_fill(level, color),
-                                });
+                        if level.fill_between
+                            && let Some(previous) = prior_arc
+                        {
+                            let upper_first = points.len() as u32;
+                            for step in 0..=32 {
+                                let p = grid.arc_point(
+                                    previous,
+                                    f64::from(step) / 32.0,
+                                    drawing.level_reverse,
+                                );
+                                points.push([p.0 as f32, p.1 as f32]);
                             }
+                            let lower_first = points.len() as u32;
+                            for step in 0..=32 {
+                                let p = grid.arc_point(
+                                    level.value,
+                                    f64::from(step) / 32.0,
+                                    drawing.level_reverse,
+                                );
+                                points.push([p.0 as f32, p.1 as f32]);
+                            }
+                            out.push(Prim::BandFill {
+                                upper_first,
+                                lower_first,
+                                point_count: 33,
+                                line_type: LineType::Simple,
+                                fill: Self::drawing_level_fill(level, color),
+                            });
                         }
                         prior_arc = Some(level.value);
                     }
@@ -1849,20 +1838,20 @@ impl ChartEngine {
                         line_type: LineType::Simple,
                         color: level_color,
                     });
-                    if level.label_visible {
-                        if let Some(text) = self.drawing_level_label(drawing, level.value, None) {
-                            out.push(Prim::Text {
-                                x: x as f32,
-                                y: (box_bounds.top - 8.0 * vpr) as f32,
-                                text,
-                                color: level_color,
-                                size: (self.options.get().layout.font_size * vpr) as f32,
-                                family: self.options.get().layout.font_family.clone(),
-                                align: TextAlign::Center,
-                                weight: drawing.text_weight.unwrap_or(400),
-                                italic: drawing.text_italic,
-                            });
-                        }
+                    if level.label_visible
+                        && let Some(text) = self.drawing_level_label(drawing, level.value, None)
+                    {
+                        out.push(Prim::Text {
+                            x: x as f32,
+                            y: (box_bounds.top - 8.0 * vpr) as f32,
+                            text,
+                            color: level_color,
+                            size: (self.options.get().layout.font_size * vpr) as f32,
+                            family: self.options.get().layout.font_family.clone(),
+                            align: TextAlign::Center,
+                            weight: drawing.text_weight.unwrap_or(400),
+                            italic: drawing.text_italic,
+                        });
                     }
                 }
                 // A box strokes its `tool_options.gann.angles` while `show_angles` is on; a
@@ -2275,7 +2264,7 @@ impl ChartEngine {
                         .collect::<Vec<_>>();
                     aeris_charts_render::shape::tube_ribbon(
                         &expanded,
-                        f64::from(stroke.0 .0) / 2.0,
+                        f64::from(stroke.0.0) / 2.0,
                         HIGHLIGHTER_TUBE_TOLERANCE,
                         stroke.1,
                         &mut tube,
@@ -2299,29 +2288,30 @@ impl ChartEngine {
                         points,
                         line_points,
                         line_type,
-                        (stroke.0 .0, stroke.0 .1, color),
+                        (stroke.0.0, stroke.0.1, color),
                         stroke.1,
                     );
                 }
-                if let (Some(first), Some(last)) = (line_points.first(), line_points.last()) {
-                    if line_points.len() >= 2 && wave {
-                        push_drawing_cap(
-                            drawing.stroke_start,
-                            *first,
-                            line_points[1],
-                            drawing.width * vpr,
-                            color,
-                            out,
-                        );
-                        push_drawing_cap(
-                            drawing.stroke_end,
-                            *last,
-                            line_points[line_points.len() - 2],
-                            drawing.width * vpr,
-                            color,
-                            out,
-                        );
-                    }
+                if let (Some(first), Some(last)) = (line_points.first(), line_points.last())
+                    && line_points.len() >= 2
+                    && wave
+                {
+                    push_drawing_cap(
+                        drawing.stroke_start,
+                        *first,
+                        line_points[1],
+                        drawing.width * vpr,
+                        color,
+                        out,
+                    );
+                    push_drawing_cap(
+                        drawing.stroke_end,
+                        *last,
+                        line_points[line_points.len() - 2],
+                        drawing.width * vpr,
+                        color,
+                        out,
+                    );
                 }
                 if let Some(terminal) = terminal {
                     let first_point = points.len() as u32;
@@ -2400,25 +2390,40 @@ impl ChartEngine {
                     projection_annotations::forecast_parts,
                 );
             }
-        } else if drawing.kind == DrawingKind::Forecast {
-            if let (Some(entry), Some(target)) = (drawing.points.first(), px.get(1)) {
-                let change = drawing.points[1].price - entry.price;
-                let percent = if entry.price.abs() > f64::EPSILON {
-                    change / entry.price.abs() * 100.0
-                } else {
-                    0.0
-                };
-                let result = match self.forecast_result(drawing) {
-                    Some(true) => "target reached",
-                    Some(false) => "expired",
-                    None => "pending",
-                };
-                let size = self.options.get().layout.font_size * vpr;
-                let label_y = target.1 - 10.0 * vpr;
+        } else if drawing.kind == DrawingKind::Forecast
+            && let (Some(entry), Some(target)) = (drawing.points.first(), px.get(1))
+        {
+            let change = drawing.points[1].price - entry.price;
+            let percent = if entry.price.abs() > f64::EPSILON {
+                change / entry.price.abs() * 100.0
+            } else {
+                0.0
+            };
+            let result = match self.forecast_result(drawing) {
+                Some(true) => "target reached",
+                Some(false) => "expired",
+                None => "pending",
+            };
+            let size = self.options.get().layout.font_size * vpr;
+            let label_y = target.1 - 10.0 * vpr;
+            out.push(Prim::Text {
+                x: target.0 as f32,
+                y: label_y as f32,
+                text: format!("{:+.1}% · {}", percent, result),
+                color,
+                size: size as f32,
+                family: self.options.get().layout.font_family.clone(),
+                align: TextAlign::Center,
+                weight: drawing.text_weight.unwrap_or(400),
+                italic: drawing.text_italic,
+            });
+            // The fork's target time, kept on upstream's label: the target bar's time through
+            // the bar label (`bar_time_label`), one line above, while the axis has time.
+            if let Some(time) = self.drawing_anchor_time_of(drawing, 1) {
                 out.push(Prim::Text {
                     x: target.0 as f32,
-                    y: label_y as f32,
-                    text: format!("{:+.1}% · {}", percent, result),
+                    y: (label_y - size * 1.25) as f32,
+                    text: self.format_crosshair_ts(time.round() as i64),
                     color,
                     size: size as f32,
                     family: self.options.get().layout.font_family.clone(),
@@ -2426,21 +2431,6 @@ impl ChartEngine {
                     weight: drawing.text_weight.unwrap_or(400),
                     italic: drawing.text_italic,
                 });
-                // The fork's target time, kept on upstream's label: the target bar's time through
-                // the bar label (`bar_time_label`), one line above, while the axis has time.
-                if let Some(time) = self.drawing_anchor_time_of(drawing, 1) {
-                    out.push(Prim::Text {
-                        x: target.0 as f32,
-                        y: (label_y - size * 1.25) as f32,
-                        text: self.format_crosshair_ts(time.round() as i64),
-                        color,
-                        size: size as f32,
-                        family: self.options.get().layout.font_family.clone(),
-                        align: TextAlign::Center,
-                        weight: drawing.text_weight.unwrap_or(400),
-                        italic: drawing.text_italic,
-                    });
-                }
             }
         }
     }
@@ -3468,9 +3458,13 @@ impl ChartEngine {
                 let first = drawing.points.first().map_or(0.0, |point| point.price);
                 let second = drawing.points.get(1).map(|point| point.price);
                 match label.metric {
-                    crate::DrawingLabelMetric::Price => self.price_formatter.format(first),
+                    crate::DrawingLabelMetric::Price => self.format_drawing_price(drawing, first),
                     crate::DrawingLabelMetric::PriceChange => second
-                        .map(|value| self.price_formatter.format(value - first))
+                        .map(|value| {
+                            crate::drawings::unsigned_zero(
+                                self.format_drawing_price(drawing, value - first),
+                            )
+                        })
                         .unwrap_or_default(),
                     crate::DrawingLabelMetric::PercentChange => second
                         .filter(|_| first.abs() > f64::EPSILON)
@@ -3551,6 +3545,13 @@ impl ChartEngine {
         }
     }
 
+    /// A price-valued drawing text in the bound scale's price format through
+    /// [`ChartEngine::format_scale_price`]: the one owner for every price a drawing prints
+    /// (level and price labels, metrics, stats boxes, positions, ranges, Fibonacci, Gann).
+    pub(crate) fn format_drawing_price(&self, drawing: &Drawing, value: f64) -> String {
+        self.format_scale_price(drawing.pane_index, drawing.price_scale.target(), value)
+    }
+
     fn build_position_labels(
         &self,
         drawing: &Drawing,
@@ -3585,7 +3586,7 @@ impl ChartEngine {
             crate::DrawingPriceScale::Left => crate::PriceScaleTarget::Left,
             crate::DrawingPriceScale::Overlay => crate::PriceScaleTarget::Overlay,
         };
-        let format_price = |value: f64| self.drawing_price_text(drawing, value);
+        let format_price = |value: f64| self.format_drawing_price(drawing, value);
         let ticks = |from: f64, to: f64| {
             self.position_price_ticks_between(drawing.pane_index, drawing.price_scale, from, to)
                 .map_or_else(|| "—".to_string(), |ticks| position_stat_number(ticks, 0))
@@ -3726,7 +3727,7 @@ impl ChartEngine {
                 continue;
             };
 
-            // The progress origin is the first post-placement candle that actually reaches/crosses
+            // The progress pivot is the first post-placement candle that actually reaches/crosses
             // the entry. A position that has not filled emits no progress geometry at all.
             let Some((start_x, _)) =
                 self.drawing_to_px_for(pane_index, drawing.price_scale, run_start)

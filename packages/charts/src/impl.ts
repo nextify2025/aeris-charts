@@ -29,7 +29,8 @@ import type {
   depth_event_columns, depth_event_layer_options, depth_heatmap_options, depth_ladder_row, depth_options, depth_snapshot_columns, depth_study_snapshot, depth_update_columns,
   drawing_point, drawing_point_input, drawing_points_update, drawing_price_segment, drawing_magnet_mode,
   drawing_tool_change_handler, drawing_interval, drawing_property_schema, drawing_kind_options, drawing_template,
-  ema_ribbon_options, ema_ribbon_periods,
+  ema_ribbon_options, ema_ribbon_periods, kst_periods,
+  fair_value_gap_options, order_block_options, structure_break_on, structure_zone_options, study_calendar_policy, previous_period,
   feature_series_kind, frame_stats,
   footprint_bar, footprint_series_api, footprint_series_options, footprint_trade, footprint_trade_columns,
   general_accessibility_snapshot, general_axis_api, general_axis_options, general_axis_presentation_options, general_brush_snapshot, general_legend_snapshot, general_pane_options, general_reference_api, general_reference_options, general_reference_value, general_series_api, general_series_hit,
@@ -45,7 +46,7 @@ import type {
   price_scale_info, price_scale_options, ring_source_layout,
   series_api, series_change_handler, series_data, series_kind, series_merge_columns, series_merge_data, series_update_options,
   series_marker, series_marker_options, series_options, single_value_data, size_change_handler, time, time_range,
-  replay_clock_stats, replay_seek_stats, resample_options, synthetic_bar_options, trade_stream_stats,
+  replay_clock_stats, replay_seek_stats, resample_options, study_annotations, synthetic_bar_options, trade_stream_stats,
   profile_source, profile_request, profile_snapshot, naked_profile_level, tpo_request, tpo_snapshot, tpo_presentation_options,
   periodic_profile_presentation_request, periodic_profile_presentation_options,
   anchored_vwap_point, profile_drawing_options, profile_drawing_snapshot,
@@ -60,6 +61,9 @@ import type {
   baseline_mode, histogram_updown_rule, kdj_parameters, session_slot_options, time_tick_mark, time_alignment,
   legacy_resample_boundary, resample_boundary, resample_boundary_options, resample_series_options, resample_stats, resampled_bar,
   trade_session_options, business_day,
+  big_trades_api, big_trades_options, big_trades_snapshot,
+  auction_mark, auction_marker_options, auction_markers_api,
+  custom_study_definition, custom_study_fault_event, custom_study_binding_options,
 } from "./types.js";
 import {
   DRAWING_KIND_ALIASES, DRAWING_KIND_TO_U8, FEATURE_KIND_TO_U8, KIND_TO_U8, LINE_STYLE_TO_U8,
@@ -354,6 +358,11 @@ function countdown_timer_needed(
   series: readonly { countdown_visible?: boolean; has_data: boolean }[],
 ): boolean {
   return series.some((s) => s.countdown_visible === true && s.has_data);
+}
+
+/** Milliseconds past the current whole second of a countdown clock reading (UTC seconds). */
+function countdown_phase_ms(seconds: number): number {
+  return ((Math.floor(seconds * 1000) % 1000) + 1000) % 1000;
 }
 
 /**
@@ -4461,6 +4470,10 @@ export class chart_impl implements chart_api {
   exportState(): chart_state { return this.export_state(); }
   importState(...args: Parameters<chart_api["import_state"]>): persistence_restore_result { return this.import_state(...args); }
   private wasm_instance: AerisChart | null;
+  private guarded_wasm: AerisChart | null = null;
+  private custom_study_chart_guard_installed = false;
+  private in_custom_study_callback = false;
+  private readonly custom_study_fault_subs = new Set<(event: custom_study_fault_event) => void>();
   private next_extra_series = false;
   private readonly gestures_cfg: resolved_gestures = {
     pan: true,
@@ -4551,8 +4564,8 @@ export class chart_impl implements chart_api {
    */
   private text_editor_reposition: (() => void) | null = null;
   private anim_frame: number | null = null;
-  /** The 1s candle-close countdown interval; `null` while no countdown is visible. */
-  private countdown_timer: ReturnType<typeof setInterval> | null = null;
+  /** The pending second-aligned countdown tick; `null` while no countdown is visible. */
+  private countdown_timer: ReturnType<typeof setTimeout> | null = null;
   /** True while any pointer/touch is down — pauses the countdown tick so it can't repaint mid-gesture. */
   private interacting = false;
   /** Pending rAF handle for a coalesced repaint; `null` when no repaint is scheduled. */
@@ -4863,7 +4876,11 @@ export class chart_impl implements chart_api {
     this.plugin_resize_observer.observe(container);
   }
 
-  /** Internal package boundary. Every post-disposal operation fails with one stable error. */
+  /**
+   * Internal package boundary. Every post-disposal operation fails with one stable error; a call
+   * from a render-time host callback or a custom study callback fails instead of re-entering the
+   * engine. Charts with registered custom studies route calls through the fault-draining proxy.
+   */
   get wasm(): AerisChart {
     if (this.wasm_instance === null) {
       throw new AerisChartsError("disposed", "this chart has been disposed");
@@ -4875,7 +4892,11 @@ export class chart_impl implements chart_api {
         `chart APIs cannot be called from ${this.render_callback}, which runs while the chart renders`,
       );
     }
-    return this.wasm_instance;
+    if (this.in_custom_study_callback) {
+      // A custom study computes inside an engine rebuild: the same aliasing rule applies.
+      throw new AerisChartsError("reentrant_call", "chart APIs cannot be called during a custom study callback");
+    }
+    return this.guarded_wasm ?? this.wasm_instance;
   }
 
   /** The render-time host callback currently on the stack, if any. */
@@ -5194,7 +5215,7 @@ export class chart_impl implements chart_api {
   }
 
   /**
-   * Start or stop the 1s candle-close countdown interval to match whether any live series has
+   * Start or stop the 1s candle-close countdown timer to match whether any live series has
    * `countdown_visible` and data (industry-standard countdown row in the last-value cluster).
    * Central rebuild point: called from the series apply-options/set-data/remove paths and on
    * chart teardown. Ticks pin the engine clock and repaint; ticks are skipped while the
@@ -5219,18 +5240,30 @@ export class chart_impl implements chart_api {
       // that just opened until the next tick.
       this.wasm.set_now_seconds(this.now_seconds());
       if (this.countdown_timer === null) {
-        this.countdown_timer = setInterval(() => {
-          // Skip while hidden or while the user is mid-gesture — a mid-drag repaint is the
-          // visible lag/flicker when moving the chart.
-          if (document.hidden || this.interacting) return;
-          this.wasm.set_now_seconds(this.now_seconds());
-          this.repaint();
-        }, 1000);
+        this.schedule_countdown_tick();
       }
-    } else if (this.countdown_timer !== null) {
-      clearInterval(this.countdown_timer);
-      this.countdown_timer = null;
+    } else {
+      this.stop_countdown_timer();
     }
+  }
+  /**
+   * Arm the next countdown tick 1 ms past the next whole second of the countdown clock (the host
+   * clock from `set_clock`, otherwise the wall clock). The label shows the floor
+   * of the remaining seconds, so it changes exactly when `now` crosses a whole second; a free
+   * running `setInterval` with an arbitrary phase lets jitter land two ticks in one second,
+   * holding a value for two seconds and then skipping one.
+   */
+  private schedule_countdown_tick(): void {
+    this.countdown_timer = setTimeout(() => {
+      this.countdown_timer = null;
+      if (this.removed) return;
+      this.schedule_countdown_tick();
+      // Skip while hidden or while the user is mid-gesture — a mid-drag repaint is the
+      // visible lag/flicker when moving the chart.
+      if (document.hidden || this.interacting) return;
+      this.wasm.set_now_seconds(this.now_seconds());
+      this.repaint();
+    }, 1001 - countdown_phase_ms(this.now_seconds()));
   }
   /**
    * Install (or with `null` remove) the host clock used by the candle-close countdown. The clock
@@ -5332,7 +5365,7 @@ export class chart_impl implements chart_api {
 
   private stop_countdown_timer(): void {
     if (this.countdown_timer !== null) {
-      clearInterval(this.countdown_timer);
+      clearTimeout(this.countdown_timer);
       this.countdown_timer = null;
     }
   }
@@ -5720,22 +5753,39 @@ export class chart_impl implements chart_api {
     return series;
   }
 
-  add_trade_bubbles(
-    series: series_api | number,
-    stream_id: number,
-    options: { minimum_volume?: number; max_markers?: number; aggregation_window_micros?: number } = {},
-  ): void {
+  add_big_trades(series: series_api | number, stream_id: number, options: Partial<big_trades_options> = {}): big_trades_api {
     const series_id = typeof series === "number" ? series : series.id;
-    if (!this.wasm.add_trade_bubbles(
-      stream_id,
-      series_id,
-      options.minimum_volume ?? 0,
-      options.max_markers ?? 2048,
-      options.aggregation_window_micros ?? 0,
-    )) {
-      throw new AerisChartsError("invalid_options", "trade bubbles were rejected by the engine");
-    }
+    // Typed rejections: resource_limit (16 indicators), unsupported_operation (series type),
+    // invalid_handle (stream or series), invalid_options.
+    const id = parse_general_result<number>(
+      this.wasm.add_big_trades(stream_id, series_id, JSON.stringify(options)),
+    );
+    let removed = false;
+    const read_options = (): big_trades_options => {
+      const result = removed ? null : JSON.parse(this.wasm.big_trades_options(id)) as big_trades_options | null;
+      if (result === null) throw new AerisChartsError("stale_handle", "big-trades indicator has been removed");
+      return result;
+    };
     this.repaint();
+    return {
+      id,
+      options: read_options,
+      apply_options: (patch) => {
+        const merged = { ...read_options(), ...patch };
+        parse_general_result<null>(this.wasm.set_big_trades_options(id, JSON.stringify(merged)));
+        this.repaint();
+      },
+      snapshot: () => {
+        const result = removed ? null : JSON.parse(this.wasm.big_trades_snapshot(id)) as big_trades_snapshot | null;
+        if (result === null) throw new AerisChartsError("stale_handle", "big-trades indicator has been removed");
+        return result;
+      },
+      remove: () => {
+        if (removed) return;
+        if (this.wasm.remove_big_trades(id)) this.repaint();
+        removed = true;
+      },
+    };
   }
 
   set_trade_stream_sessions(stream_id: number, sessions: trade_session_options | null): void {
@@ -5831,6 +5881,45 @@ export class chart_impl implements chart_api {
   resample_stats(target: series_api | number): resample_stats | null {
     const id = typeof target === "number" ? target : target.id;
     return JSON.parse(this.wasm.resample_stats_json(id)) as resample_stats | null;
+  }
+
+  add_auction_markers(
+    series: series_api | number,
+    stream_id: number,
+    options: Partial<auction_marker_options> = {},
+  ): auction_markers_api {
+    const series_id = typeof series === "number" ? series : series.id;
+    // Typed rejections, as for big trades: resource_limit (16 marker sets),
+    // unsupported_operation (series type), invalid_handle (stream or series), invalid_options.
+    const id = parse_general_result<number>(
+      this.wasm.add_auction_markers(stream_id, series_id, JSON.stringify(options)),
+    );
+    let removed = false;
+    const read_options = (): auction_marker_options => {
+      const result = removed ? null : JSON.parse(this.wasm.auction_marker_options(id)) as auction_marker_options | null;
+      if (result === null) throw new AerisChartsError("stale_handle", "auction markers have been removed");
+      return result;
+    };
+    this.repaint();
+    return {
+      id,
+      options: read_options,
+      apply_options: (patch) => {
+        const merged = { ...read_options(), ...patch };
+        parse_general_result<null>(this.wasm.set_auction_marker_options(id, JSON.stringify(merged)));
+        this.repaint();
+      },
+      snapshot: () => {
+        const result = removed ? null : JSON.parse(this.wasm.auction_markers_snapshot(id)) as auction_mark[] | null;
+        if (result === null) throw new AerisChartsError("stale_handle", "auction markers have been removed");
+        return result;
+      },
+      remove: () => {
+        if (removed) return;
+        if (this.wasm.remove_auction_markers(id)) this.repaint();
+        removed = true;
+      },
+    };
   }
 
   add_series(
@@ -6105,6 +6194,171 @@ export class chart_impl implements chart_api {
     return series;
   }
 
+  private drain_custom_study_faults(): void {
+    if (!this.wasm_instance || this.custom_study_fault_subs.size === 0) return;
+    const json = this.wasm_instance.take_custom_study_faults_json();
+    if (json === "") return;
+    const events = JSON.parse(json) as custom_study_fault_event[];
+    for (const event of events) {
+      for (const callback of this.custom_study_fault_subs) {
+        try { callback(event); } catch (error) { console.error("custom study fault subscriber threw", error); }
+      }
+    }
+  }
+
+  private protect_chart_calls_in_custom_callbacks(): void {
+    if (this.custom_study_chart_guard_installed) return;
+    this.custom_study_chart_guard_installed = true;
+    // Install on this chart only. Ordinary charts retain the direct prototype dispatch.
+    for (const name of Object.getOwnPropertyNames(chart_impl.prototype)) {
+      const descriptor = Object.getOwnPropertyDescriptor(chart_impl.prototype, name);
+      if (name === "constructor" || typeof descriptor?.value !== "function") continue;
+      const method = descriptor.value as (...args: unknown[]) => unknown;
+      Object.defineProperty(this, name, {
+        configurable: true,
+        value: (...args: unknown[]) => {
+          if (this.in_custom_study_callback) {
+            throw new AerisChartsError("reentrant_call", "chart API called during a custom study callback");
+          }
+          return method.apply(this, args);
+        },
+      });
+    }
+  }
+
+  register_custom_study<State>(definition: custom_study_definition<State>): void {
+    if (this.in_custom_study_callback) throw new AerisChartsError("reentrant_call", "chart API called during a custom study callback");
+    if (!definition || typeof definition.init !== "function" || typeof definition.rebuild !== "function" ||
+      (definition.update !== undefined && typeof definition.update !== "function") ||
+      !/^[a-z0-9._-]{1,64}$/.test(definition.type) || !Number.isSafeInteger(definition.version) ||
+      definition.version < 1 || !definition.title || !Array.isArray(definition.parameters) ||
+      !Array.isArray(definition.outputs) || definition.outputs.length < 1 || definition.outputs.length > 5 ||
+      definition.outputs.some((output) => !output || typeof output.name !== "string" ||
+        !["line", "histogram", "area", "marker"].includes(output.plot) ||
+        !["price", "dedicated"].includes(output.pane)) ||
+      definition.parameters.some((parameter) => !parameter || typeof parameter.name !== "string")) {
+      throw new AerisChartsError("invalid_options", "invalid custom study definition");
+    }
+    this.protect_chart_calls_in_custom_callbacks();
+    const guard = <Args extends unknown[], Result>(callback: (...args: Args) => Result) =>
+      (...args: Args): Result => {
+        this.in_custom_study_callback = true;
+        try { return callback(...args); } finally { this.in_custom_study_callback = false; }
+      };
+    const style = {
+      visible: true, line_color: null, line_width: null, line_style: 0,
+      point_markers: false, up_color: null, down_color: null,
+      area_top_color: null, area_bottom_color: null,
+    };
+    const wire = {
+      ...definition,
+      parameters: definition.parameters.map((parameter) => ({
+        ...parameter, min: parameter.min ?? null, max: parameter.max ?? null,
+      })),
+      outputs: definition.outputs.map((output) => ({
+        ...output, default_style: { ...style, ...output.default_style },
+      })),
+      init: undefined, update: undefined, rebuild: undefined,
+    };
+    let document: string;
+    try { document = JSON.stringify(wire); }
+    catch { throw new AerisChartsError("invalid_options", "custom study definition must be JSON-serializable"); }
+    const result = JSON.parse(this.wasm.register_custom_study_result_json(
+      document,
+      guard(definition.init),
+      definition.update ? guard(definition.update) : undefined,
+      guard(definition.rebuild),
+    )) as { ok: true } | persistence_error_result;
+    if (!result.ok) throw_persistence_error(result);
+    // Only charts with registered JS callbacks pay for this boundary guard.
+    if (!this.guarded_wasm && this.wasm_instance) {
+      const methods = new Map<PropertyKey, (...args: unknown[]) => unknown>();
+      // These calls only inspect or paint already-computed state. Everything else
+      // drains, including future wasm mutations that do not follow a name prefix.
+      // The gesture layer holds the raw instance, so pointer, wheel and key routing never pays a
+      // drain; the fork's per-repaint and countdown reads are listed with upstream's.
+      const read_only = new Set([
+        "frame_pending", "frame_stats", "render", "ring_source_count",
+        "wants_animation", "time_scale_width", "time_scale_height",
+        "visible_logical_range", "visible_time_range",
+        "pane_geometry_json", "series_last_value_data",
+      ]);
+      this.guarded_wasm = new Proxy(this.wasm_instance, {
+        get: (target, key) => {
+          const value = Reflect.get(target, key, target);
+          if (typeof value !== "function") return value;
+          const cached = methods.get(key);
+          if (cached) return cached;
+          const may_mutate = typeof key !== "string" || !read_only.has(key);
+          const invoke = (...args: unknown[]) => {
+            if (this.in_custom_study_callback) {
+              throw new AerisChartsError("reentrant_call", "chart API called during a custom study callback");
+            }
+            try { return value.apply(target, args) as unknown; }
+            finally { if (may_mutate) this.drain_custom_study_faults(); }
+          };
+          methods.set(key, invoke);
+          return invoke;
+        },
+      });
+    }
+    this.drain_custom_study_faults();
+    this.repaint();
+  }
+
+  add_custom_study(type: string, source: series_api, params: Record<string, unknown> = {}, options?: custom_study_binding_options): series_api[] {
+    if (this.series_by_id.get(source.id) !== source) {
+      throw new AerisChartsError("invalid_handle", "custom study source must belong to this chart");
+    }
+    const { input_source = "close", volume_source = null, ...series_options } = options ?? {};
+    if (volume_source && this.series_by_id.get(volume_source.id) !== volume_source) {
+      throw new AerisChartsError("invalid_handle", "custom study volume source must belong to this chart");
+    }
+    let document: string;
+    try { document = JSON.stringify(params); }
+    catch { throw new AerisChartsError("invalid_options", "custom study parameters must be JSON-serializable"); }
+    const result = JSON.parse(this.wasm.add_custom_study_result_json(
+      type, source.id, input_source, volume_source ? BigInt(volume_source.id) : -1n, document,
+    )) as { ok: true; outputs: number[] } | persistence_error_result;
+    if (!result.ok) throw_persistence_error(result);
+    return result.outputs.map((id) => this.indicator_series(id, series_options));
+  }
+
+  subscribe_custom_study_fault(callback: (event: custom_study_fault_event) => void): () => void {
+    if (this.in_custom_study_callback) throw new AerisChartsError("reentrant_call", "chart API called during a custom study callback");
+    this.custom_study_fault_subs.add(callback);
+    return () => this.custom_study_fault_subs.delete(callback);
+  }
+
+  set_study_calendar(boundaries: readonly resample_boundary[]): void {
+    if (!Array.isArray(boundaries) || boundaries.length > 20_000 ||
+      boundaries.some((b, i) => !Number.isSafeInteger(b.startTime) || !Number.isSafeInteger(b.endTime) ||
+        !Number.isSafeInteger(b.sessionId) || b.sessionId < 0 || b.endTime <= b.startTime ||
+        (i > 0 && boundaries[i - 1]!.endTime > b.startTime))) {
+      throw new AerisChartsError("invalid_options", "study calendar requires ordered, disjoint UTC spans (at most 20,000)");
+    }
+    if (!this.wasm.set_study_calendar_json(JSON.stringify(boundaries))) {
+      throw new AerisChartsError("invalid_options", "invalid study calendar boundaries");
+    }
+    this.repaint();
+  }
+
+  clear_study_calendar(): void {
+    this.wasm.clear_study_calendar();
+    this.repaint();
+  }
+
+  study_annotations(binding: series_api): study_annotations {
+    if (this.series_by_id.get(binding.id) !== binding) {
+      throw new AerisChartsError("invalid_handle", "study binding must be a live output of this chart");
+    }
+    const info = binding.indicator_info();
+    if (!info) throw new AerisChartsError("unsupported_operation", "series is not a study binding");
+    const result = JSON.parse(this.wasm.study_annotations_json(info.binding_id)) as study_annotations | { code: "invalid_handle" | "unsupported_operation"; error: string };
+    if ("error" in result) throw new AerisChartsError(result.code, result.error);
+    return result;
+  }
+
   volume_profile_snapshot(request: profile_request): profile_snapshot | null {
     return JSON.parse(this.wasm.volume_profile_snapshot_json(JSON.stringify(request))) as profile_snapshot | null;
   }
@@ -6373,6 +6627,182 @@ export class chart_impl implements chart_api {
 
   add_obv(source: series_api, volume_source: series_api, options?: Partial<series_options>): series_api {
     return this.indicator_series(this.wasm.add_obv(source.id, volume_source.id), options);
+  }
+
+  add_accumulation_distribution(source: series_api, volume_source: series_api, options?: Partial<series_options>): series_api {
+    return this.indicator_series(this.wasm.add_accumulation_distribution(source.id, volume_source.id), options);
+  }
+
+  add_price_volume_trend(source: series_api, volume_source: series_api, options?: Partial<series_options>): series_api {
+    return this.indicator_series(this.wasm.add_price_volume_trend(source.id, volume_source.id), options);
+  }
+
+  add_chaikin_oscillator(source: series_api, fast: number, slow: number, volume_source: series_api, options?: Partial<series_options>): series_api {
+    if (!Number.isInteger(fast) || !Number.isInteger(slow) || fast < 1 || fast >= slow || slow > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "Chaikin periods must satisfy 1 <= fast < slow <= 1000000");
+    }
+    return this.indicator_series(this.wasm.add_chaikin_oscillator(source.id, volume_source.id, fast, slow), options);
+  }
+
+  add_klinger(source: series_api, fast: number | undefined, slow: number | undefined, signal: number | undefined, volume_source: series_api, options?: Partial<series_options>): [series_api, series_api] {
+    fast ??= 34;
+    slow ??= 55;
+    signal ??= 13;
+    if (![fast, slow, signal].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000) || fast >= slow || !volume_source) {
+      throw new AerisChartsError("invalid_options", "Klinger requires volume and periods satisfying 1 <= fast < slow <= 1000000 and 1 <= signal <= 1000000");
+    }
+    const ids = this.wasm.add_klinger(source.id, volume_source.id, fast, slow, signal);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid Klinger configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+
+  add_kama(source: series_api, period = 10, fast = 2, slow = 30, options?: Partial<series_options>): series_api {
+    if (![period, fast, slow].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000) || fast >= slow) {
+      throw new AerisChartsError("invalid_options", "KAMA requires 1 <= period <= 1000000 and 1 <= fast < slow <= 1000000");
+    }
+    return this.indicator_series(this.wasm.add_kama(source.id, period, fast, slow), options);
+  }
+
+  add_mcginley(source: series_api, period = 14, options?: Partial<series_options>): series_api {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "McGinley period must be an integer from 1 to 1000000");
+    }
+    return this.indicator_series(this.wasm.add_mcginley(source.id, period), options);
+  }
+
+  add_linear_regression(source: series_api, period = 20, deviation = 2, options?: Partial<series_options>): [series_api, series_api, series_api] {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000 || !Number.isFinite(deviation) || deviation < 0) {
+      throw new AerisChartsError("invalid_options", "Linear Regression requires a period from 1 to 1000000 and a nonnegative finite deviation");
+    }
+    const ids = this.wasm.add_linear_regression(source.id, period, deviation);
+    if (ids.length !== 3) throw new AerisChartsError("invalid_options", "invalid Linear Regression configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options), this.indicator_series(ids[2]!, options)];
+  }
+
+  add_choppiness(source: series_api, period = 14, options?: Partial<series_options>): series_api {
+    if (!Number.isInteger(period) || period < 2 || period > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "Choppiness period must be an integer from 2 to 1000000");
+    }
+    return this.indicator_series(this.wasm.add_choppiness(source.id, period), options);
+  }
+
+  add_atr_bands(source: series_api, period = 14, multiplier = 2, options?: Partial<series_options>): [series_api, series_api, series_api] {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000 || !Number.isFinite(multiplier) || multiplier < 0) {
+      throw new AerisChartsError("invalid_options", "ATR Bands require a period from 1 to 1000000 and a nonnegative finite multiplier");
+    }
+    const ids = this.wasm.add_atr_bands(source.id, period, multiplier);
+    if (ids.length !== 3) throw new AerisChartsError("invalid_options", "invalid ATR Bands configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options), this.indicator_series(ids[2]!, options)];
+  }
+
+  add_relative_volume(source: series_api, period: number, volume_source: series_api, options?: Partial<series_options>): series_api {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "Relative Volume period must be an integer from 1 to 1000000");
+    }
+    return this.indicator_series(this.wasm.add_relative_volume(source.id, volume_source.id, period), options);
+  }
+
+  add_volume_oscillator(source: series_api, fast: number, slow: number, signal: number, volume_source: series_api, options?: Partial<series_options>): [series_api, series_api, series_api] {
+    if (![fast, slow, signal].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000) || fast >= slow) {
+      throw new AerisChartsError("invalid_options", "Volume Oscillator periods must satisfy 1 <= fast < slow <= 1000000 and 1 <= signal <= 1000000");
+    }
+    const ids = this.wasm.add_volume_oscillator(source.id, volume_source.id, fast, slow, signal);
+    if (ids.length !== 3) throw new AerisChartsError("invalid_options", "invalid Volume Oscillator configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options), this.indicator_series(ids[2]!, options)];
+  }
+
+  add_elder_force(source: series_api, period: number, volume_source: series_api, options?: Partial<series_options>): series_api {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "Elder Force period must be an integer from 1 to 1000000");
+    }
+    return this.indicator_series(this.wasm.add_elder_force(source.id, volume_source.id, period), options);
+  }
+
+  add_ease_of_movement(source: series_api, period: number, volume_source: series_api, divisor = 100_000_000, options?: Partial<series_options>): series_api {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000 || !Number.isFinite(divisor) || divisor <= 0) {
+      throw new AerisChartsError("invalid_options", "Ease of Movement requires a period from 1 to 1000000 and a positive finite divisor");
+    }
+    return this.indicator_series(this.wasm.add_ease_of_movement(source.id, volume_source.id, period, divisor), options);
+  }
+
+  add_historical_volatility(source: series_api, period: number, annualization = 252, options?: Partial<series_options>): series_api {
+    if (!Number.isInteger(period) || period < 2 || period > 1_000_000 || !Number.isFinite(annualization) || annualization <= 0) {
+      throw new AerisChartsError("invalid_options", "Historical Volatility requires at least two returns and a positive finite annualization factor");
+    }
+    return this.indicator_series(this.wasm.add_historical_volatility(source.id, period, annualization), options);
+  }
+
+  add_trix(source: series_api, period: number, signal = 9, options?: Partial<series_options>): [series_api, series_api] {
+    if (![period, signal].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000)) {
+      throw new AerisChartsError("invalid_options", "TRIX periods must be integers from 1 to 1000000");
+    }
+    const ids = this.wasm.add_trix(source.id, period, signal);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid TRIX configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+
+  add_kst(
+    source: series_api,
+    roc: kst_periods = [10, 15, 20, 30],
+    smoothing: kst_periods = [10, 10, 10, 15],
+    signal = 9,
+    options?: Partial<series_options>,
+  ): [series_api, series_api] {
+    if (roc.length !== 4 || smoothing.length !== 4 ||
+        ![...roc, ...smoothing, signal].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000)) {
+      throw new AerisChartsError("invalid_options", "KST periods must be integers from 1 to 1000000");
+    }
+    const ids = this.wasm.add_kst(source.id, Uint32Array.from(roc), Uint32Array.from(smoothing), signal);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid KST configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+
+  add_tsi(source: series_api, long = 25, short = 13, signal = 13, options?: Partial<series_options>): [series_api, series_api] {
+    if (![long, short, signal].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000)) {
+      throw new AerisChartsError("invalid_options", "TSI periods must be integers from 1 to 1000000");
+    }
+    const ids = this.wasm.add_tsi(source.id, long, short, signal);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid TSI configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+
+  add_mass_index(source: series_api, ema_period = 9, sum_period = 25, options?: Partial<series_options>): series_api {
+    if (![ema_period, sum_period].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000)) {
+      throw new AerisChartsError("invalid_options", "Mass Index periods must be integers from 1 to 1000000");
+    }
+    return this.indicator_series(this.wasm.add_mass_index(source.id, ema_period, sum_period), options);
+  }
+
+  add_vortex(source: series_api, period = 14, options?: Partial<series_options>): [series_api, series_api] {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "Vortex period must be an integer from 1 to 1000000");
+    }
+    const ids = this.wasm.add_vortex(source.id, period);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid Vortex configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+
+  add_coppock_curve(source: series_api, long_period = 14, short_period = 11, smoothing = 10, options?: Partial<series_options>): series_api {
+    if (![long_period, short_period, smoothing].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000)) {
+      throw new AerisChartsError("invalid_options", "Coppock Curve periods must be integers from 1 to 1000000");
+    }
+    return this.indicator_series(this.wasm.add_coppock_curve(source.id, long_period, short_period, smoothing), options);
+  }
+
+  add_fisher_transform(source: series_api, period = 10, options?: Partial<series_options>): [series_api, series_api] {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "Fisher Transform period must be an integer from 1 to 1000000");
+    }
+    const ids = this.wasm.add_fisher_transform(source.id, period);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid Fisher Transform configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+
+  add_ultimate_oscillator(source: series_api, short_period = 7, medium_period = 14, long_period = 28, options?: Partial<series_options>): series_api {
+    if (![short_period, medium_period, long_period].every((value) => Number.isInteger(value) && value >= 1 && value <= 1_000_000)) {
+      throw new AerisChartsError("invalid_options", "Ultimate Oscillator periods must be integers from 1 to 1000000");
+    }
+    return this.indicator_series(this.wasm.add_ultimate_oscillator(source.id, short_period, medium_period, long_period), options);
   }
 
   add_cmf(source: series_api, period: number, volume_source: series_api, options?: Partial<series_options>): series_api {
@@ -6891,11 +7321,6 @@ export class chart_impl implements chart_api {
     return DRAWING_MAGNET_FROM_U8[this.wasm.drawing_magnet_mode()] ?? "off";
   }
 
-  /** Whether the armed tool's next placement snaps strongly (crosshair magnet mirror). */
-  armed_drawing_magnet_strong(toggle: boolean): boolean {
-    return this.wasm.armed_drawing_magnet(toggle) === 2;
-  }
-
   drawings(): drawing_api[] {
     const list = JSON.parse(this.wasm.drawings_json()) as drawing_info[];
     return list.map((d) => new drawing_impl(this, d.id, d.kind, d.pane_index));
@@ -6913,6 +7338,154 @@ export class chart_impl implements chart_api {
     const value = this.wasm.drawing_kind_options_json(id);
     if (value === "") throw new AerisChartsError("stale_handle", "drawing has been removed");
     return JSON.parse(value) as drawing_kind_options;
+  }
+
+  add_aroon(source: series_api, period: number, options?: Partial<series_options>): [series_api, series_api] {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "Aroon period must be an integer from 1 to 1000000");
+    }
+    const ids = this.wasm.add_aroon(source.id, period);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid Aroon configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+  private validate_structure_pivots(left: number, right: number): void {
+    if (![left, right].every((value) => Number.isInteger(value) && value >= 1 && value <= 50)) {
+      throw new AerisChartsError("invalid_options", "structure pivot left and right must be integers from 1 to 50");
+    }
+  }
+  private validate_structure_zones(config: structure_zone_options): void {
+    if (!config || typeof config !== "object" || Array.isArray(config) ||
+        (config.mitigation !== undefined && !["touch", "half", "full"].includes(config.mitigation)) ||
+        (config.mitigation_price !== undefined && !["wick", "close"].includes(config.mitigation_price)) ||
+        (config.max_active !== undefined && (!Number.isInteger(config.max_active) || config.max_active < 1 || config.max_active > 64)) ||
+        (config.show_mitigated !== undefined && typeof config.show_mitigated !== "boolean")) {
+      throw new AerisChartsError("invalid_options", "invalid structure mitigation, price, max_active (1–64), or show_mitigated");
+    }
+  }
+  add_swing_points(source: series_api, left = 5, right = 5, options?: Partial<series_options>): [series_api, series_api] {
+    this.validate_structure_pivots(left, right);
+    const ids = this.wasm.add_swing_points(source.id, left, right);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid Swing Points source or configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+  private validate_study_calendar_policy(calendar: study_calendar_policy): void {
+    if (calendar !== "exchange" && calendar !== "utc" && calendar !== "host") {
+      throw new AerisChartsError("invalid_options", "study calendar must be exchange, utc or host");
+    }
+  }
+  add_session_levels(source: series_api, calendar: study_calendar_policy = "exchange", options?: Partial<series_options>): [series_api, series_api] {
+    this.validate_study_calendar_policy(calendar);
+    const ids = this.wasm.add_session_levels(source.id, calendar);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid Session Levels source or configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+  add_previous_period_levels(
+    source: series_api, period: previous_period = "day", calendar: study_calendar_policy = "exchange",
+    options?: Partial<series_options>,
+  ): [series_api, series_api, series_api] {
+    if (!["day", "week", "month"].includes(period)) {
+      throw new AerisChartsError("invalid_options", "previous period must be day, week, or month");
+    }
+    this.validate_study_calendar_policy(calendar);
+    const ids = this.wasm.add_previous_period_levels(source.id, period, calendar);
+    if (ids.length !== 3) throw new AerisChartsError("invalid_options", "invalid Previous Period Levels source or configuration");
+    return [
+      this.indicator_series(ids[0]!, options),
+      this.indicator_series(ids[1]!, options),
+      this.indicator_series(ids[2]!, options),
+    ];
+  }
+  add_opening_range(
+    source: series_api, duration_seconds: number, calendar: study_calendar_policy = "exchange",
+    options?: Partial<series_options>,
+  ): [series_api, series_api, series_api] {
+    if (!Number.isInteger(duration_seconds) || duration_seconds < 1 || duration_seconds > 0xffffffff) {
+      throw new AerisChartsError("invalid_options", "opening range duration_seconds must be a positive u32 integer");
+    }
+    this.validate_study_calendar_policy(calendar);
+    const ids = this.wasm.add_opening_range(source.id, duration_seconds, calendar);
+    if (ids.length !== 3) throw new AerisChartsError("invalid_options", "invalid Opening Range source or configuration");
+    return [
+      this.indicator_series(ids[0]!, options),
+      this.indicator_series(ids[1]!, options),
+      this.indicator_series(ids[2]!, options),
+    ];
+  }
+  add_market_structure(source: series_api, left = 5, right = 5, break_on: structure_break_on = "close", options?: Partial<series_options>): series_api {
+    this.validate_structure_pivots(left, right);
+    if (!["close", "wick"].includes(break_on)) throw new AerisChartsError("invalid_options", "break_on must be close or wick");
+    const ids = this.wasm.add_market_structure(source.id, left, right, break_on);
+    if (ids.length !== 1) throw new AerisChartsError("invalid_options", "invalid Market Structure source or configuration");
+    return this.indicator_series(ids[0]!, options);
+  }
+  add_fair_value_gaps(source: series_api, config: fair_value_gap_options = {}, options?: Partial<series_options>): series_api {
+    this.validate_structure_zones(config);
+    const { min_size = 0, mitigation = "touch", mitigation_price = "wick", max_active = 20, show_mitigated = false } = config;
+    if (!Number.isFinite(min_size) || min_size < 0) throw new AerisChartsError("invalid_options", "min_size must be finite and nonnegative");
+    const ids = this.wasm.add_fair_value_gaps(source.id, min_size, mitigation, mitigation_price, max_active, show_mitigated);
+    if (ids.length !== 1) throw new AerisChartsError("invalid_options", "invalid Fair Value Gaps source or configuration");
+    return this.indicator_series(ids[0]!, options);
+  }
+  add_order_blocks(source: series_api, config: order_block_options = {}, options?: Partial<series_options>): series_api {
+    this.validate_structure_zones(config);
+    const { left = 5, right = 5, break_on = "close", zone = "wick",
+      mitigation = "touch", mitigation_price = "wick", max_active = 20, show_mitigated = false } = config;
+    this.validate_structure_pivots(left, right);
+    if (!["close", "wick"].includes(break_on) || !["wick", "body"].includes(zone)) {
+      throw new AerisChartsError("invalid_options", "break_on must be close or wick; zone must be wick or body");
+    }
+    const ids = this.wasm.add_order_blocks(
+      source.id, left, right, break_on, zone, mitigation, mitigation_price, max_active, show_mitigated,
+    );
+    if (ids.length !== 1) throw new AerisChartsError("invalid_options", "invalid Order Blocks source or configuration");
+    return this.indicator_series(ids[0]!, options);
+  }
+
+  add_awesome_oscillator(source: series_api, options?: Partial<series_options>): series_api {
+    return this.indicator_series(this.wasm.add_awesome_oscillator(source.id), options);
+  }
+
+  add_dpo(source: series_api, period: number, options?: Partial<series_options>): series_api {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "DPO period must be an integer from 1 to 1000000");
+    }
+    return this.indicator_series(this.wasm.add_dpo(source.id, period), options);
+  }
+
+  add_chande_momentum(source: series_api, period: number, options?: Partial<series_options>): series_api {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "CMO period must be an integer from 1 to 1000000");
+    }
+    return this.indicator_series(this.wasm.add_chande_momentum(source.id, period), options);
+  }
+
+  add_bollinger_metrics(source: series_api, period: number, deviation: number, options?: Partial<series_options>): [series_api, series_api] {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000 || !Number.isFinite(deviation) || deviation < 0 || deviation > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "invalid Bollinger metrics configuration");
+    }
+    const ids = this.wasm.add_bollinger_metrics(source.id, period, deviation);
+    if (ids.length !== 2) throw new AerisChartsError("invalid_options", "invalid Bollinger metrics configuration");
+    return [this.indicator_series(ids[0]!, options), this.indicator_series(ids[1]!, options)];
+  }
+
+  add_envelopes(source: series_api, period: number, percent: number, exponential = false, options?: Partial<series_options>): [series_api, series_api, series_api] {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000 || !Number.isFinite(percent) || percent < 0 || percent > 1_000_000 || typeof exponential !== "boolean") {
+      throw new AerisChartsError("invalid_options", "invalid Envelopes configuration");
+    }
+    const ids = this.wasm.add_envelopes(source.id, period, percent, exponential);
+    if (ids.length !== 3) throw new AerisChartsError("invalid_options", "invalid Envelopes configuration");
+    return [
+      this.indicator_series(ids[0]!, options),
+      this.indicator_series(ids[1]!, options),
+      this.indicator_series(ids[2]!, options),
+    ];
+  }
+
+  add_alma(source: series_api, period: number, offset = 0.85, sigma = 6, options?: Partial<series_options>): series_api {
+    if (!Number.isInteger(period) || period < 1 || period > 1_000_000 || !Number.isFinite(offset) || offset < 0 || offset > 1 || !Number.isFinite(sigma) || sigma < 0.01 || sigma > 1_000_000) {
+      throw new AerisChartsError("invalid_options", "invalid ALMA configuration");
+    }
+    return this.indicator_series(this.wasm.add_alma(source.id, period, offset, sigma), options);
   }
 
   register_drawing_icon(name: string, width: number, height: number, pixels: Uint8Array): void {
@@ -7051,6 +7624,13 @@ export class chart_impl implements chart_api {
             this,
           ),
         );
+      }
+    }
+    if (response.result.schema_version === 3) {
+      for (const id of JSON.parse(this.wasm.series_order_json()) as number[]) {
+        if (!this.series_by_id.has(id)) {
+          this.series_by_id.set(id, new series_impl(id, "line", this));
+        }
       }
     }
     this.repaint();

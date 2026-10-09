@@ -1,4 +1,5 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test, wait_for_chart } from "./page-ready.mjs";
 import { readFileSync } from "node:fs";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
@@ -20,13 +21,6 @@ test.beforeEach(async ({ page }) => {
   page.on("console", (message) => console.log(`[browser:${message.type()}] ${message.text()}`));
   page.on("pageerror", (error) => console.log(`[browser:pageerror] ${error.message}`));
 });
-
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
-}
 
 async function settle_frames(page) {
   await page.evaluate(() => new Promise((resolve) => {
@@ -508,6 +502,58 @@ test("click selects with anchor handles and part cursors; empty click deselects"
   await settle_frames(page);
   expect(await page.evaluate(() => window.__chart.selected_drawing())).toBeNull();
   expect(count_color(await capture(page), BLUE), "handles gone after deselect").toBe(0);
+});
+
+test("a drawing's own magnet mode snaps unmodified anchor drags and Ctrl upgrades it to strong", async ({ page }) => {
+  await goto_fixture(page);
+  const s = await anchor_spots(page);
+  const spacing = await bar_spacing(page);
+  // A held Ctrl upgrades a drawing's own weak magnet to strong (press-drags keep Ctrl on macOS).
+  for (const [magnet, ctrl] of [["strong", false], ["off", false], ["weak", true]]) {
+    await page.evaluate(({ l0, l1, p_lo, p_hi, magnet }) => {
+      window.__chart.clear_drawings();
+      window.__chart.add_drawing("trend_line", [
+        { logical: l0, price: p_lo },
+        { logical: l1, price: p_hi },
+      ], { magnet });
+    }, { ...s, magnet });
+    await settle_frames(page);
+    const mid = await page.evaluate(({ l0, l1, p_lo, p_hi }) => ({
+      x: (window.__chart.time_scale().logical_to_coordinate(l0) + window.__chart.time_scale().logical_to_coordinate(l1)) / 2,
+      y: (window.__main.price_to_coordinate(p_lo) + window.__main.price_to_coordinate(p_hi)) / 2,
+    }), s);
+    await page.mouse.click(mid.x, mid.y);
+    const anchor = await spot(page, s.l0, s.p_lo);
+    const target = s.l0 + 3;
+    // Drop off-center and between the target bar's prices so only a magnet can land exactly.
+    const expected = await page.evaluate(({ target, x }) => {
+      const bar = window.__main.data_by_index(target);
+      const fields = [bar.open, bar.high, bar.low, bar.close];
+      const y = (window.__main.price_to_coordinate(bar.high) + window.__main.price_to_coordinate(bar.low)) / 2 + 1.5;
+      const nearest = fields.reduce((best, price) => (
+        Math.abs(window.__main.price_to_coordinate(price) - y) < Math.abs(window.__main.price_to_coordinate(best) - y)
+          ? price : best
+      ));
+      return { x, y, nearest, raw: window.__main.coordinate_to_price(y) };
+    }, { target, x: anchor.x + 3.3 * spacing });
+    await page.mouse.move(anchor.x, anchor.y);
+    if (ctrl) await page.keyboard.down("Control");
+    await page.mouse.down();
+    await page.mouse.move(expected.x, expected.y, { steps: 5 });
+    await page.mouse.up();
+    if (ctrl) await page.keyboard.up("Control");
+    await settle_frames(page);
+    const point = (await drawings(page))[0].points[0];
+    if (magnet === "strong" || ctrl) {
+      expect(point.logical).toBe(target);
+      expect(point.price).toBeCloseTo(expected.nearest, 9);
+    } else {
+      expect(point.logical).not.toBe(target);
+      // Browser pointer coordinates are quantized, so the raw price is exact only to ~1e-6.
+      expect(point.price).toBeCloseTo(expected.raw, 4);
+      expect(point.price).not.toBe(expected.nearest);
+    }
+  }
 });
 
 test("anchor drag re-anchors one point; body drag moves the whole drawing", async ({ page }) => {

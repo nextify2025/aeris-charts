@@ -8,7 +8,7 @@ use aeris_charts_render::draw_list::{LineStyle, Prim, TextAlign};
 use aeris_charts_render::shape::point_in_polygon;
 
 use super::super::super::{DrawingPlacement, DrawingTextHAlign, DrawingTextVAlign};
-use super::{regression_stats, FAMILY};
+use super::{FAMILY, regression_stats};
 use crate::{
     ChartEngine, DrawingDragPart, DrawingId, DrawingKind, DrawingMagnetMode, DrawingModifiers,
     DrawingPoint, DrawingPriceScale, IndicatorInputSource,
@@ -839,9 +839,11 @@ fn regression_trends_without_a_fit_keep_their_dashed_anchor_segment() {
         id,
         &serde_json::to_string(&[p(38.0, 101.0), p(45.0, 103.0)]).unwrap()
     ));
-    assert!(chart
-        .regression_points(chart.drawing(id).unwrap())
-        .is_some());
+    assert!(
+        chart
+            .regression_points(chart.drawing(id).unwrap())
+            .is_some()
+    );
     let lines = strokes(&ink_polylines(&mut chart));
     assert!(!lines.is_empty() && lines.iter().all(|stroke| !stroke.dashed()));
 }
@@ -1582,7 +1584,7 @@ fn fit(chart: &ChartEngine, id: DrawingId, source: IndicatorInputSource) -> supe
 /// rows on it alone, all at upstream's defaults.
 #[test]
 fn upstream_channel_schemas_list_the_channel_rows_they_read() {
-    use crate::{drawing_property_schema, DrawingPropertyType};
+    use crate::{DrawingPropertyType, drawing_property_schema};
     let rows = |kind: DrawingKind| {
         drawing_property_schema(kind)
             .properties
@@ -1832,17 +1834,19 @@ fn disjoint_channels_fill_and_hit_the_region_between_their_lines() {
 
     // Crossing lines: two lobes that meet where the lines cross; nothing beyond the crossing
     // between the lines' outer ends.
-    assert!(chart
-        .set_drawing_anchors(
-            id,
-            &[
-                p(10.0, 101.0).into(),
-                p(20.0, 105.0).into(),
-                p(10.0, 104.0).into(),
-                p(20.0, 102.0).into(),
-            ],
-        )
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(
+                id,
+                &[
+                    p(10.0, 101.0).into(),
+                    p(20.0, 105.0).into(),
+                    p(10.0, 104.0).into(),
+                    p(20.0, 102.0).into(),
+                ],
+            )
+            .is_ok()
+    );
     let px = [0, 1, 2, 3].map(|index| anchor(&chart, id, index));
     let as_f32 = |point: (f64, f64)| [point.0 as f32, point.1 as f32];
     let crossing = aeris_charts_render::line::band_crossing(
@@ -2161,9 +2165,11 @@ fn regressions_paint_pearsons_r_below_their_start_when_enabled() {
     );
 
     // Drawn right to left: right-aligned at the start, reading into the channel.
-    assert!(chart
-        .set_drawing_anchors(id, &[p(31.0, 104.0).into(), p(6.0, 101.0).into()])
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[p(31.0, 104.0).into(), p(6.0, 101.0).into()])
+            .is_ok()
+    );
     let (_, at, _) = texts(&mut chart)[0].clone();
     let start = on_fit(&chart, stats, 31.0, 0.0);
     assert!(at.0 < start.0 - 10.0, "ends at the start: {at:?} {start:?}");
@@ -2197,7 +2203,7 @@ fn regressions_paint_pearsons_r_below_their_start_when_enabled() {
     assert_eq!(runs.len(), 1, "the label paints: {runs:?}");
     let size = culled.drawing_text_size(culled.drawing(narrow).unwrap());
     let family = culled.options.get().layout.font_family.clone();
-    let label_end = runs[0].1 .0 + culled.measure_text_run(&runs[0].0, size, &family, 400, false);
+    let label_end = runs[0].1.0 + culled.measure_text_run(&runs[0].0, size, &family, 400, false);
     assert!(
         label_end > 0.0,
         "the label reaches into the pane: {label_end}"
@@ -2224,7 +2230,9 @@ fn regression_middle_line_dashes_the_centre_in_its_color() {
     let stats = fit(&chart, id, IndicatorInputSource::Close);
     let (solid, dashed) = split_lines(&ink_polylines(&mut chart));
     assert_eq!((solid.len(), dashed.len()), (3, 0));
-    assert!(chart.drawing_apply_options(id, r#"{"tool_options":{"channel":{"middle_line":true}}}"#));
+    assert!(
+        chart.drawing_apply_options(id, r#"{"tool_options":{"channel":{"middle_line":true}}}"#)
+    );
     let (solid, dashed) = split_lines(&ink_polylines(&mut chart));
     assert_eq!((solid.len(), dashed.len()), (2, 1));
     assert_eq!(dashed[0].width, 1.0);
@@ -2395,9 +2403,11 @@ fn regression_handles_sit_on_the_fitted_line_ends() {
     assert!((chart.drawing(id).unwrap().points[1].logical - 29.0).abs() < 1e-6);
 
     // Without a fit (beyond the data), the handles stay on the placeholder's anchors.
-    assert!(chart
-        .set_drawing_anchors(id, &[p(50.0, 100.0).into(), p(60.0, 101.0).into()])
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[p(50.0, 100.0).into(), p(60.0, 101.0).into()])
+            .is_ok()
+    );
     let placeholder = [anchor(&chart, id, 0), anchor(&chart, id, 1)];
     let painted = painted_handles(&mut chart);
     assert!(close(painted[0], placeholder[0], 1e-3) && close(painted[1], placeholder[1], 1e-3));

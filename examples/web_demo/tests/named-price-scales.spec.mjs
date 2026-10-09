@@ -1,11 +1,5 @@
-import { test, expect } from "@playwright/test";
-
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
-}
+import { expect } from "@playwright/test";
+import { test, wait_for_chart } from "./page-ready.mjs";
 
 async function install_reset_fixture(page) {
   return page.evaluate(async () => {

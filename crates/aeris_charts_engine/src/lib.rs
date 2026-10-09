@@ -10,10 +10,13 @@
 #![recursion_limit = "256"]
 
 mod alerts;
+mod auction_markers;
 mod axis_metrics;
 mod axis_primitives;
 mod bar_time_label_api;
+mod big_trades;
 mod chart_input;
+mod custom_studies;
 mod depth;
 mod domains;
 mod drawing_contract;
@@ -41,7 +44,7 @@ mod native_primitives;
 mod synthetic_bars;
 mod volume_profile;
 pub use volume_profile::{
-    VolumeProfileIndicatorOptions, VolumeProfileIndicatorSnapshot, MAX_VOLUME_PROFILE_INDICATORS,
+    MAX_VOLUME_PROFILE_INDICATORS, VolumeProfileIndicatorOptions, VolumeProfileIndicatorSnapshot,
 };
 mod ordering;
 mod persistence;
@@ -61,8 +64,8 @@ mod time_alignment_api;
 mod time_tick_marks_api;
 mod timeline_marks;
 pub use timeline_marks::{
-    TimelineGlyphShape, TimelineMark, TimelineMarkGlyph, TimelineMarkGroup, TimelineMarkHit,
-    TimelineMarksSnapshot, MAX_TIMELINE_GROUPS, MAX_TIMELINE_MARKS,
+    MAX_TIMELINE_GROUPS, MAX_TIMELINE_MARKS, TimelineGlyphShape, TimelineMark, TimelineMarkGlyph,
+    TimelineMarkGroup, TimelineMarkHit, TimelineMarksSnapshot,
 };
 mod trading;
 mod viewport;
@@ -77,45 +80,63 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
 
+pub use aeris_charts_indicators::study_annotations::{
+    SessionSpan, StudyAnnotations, StudyMarker, StudyMarkerKind, StudyZone,
+};
 pub use aeris_charts_indicators::{
-    klinechart, DeviationEstimator, IndicatorConvention, IndicatorSeed, KdjSeed, PivotKind,
-    VwapReset,
+    DeviationEstimator, IndicatorConvention, IndicatorSeed, KdjSeed, PivotKind, VwapReset,
+    klinechart,
 };
 pub use alerts::{
     AlertCondition, AlertCreateRequest, AlertFrequency, AlertId, AlertLine, AlertLineStatus,
     AlertPriceScale, AlertSnapshot, MAX_ALERT_LINES,
 };
+pub use auction_markers::{
+    AuctionMark, AuctionMarkKind, AuctionMarkerOptions, AuctionSide, MAX_AUCTION_MARKERS,
+};
+pub use big_trades::{
+    BigTrade, BigTradesFilter, BigTradesIntensity, BigTradesOptions, BigTradesSize,
+    BigTradesSnapshot, MAX_BIG_TRADES_BUBBLES, MAX_BIG_TRADES_GROUPING_WINDOW_MICROS,
+    MAX_BIG_TRADES_INDICATORS,
+};
 pub use chart_input::{
-    ChartContextMenu, ChartCursor, ChartFocusTarget, ChartHover, ChartInputEvent, ChartKey,
-    ChartRegion, HostPrimitiveHit, HostPrimitiveLayer, InteractionOptions, PointerInput,
-    CLICK_SLOP_MANHATTAN, PANE_SEPARATOR_HIT, TRADING_TOOLTIP_DWELL_MS,
+    CLICK_SLOP_MANHATTAN, ChartContextMenu, ChartCursor, ChartFocusTarget, ChartHover,
+    ChartInputEvent, ChartKey, ChartRegion, HostPrimitiveHit, HostPrimitiveLayer,
+    InteractionOptions, PANE_SEPARATOR_HIT, PointerInput, TRADING_TOOLTIP_DWELL_MS,
+};
+pub use custom_studies::{
+    CustomStudyDefinition, CustomStudyFactory, CustomStudyFault, CustomStudyFaultEvent,
+    CustomStudyInput, CustomStudyOutput, CustomStudyPane, CustomStudyParams, CustomStudyPlot,
+    CustomStudyRuntime, CustomStudyStats, MAX_CUSTOM_STUDY_BINDINGS, MAX_CUSTOM_STUDY_FAULTS,
+    MAX_CUSTOM_STUDY_OUTPUTS, MAX_CUSTOM_STUDY_TYPES,
 };
 pub use depth::{
     DepthBook, DepthBucket, DepthError, DepthEventCluster, DepthEventKind, DepthEventLayerOptions,
     DepthHeatmapOptions, DepthLadderRow, DepthLevel, DepthMicrostructureEvent, DepthOptions,
     DepthReplayStats, DepthResyncRequest, DepthSide, DepthSnapshot, DepthStudySnapshot,
     DepthUpdate, MAX_DEPTH_BATCH_UPDATES, MAX_DEPTH_EVENT_LABEL_BYTES, MAX_DEPTH_EVENT_LAYERS,
-    MAX_DEPTH_EVENT_MARKERS, MAX_DEPTH_HEATMAPS, MAX_DEPTH_HEATMAP_ROWS, MAX_DEPTH_HISTORY_BUCKETS,
+    MAX_DEPTH_EVENT_MARKERS, MAX_DEPTH_HEATMAP_ROWS, MAX_DEPTH_HEATMAPS, MAX_DEPTH_HISTORY_BUCKETS,
     MAX_DEPTH_HISTORY_CELLS, MAX_DEPTH_LEVELS_PER_SIDE, MAX_DEPTH_REPLAY_UPDATES,
-    MAX_DEPTH_STREAMS, MAX_DEPTH_STREAM_KEY_BYTES,
+    MAX_DEPTH_STREAM_KEY_BYTES, MAX_DEPTH_STREAMS,
 };
 pub use domains::{
     CategoryScaleType, ContinuousScaleType, HorizontalDomain, MAX_GENERAL_HORIZONTAL_DOMAINS,
 };
 pub use drawing_contract::drawing_property_schema;
 pub use drawing_contract::{
-    drawing_levels_from_ratios, DrawingToolOptions, FIBONACCI_RATIOS, FIBONACCI_TIME_ZONES,
-    MAX_DRAWING_TOOL_OPTIONS_BYTES,
+    DRAWING_CONTRACT_REVISION, DrawingClipboardItem, DrawingClipboardPayload,
+    DrawingCommonSnapshot, DrawingInterval, DrawingIntervalUnit, DrawingIntervalVisibility,
+    DrawingKindOptions, DrawingLabelMetric, DrawingLabelOptions, DrawingLabelPosition,
+    DrawingLevel, DrawingLineCap, DrawingMagnetMode, DrawingPriceSegment,
+    DrawingPropertyDescriptor, DrawingPropertySchema, DrawingPropertyType, DrawingSyncPayload,
+    DrawingTemplate, MAX_DRAWING_CLIPBOARD_BYTES, MAX_DRAWING_CLIPBOARD_POINTS,
+    MAX_DRAWING_GROUP_BYTES, MAX_DRAWING_LABELS, MAX_DRAWING_LEVELS, MAX_DRAWING_NAME_BYTES,
+    MAX_DRAWING_OBJECTS, MAX_DRAWING_PRICE_SEGMENTS, MAX_DRAWING_TEMPLATE_BYTES,
+    MAX_DRAWING_TEMPLATES, MAX_DRAWING_TEXT_BYTES,
 };
 pub use drawing_contract::{
-    DrawingClipboardItem, DrawingClipboardPayload, DrawingCommonSnapshot, DrawingInterval,
-    DrawingIntervalUnit, DrawingIntervalVisibility, DrawingKindOptions, DrawingLabelMetric,
-    DrawingLabelOptions, DrawingLabelPosition, DrawingLevel, DrawingLineCap, DrawingMagnetMode,
-    DrawingPriceSegment, DrawingPropertyDescriptor, DrawingPropertySchema, DrawingPropertyType,
-    DrawingSyncPayload, DrawingTemplate, DRAWING_CONTRACT_REVISION, MAX_DRAWING_CLIPBOARD_BYTES,
-    MAX_DRAWING_CLIPBOARD_POINTS, MAX_DRAWING_GROUP_BYTES, MAX_DRAWING_LABELS, MAX_DRAWING_LEVELS,
-    MAX_DRAWING_NAME_BYTES, MAX_DRAWING_OBJECTS, MAX_DRAWING_PRICE_SEGMENTS, MAX_DRAWING_TEMPLATES,
-    MAX_DRAWING_TEMPLATE_BYTES, MAX_DRAWING_TEXT_BYTES,
+    DrawingToolOptions, FIBONACCI_RATIOS, FIBONACCI_TIME_ZONES, MAX_DRAWING_TOOL_OPTIONS_BYTES,
+    drawing_levels_from_ratios,
 };
 // B8: lines — begin
 pub use drawings::kinds::lines::{DrawingStatsPosition, LineToolOptions};
@@ -137,11 +158,11 @@ pub use drawing_text_edit::DrawingTextEditKey;
 pub use drawings::kinds::patterns_elliott_cycles::{ElliottWaveDegree, PatternToolOptions};
 pub use drawings::kinds::shapes::ShapeToolOptions;
 pub use drawings::{
-    Drawing, DrawingAnchor, DrawingCreationUpdate, DrawingDragPart, DrawingHit, DrawingId,
-    DrawingKind, DrawingModifiers, DrawingPoint, DrawingPriceScale, DrawingTextEditLayout,
-    DrawingWorkStats, TextCapCenterFn, TextMeasureFn, DRAWING_DEFAULT_COLOR,
-    DRAWING_WEAK_MAGNET_DISTANCE, MAX_BARS_PATTERN_BARS, MAX_DRAWING_ICONS,
-    MAX_DRAWING_ICON_NAME_BYTES, MAX_DRAWING_ICON_SIZE,
+    DRAWING_DEFAULT_COLOR, DRAWING_WEAK_MAGNET_DISTANCE, Drawing, DrawingAnchor,
+    DrawingCreationUpdate, DrawingDragPart, DrawingHit, DrawingId, DrawingKind, DrawingModifiers,
+    DrawingPoint, DrawingPriceScale, DrawingTextEditLayout, DrawingWorkStats,
+    MAX_BARS_PATTERN_BARS, MAX_DRAWING_ICON_NAME_BYTES, MAX_DRAWING_ICON_SIZE, MAX_DRAWING_ICONS,
+    TextCapCenterFn, TextMeasureFn,
 };
 pub(crate) use drawings::{
     DrawingAnchorTime, DrawingChartSettings, DrawingController, DrawingDrag, DrawingHistory,
@@ -163,15 +184,16 @@ pub use financial_legend::{
     FinancialLegendValue, HostLegendSeries,
 };
 pub use footprint::{
-    adaptive_trade_bubble_threshold, auto_footprint_ticks_per_row, AggressorSide, BarSequence,
-    BarSequenceMapping, BarSequencePoint, CumulativeDeltaReset, FootprintAggregationOptions,
-    FootprintAggregator, FootprintBar, FootprintBarAggregation, FootprintCellMode, FootprintError,
-    FootprintImbalanceOptions, FootprintLevel, FootprintSeriesOptions, FootprintTrade,
-    FootprintUpdateKind, FootprintVisualOptions, FootprintWorkStats, OrderFlowPresentation,
+    AggressorSide, BarSequence, BarSequenceMapping, BarSequencePoint, CumulativeDeltaReset,
+    FOOTPRINT_BAR_SPACING, FootprintAggregationOptions, FootprintAggregator, FootprintBar,
+    FootprintBarAggregation, FootprintCellMode, FootprintError, FootprintImbalanceOptions,
+    FootprintLevel, FootprintSeriesOptions, FootprintTrade, FootprintUpdateKind,
+    FootprintVisualOptions, FootprintWorkStats, HistoryPrefixStats, MAX_TIME_AND_SALES_ROWS,
+    MAX_TRADE_STREAM_KEY_BYTES, MAX_TRADE_STREAMS, ORDER_FLOW_MAX_RETAINED_SESSIONS,
+    ORDER_FLOW_MAX_RETAINED_TRADES, ORDER_FLOW_MAX_STREAM_BYTES, OrderFlowPresentation,
     OrderFlowPresentationOptions, ReplayClockStats, ReplaySeekStats, TimeAndSalesOptions,
-    TimeAndSalesRow, TradeBubbleOptions, TradeSessionOptions, TradeStreamStats, TradeStudyKind,
-    TradeStudyOptions, MAX_TIME_AND_SALES_ROWS, MAX_TRADE_STREAMS, MAX_TRADE_STREAM_KEY_BYTES,
-    ORDER_FLOW_SWEEP_WINDOW_MICROS, ORDER_FLOW_TRADE_BUBBLE_CAPACITY,
+    TimeAndSalesRow, TradeSessionOptions, TradeStreamStats, TradeStudyKind, TradeStudyOptions,
+    footprint_row_merge,
 };
 pub use frame::{
     AxisBand, AxisFrame, AxisIcon, AxisLabel, AxisLabelCorners, AxisRotatedLabel, AxisTextAlign,
@@ -181,123 +203,126 @@ pub use frame::{
 pub use general_axes::{
     AxisDimension, AxisPosition, GeneralAxis, GeneralAxisDomain, GeneralAxisOptions,
     GeneralAxisTick, GeneralScaleType, MAX_GENERAL_AXES, MAX_GENERAL_AXIS_CATEGORIES,
-    MAX_GENERAL_AXIS_CATEGORY_BYTES, MAX_GENERAL_AXIS_ID_BYTES, MAX_GENERAL_AXIS_TICKS,
-    MAX_GENERAL_AXIS_TICK_BYTES, MAX_GENERAL_AXIS_TITLE_BYTES, MAX_GENERAL_TEMPORAL_MILLISECONDS,
+    MAX_GENERAL_AXIS_CATEGORY_BYTES, MAX_GENERAL_AXIS_ID_BYTES, MAX_GENERAL_AXIS_TICK_BYTES,
+    MAX_GENERAL_AXIS_TICKS, MAX_GENERAL_AXIS_TITLE_BYTES, MAX_GENERAL_TEMPORAL_MILLISECONDS,
 };
 #[doc(hidden)]
 pub use general_data::{
     GeneralDataset, GeneralDatasetId, GeneralRowId, GeneralRowIdentity, GeneralXKind,
-    GeneralXyInput, MAX_GENERAL_DATASETS, MAX_GENERAL_DATASET_CATEGORIES,
-    MAX_GENERAL_DATASET_CATEGORY_BYTES, MAX_GENERAL_DATASET_ROWS, MAX_GENERAL_ROW_ID_BYTES,
+    GeneralXyInput, MAX_GENERAL_DATASET_CATEGORIES, MAX_GENERAL_DATASET_CATEGORY_BYTES,
+    MAX_GENERAL_DATASET_ROWS, MAX_GENERAL_DATASETS, MAX_GENERAL_ROW_ID_BYTES,
     MAX_GENERAL_ROW_ID_BYTES_TOTAL,
 };
 #[doc(hidden)]
 pub use general_series::{
-    GeneralAccessibilityItem, GeneralAccessibilitySnapshot, GeneralBrushRange,
-    GeneralBrushSnapshot, GeneralHitMode, GeneralInterpolation, GeneralLegendItem,
-    GeneralLegendSnapshot, GeneralLineStyle, GeneralPointSymbol, GeneralReference,
-    GeneralReferenceId, GeneralReferenceOptions, GeneralReferenceValue, GeneralSeries,
-    GeneralSeriesHit, GeneralSeriesId, GeneralSeriesKind, GeneralSeriesOptions,
+    DEFAULT_GENERAL_FILL_OPACITY, GeneralAccessibilityItem, GeneralAccessibilitySnapshot,
+    GeneralBrushRange, GeneralBrushSnapshot, GeneralHitMode, GeneralInterpolation,
+    GeneralLegendItem, GeneralLegendSnapshot, GeneralLineStyle, GeneralPointSymbol,
+    GeneralReference, GeneralReferenceId, GeneralReferenceOptions, GeneralReferenceValue,
+    GeneralSeries, GeneralSeriesHit, GeneralSeriesId, GeneralSeriesKind, GeneralSeriesOptions,
     GeneralSharedTooltipSnapshot, GeneralStackMode, GeneralTooltipSnapshot,
-    DEFAULT_GENERAL_FILL_OPACITY, MAX_GENERAL_ACCESSIBILITY_ITEMS, MAX_GENERAL_BRUSH_ITEMS,
-    MAX_GENERAL_POINT_RADIUS, MAX_GENERAL_REFERENCES, MAX_GENERAL_SERIES,
-    MAX_GENERAL_SERIES_COLOR_BYTES, MAX_GENERAL_SERIES_GROUP_ID_BYTES,
-    MAX_GENERAL_SERIES_STACK_ID_BYTES, MAX_GENERAL_SERIES_TITLE_BYTES,
-    MAX_GENERAL_SHARED_TOOLTIP_ITEMS, MIN_GENERAL_POINT_RADIUS,
+    MAX_GENERAL_ACCESSIBILITY_ITEMS, MAX_GENERAL_BRUSH_ITEMS, MAX_GENERAL_POINT_RADIUS,
+    MAX_GENERAL_REFERENCES, MAX_GENERAL_SERIES, MAX_GENERAL_SERIES_COLOR_BYTES,
+    MAX_GENERAL_SERIES_GROUP_ID_BYTES, MAX_GENERAL_SERIES_STACK_ID_BYTES,
+    MAX_GENERAL_SERIES_TITLE_BYTES, MAX_GENERAL_SHARED_TOOLTIP_ITEMS, MIN_GENERAL_POINT_RADIUS,
 };
 pub use hit_test::{SeriesHit, SeriesHitKind};
 pub use host_layout::{
     ExportFrame, ExportFrameRequest, FinancialFramePreparation, FinancialFrameRequest,
 };
-pub(crate) use indicators::{IndicatorBinding, IndicatorChange};
 pub use indicators::{
+    EMA_RIBBON_DEFAULT_COLORS, EMA_RIBBON_DEFAULT_PERIODS, INDICATOR_SCHEMA_REVISION,
     IndicatorBindingInfo, IndicatorChromeOptions, IndicatorInputSource, IndicatorKind,
     IndicatorOutputDescriptor, IndicatorOutputStyle, IndicatorParameterDescriptor,
-    IndicatorParameterType, IndicatorSchema, EMA_RIBBON_DEFAULT_COLORS, EMA_RIBBON_DEFAULT_PERIODS,
-    INDICATOR_SCHEMA_REVISION,
+    IndicatorParameterType, IndicatorSchema, OrderBlockZone, PreviousPeriod, StructureBreakOn,
+    StructureMitigation, StructureMitigationPrice, StudyCalendarPolicy,
 };
+pub(crate) use indicators::{IndicatorBinding, IndicatorChange};
 pub use interaction::{
-    pinch_zoom_scale, wheel_zoom_scale, CancelReason, ChartContext, GestureResolver, GestureState,
-    GestureUpdate, GestureUpdateKind, HitProfile, InputDevice, InputEvent, InputModifiers,
-    InputTarget, PointerSample, ScrollAnimation, WheelBehavior, WheelDeltaMode, WheelIntent,
-    WheelSample, KINETIC_DUMPING, KINETIC_MAX_SPEED, KINETIC_MIN_MOVE, KINETIC_MIN_SPEED,
-    MAX_ACTIVE_POINTERS, PINCH_ZOOM_INTENSITY, WHEEL_SCROLL_PX_PER_DELTA,
+    CancelReason, ChartContext, GestureResolver, GestureState, GestureUpdate, GestureUpdateKind,
+    HitProfile, InputDevice, InputEvent, InputModifiers, InputTarget, KINETIC_DUMPING,
+    KINETIC_MAX_SPEED, KINETIC_MIN_MOVE, KINETIC_MIN_SPEED, MAX_ACTIVE_POINTERS,
+    PINCH_ZOOM_INTENSITY, PointerSample, ScrollAnimation, WHEEL_SCROLL_PX_PER_DELTA, WheelBehavior,
+    WheelDeltaMode, WheelIntent, WheelSample, pinch_zoom_scale, wheel_zoom_scale,
 };
+pub use klinechart_indicators::{KLINECHART_LINE_COLORS, klinechart_indicator_for_kind_name};
 pub(crate) use klinechart_indicators::{
-    apply_klinechart_output_style, apply_klinechart_value_format, klinechart_color_rule,
-    klinechart_kind_name, klinechart_output_color, klinechart_primary_period, KLineChartColorRule,
+    KLineChartColorRule, apply_klinechart_output_style, apply_klinechart_value_format,
+    klinechart_color_rule, klinechart_kind_name, klinechart_output_color,
+    klinechart_primary_period,
 };
-pub use klinechart_indicators::{klinechart_indicator_for_kind_name, KLINECHART_LINE_COLORS};
 pub use native_primitives::{
     AccessibilityFocusOptions, AnchoredTextHorizontalAlign, AnchoredTextOptions,
     AnchoredTextVerticalAlign, BandsIndicatorOptions, DeltaTooltipActiveRange, DeltaTooltipOptions,
-    DeltaTooltipPoint, ImageWatermarkOptions, NativePrimitiveId, OverlayPriceScaleOptions,
-    OverlayPriceScaleSide, SessionHighlightingData, SessionHighlightingOptions, TextWatermarkLine,
-    TextWatermarkOptions, TooltipOptions, TooltipSnapshot, TrendLineOptions, VerticalLineOptions,
-    VolumeProfileData, VolumeProfileOptions, VolumeProfilePoint, MAX_RASTER_IMAGE_DIMENSION,
+    DeltaTooltipPoint, ImageWatermarkOptions, MAX_RASTER_IMAGE_DIMENSION, NativePrimitiveId,
+    OverlayPriceScaleOptions, OverlayPriceScaleSide, SessionHighlightingData,
+    SessionHighlightingOptions, TextWatermarkLine, TextWatermarkOptions, TooltipOptions,
+    TooltipSnapshot, TrendLineOptions, VerticalLineOptions, VolumeProfileData,
+    VolumeProfileOptions, VolumeProfilePoint,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use persistence::PersistenceRestoreProfile;
 pub use persistence::{
-    PersistenceRestoreResult, ValidatedStateV1, PERSISTENCE_MAX_DOCUMENT_BYTES,
-    PERSISTENCE_MAX_DRAWINGS, PERSISTENCE_MAX_INDICATORS, PERSISTENCE_MAX_PANES,
-    PERSISTENCE_MAX_POINTS_PER_DRAWING, PERSISTENCE_MAX_TOTAL_POINTS, PERSISTENCE_SCHEMA_VERSION,
-    PERSISTENCE_SCHEMA_VERSION_GENERAL, PERSISTENCE_SCHEMA_VERSION_STUDIES,
+    PERSISTENCE_MAX_DOCUMENT_BYTES, PERSISTENCE_MAX_DRAWINGS, PERSISTENCE_MAX_INDICATORS,
+    PERSISTENCE_MAX_PANES, PERSISTENCE_MAX_POINTS_PER_DRAWING, PERSISTENCE_MAX_TOTAL_POINTS,
+    PERSISTENCE_SCHEMA_VERSION, PERSISTENCE_SCHEMA_VERSION_GENERAL,
+    PERSISTENCE_SCHEMA_VERSION_STUDIES, PersistenceRestoreResult, ValidatedStateV1,
 };
 pub use profiles::{
-    AnchoredVwapPoint, DevelopingValueArea, NakedProfileLevel, NakedProfileLevelKind,
-    PeriodicProfilePresentationOptions, PeriodicProfilePresentationRequest, ProfileDisplayMode,
-    ProfileDrawingOptions, ProfileDrawingSnapshot, ProfileError, ProfileRequest,
-    ProfileRowSnapshot, ProfileSnapshot, ProfileSource, TpoCellMode, TpoPresentationOptions,
-    TpoRequest, TpoRowSnapshot, TpoSnapshot, MAX_PERIODIC_PROFILE_PRESENTATIONS,
+    AnchoredVwapPoint, DevelopingValueArea, MAX_PERIODIC_PROFILE_PRESENTATIONS,
     MAX_PROFILE_DEVELOPING_POINTS, MAX_PROFILE_PERIODS, MAX_PROFILE_ROWS,
     MAX_PROFILE_TOTAL_DEVELOPING_POINTS, MAX_PROFILE_TOTAL_ROWS, MAX_TPO_PERIODS,
-    MAX_TPO_PRESENTATIONS, MAX_TPO_TOTAL_CELLS, MAX_TPO_TOTAL_ROWS,
+    MAX_TPO_PRESENTATIONS, MAX_TPO_TOTAL_CELLS, MAX_TPO_TOTAL_ROWS, NakedProfileLevel,
+    NakedProfileLevelKind, PeriodicProfilePresentationOptions, PeriodicProfilePresentationRequest,
+    ProfileDisplayMode, ProfileDrawingOptions, ProfileDrawingSnapshot, ProfileError,
+    ProfileRequest, ProfileRowSnapshot, ProfileSnapshot, ProfileSource, TpoCellMode,
+    TpoPresentationOptions, TpoRequest, TpoRowSnapshot, TpoSnapshot,
 };
 pub use resampling::{
-    resample_boundaries, ResampleBoundary, ResampleError, ResampleOptions, ResampleSpan,
-    ResampleStats, ResampledBar, MAX_RESAMPLED_SERIES, MAX_RESAMPLE_BOUNDARIES,
+    MAX_RESAMPLE_BOUNDARIES, MAX_RESAMPLED_SERIES, ResampleBoundary, ResampleError,
+    ResampleOptions, ResampleSpan, ResampleStats, ResampledBar, resample_boundaries,
 };
 pub use series_update_api::{SeriesBarPatch, SeriesUpdateOutcome, SeriesUpdateRejection};
 pub use synthetic_bars::{
-    SyntheticBar, SyntheticBarAggregator, SyntheticBarError, SyntheticBarOptions,
-    SyntheticSourceBar, MAX_SYNTHETIC_BARS, MAX_SYNTHETIC_SOURCE_BARS,
+    MAX_SYNTHETIC_BARS, MAX_SYNTHETIC_SOURCE_BARS, SyntheticBar, SyntheticBarAggregator,
+    SyntheticBarError, SyntheticBarOptions, SyntheticSourceBar,
 };
 pub use time_tick_marks_api::{
-    TimeTickMark, TimeTickMarksError, MAX_TIME_TICK_LABEL_BYTES, MAX_TIME_TICK_MARKS,
+    MAX_TIME_TICK_LABEL_BYTES, MAX_TIME_TICK_MARKS, TimeTickMark, TimeTickMarksError,
 };
 pub use trading::{
     AccountId, ExecutionId, ExecutionKind, ExecutionMarkerShape, HostEventHit, HostEventMarker,
-    HostOverlaySnapshot, HostTimeWindow, InstrumentMetadata, OrderId, OrderKind, OrderRole,
-    OrderSide, OrderStatus, PositionId, PositionSide, TradingAnnotation,
+    HostOverlaySnapshot, HostTimeWindow, InstrumentMetadata, MAX_HOST_EVENTS, MAX_HOST_WINDOWS,
+    MAX_TRADING_ANNOTATIONS, MAX_TRADING_OBJECTS, MAX_TRADING_ROUND_TRIPS, OrderId, OrderKind,
+    OrderRole, OrderSide, OrderStatus, PositionId, PositionSide, TradingAnnotation,
     TradingAnnotationPlacement, TradingAnnotationTone, TradingCursor, TradingExecution,
     TradingGroupId, TradingHit, TradingHitKind, TradingIntent, TradingIntentAction,
     TradingObjectId, TradingPosition, TradingPreview, TradingPreviewSource, TradingPriceScale,
     TradingRoundTrip, TradingRoundTripOutcome, TradingSnapshot, TradingStyle, TradingStyleOptions,
-    WorkingOrder, MAX_HOST_EVENTS, MAX_HOST_WINDOWS, MAX_TRADING_ANNOTATIONS, MAX_TRADING_OBJECTS,
-    MAX_TRADING_ROUND_TRIPS,
+    WorkingOrder,
 };
 pub use workspace::{SplitDirection, Workspace, WorkspaceError, WorkspaceLayout};
 
+use aeris_charts_core::TimePointIndex;
 use aeris_charts_core::format::price_formatter::PriceFormatter;
 pub use aeris_charts_core::format::price_tick_ladder::{
-    PriceTickBand, PriceTickLadder, MAX_PRICE_TICK_BANDS,
+    MAX_PRICE_TICK_BANDS, PriceTickBand, PriceTickLadder,
 };
-use aeris_charts_core::format::time_formatter::{MonthNames, DEFAULT_DATE_FORMAT};
+use aeris_charts_core::format::time_formatter::{DEFAULT_DATE_FORMAT, MonthNames};
 pub use aeris_charts_core::model::data_layer::TimeAlignment;
 use aeris_charts_core::model::data_layer::{
     DataLayer, DataLayerMemoryUsage, MergedTimeMapping, PointColorChannel, SeriesId, SeriesIdError,
 };
 use aeris_charts_core::model::data_validation::{
-    sanitize_ohlc, sanitize_ohlc_styled, sanitize_point, validate_timestamp, ValidationError,
-    ValidationReport,
+    ValidationError, ValidationReport, sanitize_ohlc, sanitize_ohlc_styled, sanitize_point,
+    validate_timestamp,
 };
 use aeris_charts_core::model::magnet::CrosshairMode;
 use aeris_charts_core::model::plot_list::{MismatchDirection, PlotValueIndex};
 use aeris_charts_core::model::price_range::PriceRange;
 use aeris_charts_core::model::range::{LogicalRange, StrictRange};
 pub use aeris_charts_core::options::ChartTheme;
-use aeris_charts_core::options::{chart_theme_patch, ChartOptionsStore};
+use aeris_charts_core::options::{ChartOptionsStore, chart_theme_patch};
 pub use aeris_charts_core::scale::exchange_time::{
     ExchangeTime, ExchangeTimeError, UtcOffsetSchedule, UtcOffsetTransition,
 };
@@ -306,16 +331,15 @@ use aeris_charts_core::scale::price_scale_core::{
     PriceScaleCore, PriceScaleCoreOptions, PriceScaleMargins,
 };
 pub use aeris_charts_core::scale::session_slots::{
-    parse_iso_date, parse_wall_clock, session_slot_times, SessionSlotConvention, SessionSlotError,
-    SessionWindow, MAX_SESSION_SLOTS, MAX_SESSION_WINDOWS,
+    MAX_SESSION_SLOTS, MAX_SESSION_WINDOWS, SessionSlotConvention, SessionSlotError, SessionWindow,
+    parse_iso_date, parse_wall_clock, session_slot_times,
 };
 pub use aeris_charts_core::scale::session_slots::{
-    session_window_bounds, OutOfSessionPolicy, SessionBarGrid,
+    OutOfSessionPolicy, SessionBarGrid, session_window_bounds,
 };
 use aeris_charts_core::scale::time_scale_core::{TimeScaleCore, TimeScaleOptions};
 use aeris_charts_core::scale::time_tick_marks::{self, TimeTickMarks};
 pub use aeris_charts_core::time_zone::{ChartTimeZone, DEFAULT_TIME_ZONE, TRADINGVIEW_TIME_ZONES};
-use aeris_charts_core::TimePointIndex;
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, LineType};
 
@@ -483,6 +507,16 @@ pub struct AutoscaleInfo {
 /// (`None` when the series has no data) and returns the info that REPLACES it (`None` removes the
 /// series from autoscale). Hosts must not call back into the chart from the provider.
 pub type AutoscaleInfoProviderFn = Box<dyn Fn(Option<AutoscaleInfo>) -> Option<AutoscaleInfo>>;
+
+/// Stable sort of price-scale targets by `key`. Every target ordering goes through this one
+/// function so the WASM module carries a single sort instantiation instead of one per call site's
+/// key closure (about 10 KB each).
+pub(crate) fn sort_scale_targets(
+    targets: &mut [PriceScaleTarget],
+    key: &dyn Fn(PriceScaleTarget) -> (usize, usize),
+) {
+    targets.sort_by_key(|target| key(*target));
+}
 
 /// Apply the chart-level `leftPriceScale`/`rightPriceScale` tick keys (reference
 /// `tickMarkDensity`/`ensureEdgeTickMarksVisible`) present in `group` to one scale.
@@ -1619,6 +1653,9 @@ pub struct Pane {
     pub left_scale: PriceScaleCore,
     pub overlay_scale: PriceScaleCore,
     pub(crate) named_scales: Vec<NamedPriceScale>,
+    /// Price formats selected for a whole scale. Series joining the scale later adopt them, and
+    /// engine-built price labels on the scale format through them.
+    explicit_price_formats: Vec<(PriceScaleTarget, ScalePriceFormat)>,
     next_price_scale_id: u32,
     right_scale_order: usize,
     left_scale_order: usize,
@@ -1665,6 +1702,7 @@ impl Pane {
             left_scale: PriceScaleCore::new(PriceScaleCoreOptions::default()),
             overlay_scale,
             named_scales: Vec::new(),
+            explicit_price_formats: Vec::new(),
             next_price_scale_id: 1,
             right_scale_order: 0,
             left_scale_order: 0,
@@ -1747,7 +1785,35 @@ pub(crate) struct NamedPriceScale {
     pub scale: PriceScaleCore,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ScalePriceFormat {
+    pub precision: u32,
+    pub min_move: f64,
+}
+
 impl Pane {
+    pub(crate) fn explicit_price_format(
+        &self,
+        target: PriceScaleTarget,
+    ) -> Option<ScalePriceFormat> {
+        self.explicit_price_formats
+            .iter()
+            .find(|(candidate, _)| *candidate == target)
+            .map(|(_, format)| *format)
+    }
+
+    pub(crate) fn set_explicit_price_format(
+        &mut self,
+        target: PriceScaleTarget,
+        format: Option<ScalePriceFormat>,
+    ) {
+        self.explicit_price_formats
+            .retain(|(candidate, _)| *candidate != target);
+        if let Some(format) = format {
+            self.explicit_price_formats.push((target, format));
+        }
+    }
+
     pub(crate) fn scale(&self, target: PriceScaleTarget) -> Option<&PriceScaleCore> {
         match target {
             PriceScaleTarget::Right => Some(&self.price_scale),
@@ -1871,7 +1937,9 @@ impl Pane {
                 .filter(|entry| entry.side == side)
                 .map(|entry| PriceScaleTarget::Named(entry.id)),
         );
-        targets.sort_by_key(|target| self.scale_order(*target).unwrap_or(usize::MAX));
+        sort_scale_targets(&mut targets, &|target| {
+            (self.scale_order(target).unwrap_or(usize::MAX), 0)
+        });
         targets
     }
 
@@ -1897,10 +1965,10 @@ impl Pane {
         for (order, candidate) in old_targets.into_iter().enumerate() {
             self.set_scale_order(candidate, order);
         }
-        if let PriceScaleTarget::Named(id) = target {
-            if let Some(entry) = self.named_scale_mut(id) {
-                entry.side = side;
-            }
+        if let PriceScaleTarget::Named(id) = target
+            && let Some(entry) = self.named_scale_mut(id)
+        {
+            entry.side = side;
         }
         let mut targets = self.ordered_side_targets(side);
         targets.retain(|candidate| *candidate != target);
@@ -1993,6 +2061,9 @@ pub struct ChartEngine {
     sequence_points: Option<Vec<BarSequencePoint>>,
     synthetic_series: HashMap<SeriesId, SyntheticBarAggregator>,
     resampled_series: HashMap<SeriesId, resampling::ResampleBinding>,
+    /// Host-supplied study sessions; runtime-only, never included in workspace persistence.
+    study_calendar: Vec<ResampleBoundary>,
+    study_calendar_spans: Vec<aeris_charts_indicators::SessionSpan>,
     depth_streams: HashMap<u64, DepthBook>,
     depth_stream_keys: HashMap<String, u64>,
     next_depth_stream_id: u64,
@@ -2023,12 +2094,13 @@ pub struct ChartEngine {
     grid_color_follows_theme: bool,
     crosshair_color_follows_theme: bool,
     pub crosshair_mode: CrosshairMode,
-    /// The temporary Ctrl-held drawing magnet: while set during drawing creation or drag, a
-    /// Normal-mode crosshair snaps to the hovered bar's rendered prices exactly like
+    /// The temporary Ctrl/Cmd-held drawing magnet toggle, reported by the input controller only
+    /// during drawing work: a Normal-mode crosshair then snaps with the worked drawing's
+    /// effective magnet (`drawing_work_magnet`, resolved with this flag by
+    /// `effective_drawing_magnet`), to the hovered bar's rendered prices exactly like
     /// `CrosshairMode::MagnetOhlc` (OHLC for candles/bars, close/value for scalar series;
-    /// frame/crosshair.rs `crosshair_snap`). Free browsing stays raw. The gesture layer
-    /// forwards the live modifier state; the configured `crosshair_mode` is untouched
-    /// (Magnet/MagnetOhlc stay as configured, Hidden stays hidden).
+    /// frame/crosshair.rs `crosshair_snap`). Free browsing stays raw; the configured
+    /// `crosshair_mode` is untouched (Magnet/MagnetOhlc stay as configured, Hidden stays hidden).
     pub crosshair_ohlc_magnet: bool,
     pub animation_time: f64,
     pub next_price_line_id: u32,
@@ -2107,6 +2179,8 @@ pub struct ChartEngine {
     pub(crate) left_builtin_axis_w: f64,
     pub(crate) right_builtin_axis_w: f64,
     indicators: Vec<IndicatorBinding>,
+    custom_studies: BTreeMap<String, custom_studies::RegisteredCustomStudy>,
+    custom_study_faults: VecDeque<CustomStudyFaultEvent>,
     indicator_chrome: IndicatorChromeOptions,
     external_study_outputs: BTreeMap<(u64, usize), external_studies::ExternalStudyOutputState>,
     external_study_panes: BTreeMap<(u64, u8), PaneId>,
@@ -2121,7 +2195,8 @@ pub struct ChartEngine {
     trade_stream_keys: HashMap<String, u64>,
     trade_bar_dependents: HashMap<u64, Vec<footprint::TradeBarDependent>>,
     trade_dependents: HashMap<u64, Vec<footprint::TradeStudyDependent>>,
-    trade_bubbles: HashMap<u64, Vec<footprint::TradeBubbleDependent>>,
+    big_trades: HashMap<u64, Vec<big_trades::BigTradesIndicator>>,
+    auction_markers: BTreeMap<u64, Vec<auction_markers::AuctionMarkerIndicator>>,
     next_trade_stream_id: u64,
     synced_points_len: usize,
     synced_time_points_generation: u64,
@@ -2291,6 +2366,8 @@ impl ChartEngine {
             sequence_points: None,
             synthetic_series: HashMap::new(),
             resampled_series: HashMap::new(),
+            study_calendar: Vec::new(),
+            study_calendar_spans: Vec::new(),
             depth_streams: HashMap::new(),
             depth_stream_keys: HashMap::new(),
             next_depth_stream_id: 1,
@@ -2356,6 +2433,8 @@ impl ChartEngine {
             left_builtin_axis_w: 0.0,
             right_builtin_axis_w: 0.0,
             indicators: Vec::new(),
+            custom_studies: BTreeMap::new(),
+            custom_study_faults: VecDeque::new(),
             indicator_chrome: IndicatorChromeOptions::default(),
             external_study_outputs: BTreeMap::new(),
             external_study_panes: BTreeMap::new(),
@@ -2365,7 +2444,8 @@ impl ChartEngine {
             trade_stream_keys: HashMap::new(),
             trade_bar_dependents: HashMap::new(),
             trade_dependents: HashMap::new(),
-            trade_bubbles: HashMap::new(),
+            big_trades: HashMap::new(),
+            auction_markers: BTreeMap::new(),
             next_trade_stream_id: 1,
             synced_points_len: 0,
             synced_time_points_generation: 0,
@@ -2915,6 +2995,7 @@ impl ChartEngine {
                 visual: Default::default(),
             });
         }
+        self.adopt_scale_price_format(id);
         // new series paint on top (reference appends to the pane's data sources)
         self.series_order.push(id);
         // Custom time-only rows and footprint scale-projection rows both anchor the base index.
@@ -3021,10 +3102,10 @@ impl ChartEngine {
                 if !tombstones.contains(&binding.target) {
                     tombstones.push(binding.target);
                 }
-                if let Some(volume_target) = binding.volume_target {
-                    if !tombstones.contains(&volume_target) {
-                        tombstones.push(volume_target);
-                    }
+                if let Some(volume_target) = binding.volume_target
+                    && !tombstones.contains(&volume_target)
+                {
+                    tombstones.push(volume_target);
                 }
             }
         }
@@ -3063,6 +3144,18 @@ impl ChartEngine {
                     .volume_target
                     .is_none_or(|target| !tombstones.contains(&target))
         });
+        // Big-trades indicators leave with their series before liveness is computed, so a stream
+        // they alone kept alive is released in the same sweep.
+        for indicators in self.big_trades.values_mut() {
+            indicators.retain(|indicator| !tombstones.contains(&indicator.series_id));
+        }
+        self.big_trades
+            .retain(|_, indicators| !indicators.is_empty());
+        for indicators in self.auction_markers.values_mut() {
+            indicators.retain(|indicator| !tombstones.contains(&indicator.series_id));
+        }
+        self.auction_markers
+            .retain(|_, indicators| !indicators.is_empty());
         let mut live_streams = self
             .series
             .iter()
@@ -3071,7 +3164,8 @@ impl ChartEngine {
         live_streams.extend(self.trade_stream_keys.values().copied());
         live_streams.extend(self.trade_bar_dependents.keys().copied());
         live_streams.extend(self.trade_dependents.keys().copied());
-        live_streams.extend(self.trade_bubbles.keys().copied());
+        live_streams.extend(self.big_trades.keys().copied());
+        live_streams.extend(self.auction_markers.keys().copied());
         self.trade_streams
             .retain(|stream_id, _| live_streams.contains(stream_id));
         self.trade_stream_keys
@@ -3086,12 +3180,6 @@ impl ChartEngine {
             dependents.retain(|dependent| !tombstones.contains(&dependent.series_id));
         }
         self.trade_dependents.retain(|stream_id, dependents| {
-            live_streams.contains(stream_id) && !dependents.is_empty()
-        });
-        for dependents in self.trade_bubbles.values_mut() {
-            dependents.retain(|dependent| !tombstones.contains(&dependent.series_id));
-        }
-        self.trade_bubbles.retain(|stream_id, dependents| {
             live_streams.contains(stream_id) && !dependents.is_empty()
         });
         self.clear_sequence_axis_if_unused();
@@ -3466,6 +3554,7 @@ impl ChartEngine {
         }
         series.pane_index = pane_index;
         series.price_scale_target = destination_target;
+        self.adopt_scale_price_format(id);
         // Both the scale the series left and the one it joined refit exactly.
         self.reset_scale_stabilization_at(from, current_target);
         self.reset_scale_stabilization_at(pane_index, destination_target);
@@ -3511,9 +3600,11 @@ impl ChartEngine {
         let Some(series) = self.series_entry_mut(id) else {
             return false;
         };
+        let joined = series.pane_index != pane_index || series.price_scale_target != target;
         series.pane_index = pane_index;
         series.price_scale_target = target;
-        if (from, from_target) != (pane_index, target) {
+        if joined {
+            self.adopt_scale_price_format(id);
             // Both the scale the series left and the one it joined refit exactly.
             self.reset_scale_stabilization_at(from, from_target);
             self.reset_scale_stabilization_at(pane_index, target);
@@ -3823,8 +3914,6 @@ impl ChartEngine {
 
     pub fn set_series_markers(&mut self, id: SeriesId, markers: Vec<Marker>) {
         self.invalidate_frame_series(id);
-        // A trade-bubble fold writing this series must refold on its next refresh.
-        self.invalidate_trade_bubble_folds(id, None);
         if let Some(series) = self.series_entry_mut(id) {
             series.markers = markers;
         }
@@ -4554,7 +4643,23 @@ impl ChartEngine {
         for (index, point) in points.iter_mut().enumerate() {
             point.logical_index = (from + index) as u64;
         }
+        // A late print or correction can move bar identities inside the suffix (an earlier
+        // non-time bar opens and every later bar shifts one position); drawing anchors then
+        // follow their bars through one identity mapping, as a complete install maps them.
+        let moved = replaced
+            .iter()
+            .zip(&points)
+            .any(|(old, new)| old.open_timestamp_micros != new.open_timestamp_micros);
+        let mapping = moved.then(|| {
+            let mut old = sequence.clone();
+            old.extend_from_slice(&replaced);
+            let mut new = sequence.clone();
+            new.extend_from_slice(&points);
+            BarSequenceMapping::between_points(&old, &new)
+        });
         sequence.extend_from_slice(&points);
+        let previous_pending =
+            mapping.map(|mapping| self.pending_sequence_mapping.replace(mapping));
         let times = (from..from + points.len())
             .map(|index| key_base + index as i64)
             .collect::<Vec<_>>();
@@ -4563,6 +4668,9 @@ impl ChartEngine {
             if let Some(sequence) = self.sequence_points.as_mut() {
                 sequence.truncate(from);
                 sequence.extend(replaced);
+            }
+            if let Some(previous) = previous_pending {
+                self.pending_sequence_mapping = previous;
             }
         }
         accepted
@@ -5792,6 +5900,17 @@ impl ChartEngine {
                 ) as u8;
                 self.tick_marks.push_weight(index as i64, weight);
             }
+            // The first point is weighed from the average cadence, which telescopes to
+            // (last - first) / (len - 1): an append revises it in O(1) while every other weight
+            // keeps its value. `appended` implies `tick_len > 1`.
+            self.tick_marks
+                .set_first_weight(time_tick_marks::first_point_weight_shifted_in(
+                    tick_time(0),
+                    tick_time(tick_len - 1) - tick_time(0),
+                    tick_len,
+                    label_shift,
+                    &self.exchange_time,
+                ));
         } else if let Some(dropped) = front_trim {
             // A retention trim on a time axis (and the points a tip appended with it): the
             // surviving points keep their timestamps and so their weights. Only the first point,

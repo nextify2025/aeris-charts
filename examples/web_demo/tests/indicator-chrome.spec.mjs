@@ -1,4 +1,5 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test, wait_for_chart } from "./page-ready.mjs";
 
 // Platform indicator-chrome building blocks: series lifecycle events, indicator lineage,
 // per-pane geometry anchors (top-left chip placement), hover values for the main series and
@@ -6,10 +7,7 @@ import { test, expect } from "@playwright/test";
 // owns no chips — it only supplies these APIs.
 
 async function wait_grid(page) {
-  await page.waitForFunction(() => window.__grid !== undefined && window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
+  await wait_for_chart(page, { grid: true });
 }
 
 async function wait_cell_charts(page) {

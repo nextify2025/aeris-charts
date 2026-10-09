@@ -6,7 +6,7 @@ on:
     tags: ["v*"]
 
 env:
-  RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-msvc
+  RUSTUP_TOOLCHAIN: 1.99.0-x86_64-pc-windows-msvc
   AERIS_CHARTS_BENCH_ENV_CLASS: official-benchmark-runner
   AERIS_CHARTS_BENCH_ENV_ID: official-win-gpu-01
 

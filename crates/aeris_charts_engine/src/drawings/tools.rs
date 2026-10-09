@@ -126,8 +126,8 @@
 // (upstream's solid centre, not none), and the third handle of the parallel, flat and disjoint
 // channels (on the free third anchor, not the second line's midpoint).
 
-use super::kinds::DrawingFamily;
 use super::DrawingKind;
+use super::kinds::DrawingFamily;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DrawingPlacement {

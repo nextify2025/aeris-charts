@@ -55,10 +55,8 @@ pub(crate) fn importable_chart_options(options: &serde_json::Value) -> serde_jso
         Some(serde_json::Value::String(id)) => ChartTimeZone::parse(id).is_some(),
         Some(_) => false,
     };
-    if !usable {
-        if let Some(map) = options.as_object_mut() {
-            map.remove("timezone");
-        }
+    if !usable && let Some(map) = options.as_object_mut() {
+        map.remove("timezone");
     }
     options
 }
@@ -309,7 +307,7 @@ fn time_zone_json(offsets: &UtcOffsetSchedule) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use aeris_charts_core::scale::time_tick_marks::{days_from_civil, TickMarkWeight};
+    use aeris_charts_core::scale::time_tick_marks::{TickMarkWeight, days_from_civil};
 
     use crate::{
         AxisTextAlign, AxisTextMidpoint, ChartEngine, SeriesKind, UtcOffsetSchedule,

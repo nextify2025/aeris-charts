@@ -410,10 +410,12 @@ mod tests {
         let profile = volume_profile(bars.into_iter(), 8, 100.0, 0.01).unwrap();
         assert_eq!(profile.bar_count, 1);
         assert_eq!(profile.rows.iter().map(|row| row.volume).sum::<f64>(), 7.0);
-        assert!(volume_profile(std::iter::empty(), 512, 70.0, 0.01)
-            .unwrap()
-            .rows
-            .is_empty());
+        assert!(
+            volume_profile(std::iter::empty(), 512, 70.0, 0.01)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
         assert!(volume_profile(std::iter::empty(), 513, 70.0, 0.01).is_err());
         assert!(volume_profile(bars.into_iter(), 4, f64::NAN, 0.01).is_err());
     }

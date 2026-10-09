@@ -1,7 +1,7 @@
 //! `CR` (带状能量线). Ported from KLineChart `src/extension/indicator/currentRatio.ts`.
 
-use super::stepper::{fold, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold};
 
 /// CR outputs in KLineChart figure order.
 #[derive(Clone, Debug, PartialEq)]

@@ -207,10 +207,12 @@ fn catalog_defaults_follow_each_tool() {
                 LineStyle::Dashed
             }
         );
-        assert!(drawing
-            .levels
-            .iter()
-            .all(|level| level.visible && level.fill_between && level.label_visible));
+        assert!(
+            drawing
+                .levels
+                .iter()
+                .all(|level| level.visible && level.fill_between && level.label_visible)
+        );
     }
     // TradingView's retracement levels and palette; time zones follow the Fibonacci sequence.
     let retracement = legacy(DrawingKind::FibonacciRetracement);
@@ -275,10 +277,12 @@ fn armed_tools_place_every_fibonacci_kind() {
         assert_eq!(chart.selected_drawing(), Some(id));
     }
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .points
-        .iter()
-        .all(|point| point[0].is_finite() && point[1].is_finite()));
+    assert!(
+        frame.panes[0]
+            .points
+            .iter()
+            .all(|point| point[0].is_finite() && point[1].is_finite())
+    );
 }
 
 #[test]
@@ -483,9 +487,11 @@ fn clipboard_and_sync_payloads_carry_levels_and_tool_options() {
 fn fibonacci_tools_tolerate_charts_without_data_and_degenerate_anchors() {
     let mut empty = ChartEngine::new(800.0, 500.0, 1.0);
     for kind in FIB_KINDS {
-        assert!(empty
-            .add_drawing(kind, 0, anchors_for(kind), None)
-            .is_some());
+        assert!(
+            empty
+                .add_drawing(kind, 0, anchors_for(kind), None)
+                .is_some()
+        );
     }
     empty.build_frame();
     assert_eq!(empty.hit_test_drawing(100.0, 100.0), None);
@@ -497,20 +503,24 @@ fn fibonacci_tools_tolerate_charts_without_data_and_degenerate_anchors() {
         // Non-positive prices fall back to linear levels under log scale.
         let points =
             vec![p(12.0, -5.0), p(14.0, 0.0), p(16.0, 3.0)][..kind.anchor_count()].to_vec();
-        assert!(chart
-            .add_drawing(
-                kind,
-                0,
-                points,
-                Some(r#"{"tool_options":{"fibonacci":{"log_scale":true}}}"#)
-            )
-            .is_some());
+        assert!(
+            chart
+                .add_drawing(
+                    kind,
+                    0,
+                    points,
+                    Some(r#"{"tool_options":{"fibonacci":{"log_scale":true}}}"#)
+                )
+                .is_some()
+        );
     }
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .points
-        .iter()
-        .all(|point| point[0].is_finite() && point[1].is_finite()));
+    assert!(
+        frame.panes[0]
+            .points
+            .iter()
+            .all(|point| point[0].is_finite() && point[1].is_finite())
+    );
     chart.hit_test_drawing(400.0, 200.0);
 }
 
@@ -992,9 +1002,11 @@ fn full_circles_turn_speed_arcs_into_rings() {
         far_side(points),
         "the ring passes opposite the first anchor"
     );
-    assert!(points
-        .iter()
-        .all(|p| ((p.0 - b.0).hypot(p.1 - b.1) - radius).abs() < 0.3));
+    assert!(
+        points
+            .iter()
+            .all(|p| ((p.0 - b.0).hypot(p.1 - b.1) - radius).abs() < 0.3)
+    );
     assert!(close(points[0], *points.last().unwrap(), 0.01), "closed");
     assert_eq!(
         body(&chart, opposite.0, opposite.1).map(|hit| hit.0),

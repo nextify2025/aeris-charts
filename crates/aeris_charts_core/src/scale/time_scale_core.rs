@@ -241,11 +241,7 @@ impl TimeScaleCore {
     }
 
     fn first_index(&self) -> Option<TimePointIndex> {
-        if self.points_len == 0 {
-            None
-        } else {
-            Some(0)
-        }
+        if self.points_len == 0 { None } else { Some(0) }
     }
 
     fn last_index(&self) -> Option<TimePointIndex> {
@@ -306,10 +302,10 @@ impl TimeScaleCore {
         }
         // A locked range reports the exact host range while the spacing honors it; derived
         // borders would carry floating-point noise from `width / (width / count)`.
-        if let Some(locked) = self.locked_range {
-            if self.bar_spacing == self.width / (locked.right() - locked.left() + 1.0) {
-                return Some(locked);
-            }
+        if let Some(locked) = self.locked_range
+            && self.bar_spacing == self.width / (locked.right() - locked.left() + 1.0)
+        {
+            return Some(locked);
         }
         self.derived_visible_logical_range()
     }
@@ -354,14 +350,13 @@ impl TimeScaleCore {
             self.bar_spacing = self.bar_spacing * new_width / old_width;
         }
 
-        if self.options.fix_left_edge {
-            if let Some(prev) = previous_visible_range {
-                if prev.left() <= 0.0 {
-                    let delta = old_width - new_width;
-                    // reducing right_offset means moving right
-                    self.right_offset -= (delta / self.bar_spacing).round() + 1.0;
-                }
-            }
+        if self.options.fix_left_edge
+            && let Some(prev) = previous_visible_range
+            && prev.left() <= 0.0
+        {
+            let delta = old_width - new_width;
+            // reducing right_offset means moving right
+            self.right_offset -= (delta / self.bar_spacing).round() + 1.0;
         }
 
         // bar spacing first: right offset correction depends on it
@@ -679,10 +674,10 @@ impl TimeScaleCore {
 
     fn correct_offset(&mut self) {
         // block scrolling into the past
-        if let Some(min_right_offset) = self.min_right_offset() {
-            if self.right_offset < min_right_offset {
-                self.right_offset = min_right_offset;
-            }
+        if let Some(min_right_offset) = self.min_right_offset()
+            && self.right_offset < min_right_offset
+        {
+            self.right_offset = min_right_offset;
         }
 
         // block scrolling into the future

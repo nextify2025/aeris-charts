@@ -11,11 +11,11 @@
 //! Uses Aeris's coordinate, bar-width, and snapping calculations.
 
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{segment_points, IRect, LineStyle, LineType};
+use aeris_charts_render::draw_list::{IRect, LineStyle, LineType, segment_points};
 pub(crate) use aeris_charts_render::line::round_rect_polygon;
 use aeris_charts_render::line::{
-    build_area_fill, expand_line_into, stroke_aa, AreaMesh, LineParams, LinePoint, RoundRectBorder,
-    STROKE_AA_SOLID,
+    AreaMesh, LineParams, LinePoint, RoundRectBorder, STROKE_AA_SOLID, build_area_fill,
+    expand_line_into, stroke_aa,
 };
 
 use crate::scene::{DeviceRect, MeshVertex, Paint, SOLID_ST};
@@ -937,21 +937,31 @@ mod tests {
             &[[10.0, 10.0], [30.0, 10.0], [30.0, 30.0], [10.0, 30.0]],
         );
         let vertices = &pool[first as usize..(first + count) as usize];
-        assert!(vertices
-            .iter()
-            .any(|v| v.y == 10.0 && v.st == stroke_distance_st(0.0)));
-        assert!(vertices
-            .iter()
-            .any(|v| v.y == 9.0 && v.st == stroke_distance_st(1.0)));
-        assert!(vertices
-            .iter()
-            .any(|v| v.x == 31.0 && v.st == stroke_distance_st(1.0)));
-        assert!(vertices
-            .iter()
-            .any(|v| v.y == 31.0 && v.st == stroke_distance_st(1.0)));
-        assert!(vertices
-            .iter()
-            .any(|v| v.x == 9.0 && v.st == stroke_distance_st(1.0)));
+        assert!(
+            vertices
+                .iter()
+                .any(|v| v.y == 10.0 && v.st == stroke_distance_st(0.0))
+        );
+        assert!(
+            vertices
+                .iter()
+                .any(|v| v.y == 9.0 && v.st == stroke_distance_st(1.0))
+        );
+        assert!(
+            vertices
+                .iter()
+                .any(|v| v.x == 31.0 && v.st == stroke_distance_st(1.0))
+        );
+        assert!(
+            vertices
+                .iter()
+                .any(|v| v.y == 31.0 && v.st == stroke_distance_st(1.0))
+        );
+        assert!(
+            vertices
+                .iter()
+                .any(|v| v.x == 9.0 && v.st == stroke_distance_st(1.0))
+        );
     }
 
     #[test]
@@ -1257,9 +1267,11 @@ mod tests {
             (lo.min(v.y), hi.max(v.y))
         });
         assert_eq!((y0, y1), (4.0, 40.0));
-        assert!(pool[(first + count) as usize..]
-            .iter()
-            .any(|v| v.st != SOLID_ST));
+        assert!(
+            pool[(first + count) as usize..]
+                .iter()
+                .any(|v| v.st != SOLID_ST)
+        );
     }
 
     #[test]
@@ -1397,12 +1409,16 @@ mod tests {
         assert!(verts
             .iter()
             .any(|v| (v.y - 12.5).abs() < 1e-4 && v.st == stroke_distance_st(STROKE_AA_HALF_PX)));
-        assert!(verts
-            .iter()
-            .any(|v| (v.y - 11.5).abs() < 1e-4 && v.st == stroke_distance_st(-STROKE_AA_HALF_PX)));
-        assert!(verts
-            .iter()
-            .any(|v| (v.y - 8.5).abs() < 1e-4 && v.st == SOLID_ST));
+        assert!(
+            verts.iter().any(
+                |v| (v.y - 11.5).abs() < 1e-4 && v.st == stroke_distance_st(-STROKE_AA_HALF_PX)
+            )
+        );
+        assert!(
+            verts
+                .iter()
+                .any(|v| (v.y - 8.5).abs() < 1e-4 && v.st == SOLID_ST)
+        );
         assert!(
             verts
                 .iter()

@@ -206,11 +206,21 @@ impl core::fmt::Display for ValidationError {
             ValidationError::InvalidTimestamp { index, error } => {
                 write!(f, "invalid timestamp at row {index}: {error}")
             }
-            ValidationError::LengthMismatch { times, open, high, low, close } => write!(
+            ValidationError::LengthMismatch {
+                times,
+                open,
+                high,
+                low,
+                close,
+            } => write!(
                 f,
                 "time/OHLC arrays must have equal length (times={times}, open={open}, high={high}, low={low}, close={close})"
             ),
-            ValidationError::ColorLengthMismatch { times, channel, colors } => write!(
+            ValidationError::ColorLengthMismatch {
+                times,
+                channel,
+                colors,
+            } => write!(
                 f,
                 "point-color channel must match the row count (channel={channel}, times={times}, colors={colors})"
             ),
@@ -285,14 +295,14 @@ pub fn sanitize_ohlc_styled(
 ) -> Result<SanitizedOhlcStyled, ValidationError> {
     const CHANNEL_NAMES: [&str; 3] = ["body", "wick", "border"];
     for (name, channel) in CHANNEL_NAMES.into_iter().zip(&colors) {
-        if let Some(channel) = channel {
-            if channel.len() != times.len() {
-                return Err(ValidationError::ColorLengthMismatch {
-                    times: times.len(),
-                    channel: name,
-                    colors: channel.len(),
-                });
-            }
+        if let Some(channel) = channel
+            && channel.len() != times.len()
+        {
+            return Err(ValidationError::ColorLengthMismatch {
+                times: times.len(),
+                channel: name,
+                colors: channel.len(),
+            });
         }
     }
     let present = [

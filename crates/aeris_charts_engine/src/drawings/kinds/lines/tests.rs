@@ -224,9 +224,11 @@ fn cross_lines_span_both_axes_and_tag_their_price() {
     assert!(axis.labels.iter().any(|label| label.text == "102.00"));
     // Either line is a body target far from the anchor.
     assert!(chart.hit_test_drawing(20.0, y).is_some());
-    assert!(chart
-        .hit_test_drawing(x, chart.panes[0].top + 5.0)
-        .is_some());
+    assert!(
+        chart
+            .hit_test_drawing(x, chart.panes[0].top + 5.0)
+            .is_some()
+    );
     // A body drag moves both coordinates.
     assert!(chart.drawing_drag_start_at(20.0, y));
     chart.drawing_drag_to(60.0, y - 40.0, DrawingModifiers::default());
@@ -413,15 +415,19 @@ fn schema_kind_options_and_tool_option_patches_are_typed_and_atomic() {
     assert_eq!(stats.default, serde_json::json!("end"));
     assert_eq!(stats.enum_values, ["start", "middle", "end"]);
     let arrow = crate::drawing_property_schema(DrawingKind::ArrowLine);
-    assert!(arrow
-        .properties
-        .iter()
-        .any(|property| property.name == "stroke_end" && property.default == "arrow"));
+    assert!(
+        arrow
+            .properties
+            .iter()
+            .any(|property| property.name == "stroke_end" && property.default == "arrow")
+    );
     // Core tools keep their historical schema.
-    assert!(!crate::drawing_property_schema(DrawingKind::TrendLine)
-        .properties
-        .iter()
-        .any(|property| property.name.starts_with("tool_options")));
+    assert!(
+        !crate::drawing_property_schema(DrawingKind::TrendLine)
+            .properties
+            .iter()
+            .any(|property| property.name.starts_with("tool_options"))
+    );
 
     let mut chart = chart();
     let id = add(
@@ -627,24 +633,28 @@ fn lines_tools_tolerate_charts_without_data_and_degenerate_anchors() {
     assert_eq!(empty.hit_test_drawing(100.0, 100.0), None);
 
     let mut chart = chart();
-    assert!(chart
-        .add_drawing(
-            DrawingKind::Ray,
-            0,
-            vec![p(f64::NAN, 1.0), p(2.0, 3.0)],
-            None
-        )
-        .is_none());
+    assert!(
+        chart
+            .add_drawing(
+                DrawingKind::Ray,
+                0,
+                vec![p(f64::NAN, 1.0), p(2.0, 3.0)],
+                None
+            )
+            .is_none()
+    );
     for kind in LINE_KINDS {
         let point = p(12.0, 102.0);
         let points = vec![point; kind.anchor_count()];
         assert!(chart.add_drawing(kind, 0, points, None).is_some());
     }
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .points
-        .iter()
-        .all(|point| point[0].is_finite() && point[1].is_finite()));
+    assert!(
+        frame.panes[0]
+            .points
+            .iter()
+            .all(|point| point[0].is_finite() && point[1].is_finite())
+    );
 }
 
 #[test]
@@ -1225,10 +1235,12 @@ fn a_line_block_draws_an_info_lines_labels_as_one_hittable_stats_box() {
     assert!(f64::from(box_x) > b.0 + 8.0);
     let background = Color::rgba(0x12, 0x34, 0x56, 224);
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == background)));
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == background))
+    );
     let probe = (f64::from(box_x) + 10.0, f64::from(box_y));
     assert_eq!(
         chart
@@ -1262,9 +1274,10 @@ fn a_line_block_draws_an_info_lines_labels_as_one_hittable_stats_box() {
     assert!(chart.drawing_apply_options(id, r#"{"tool_options":{"line":null}}"#));
     let runs = texts(&mut chart);
     assert_eq!(runs.len(), 5, "{runs:?}");
-    assert!(runs
-        .iter()
-        .all(|(_, x, _)| (f64::from(*x) - a.0).abs() < 1e-3));
+    assert!(
+        runs.iter()
+            .all(|(_, x, _)| (f64::from(*x) - a.0).abs() < 1e-3)
+    );
     assert_eq!(chart.hit_test_drawing(probe.0, probe.1), None);
 }
 
@@ -1280,15 +1293,18 @@ fn upstream_line_tools_keep_upstreams_rendering_without_a_line_block() {
     let a = anchor(&chart, id, 0);
     let runs = texts(&mut chart);
     assert_eq!(runs.len(), 4, "upstream's four labels: {runs:?}");
-    assert!(runs
-        .iter()
-        .all(|(_, x, _)| (f64::from(*x) - a.0).abs() < 1e-3));
+    assert!(
+        runs.iter()
+            .all(|(_, x, _)| (f64::from(*x) - a.0).abs() < 1e-3)
+    );
     let background = Color::rgba(0x12, 0x34, 0x56, 224);
     let frame = chart.build_frame();
-    assert!(!frame.panes[0]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == background)));
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == background))
+    );
     chart.remove_drawing(id);
 
     add(
@@ -1334,9 +1350,10 @@ fn a_line_block_draws_the_trend_angles_reference_arc_and_folded_angle() {
         .0;
     let radius = (arc[0].0 - ax).hypot(arc[0].1 - ay);
     assert!((16.0..=48.0).contains(&radius));
-    assert!(arc
-        .iter()
-        .all(|point| ((point.0 - ax).hypot(point.1 - ay) - radius).abs() < 1e-3));
+    assert!(
+        arc.iter()
+            .all(|point| ((point.0 - ax).hypot(point.1 - ay) - radius).abs() < 1e-3)
+    );
     assert!(
         (arc[0].1 - ay).abs() < 1e-3,
         "the arc starts on the reference"
@@ -1375,16 +1392,20 @@ fn a_line_block_draws_the_trend_angles_reference_arc_and_folded_angle() {
     let falling = chart
         .drawing_from_px_for(0, crate::DrawingPriceScale::Right, ax + 90.0, ay + 30.0)
         .unwrap();
-    assert!(chart
-        .set_drawing_anchors(id, &[a.into(), falling.into()])
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[a.into(), falling.into()])
+            .is_ok()
+    );
     assert_eq!(texts_of(&mut chart), ["-18.43°"]);
     let leftward = chart
         .drawing_from_px_for(0, crate::DrawingPriceScale::Right, ax - 90.0, ay - 90.0)
         .unwrap();
-    assert!(chart
-        .set_drawing_anchors(id, &[a.into(), leftward.into()])
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[a.into(), leftward.into()])
+            .is_ok()
+    );
     assert_eq!(texts_of(&mut chart), ["45.00°"]);
     let (_, x0, x1) = dashed_ink_hline(&mut chart).unwrap();
     assert!(f64::from(x0) < ax - 90.0 && x1 == ax.round() as i32);
@@ -1872,10 +1893,12 @@ fn line_block_stats_paint_and_hit_on_a_lower_pane() {
         })
         .expect("stats on the drawing's own pane");
     assert!(stats > chart.panes[pane].top);
-    assert!(!frame.panes[0]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Text { text, .. } if text.contains("bars"))));
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Text { text, .. } if text.contains("bars")))
+    );
     let middle = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
     assert_eq!(
         chart.hit_test_drawing(middle.0, middle.1).map(|hit| hit.id),

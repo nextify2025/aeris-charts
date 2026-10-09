@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 use aeris_charts_core::scale::general_scale::{BandScale, LinearScale, PointScale};
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, LineType};
-use aeris_charts_render::line::{expand_band_into, expand_line_into, LinePoint};
+use aeris_charts_render::line::{LinePoint, expand_band_into, expand_line_into};
 
 use crate::general_axes::NumericAxisScale;
 use crate::{
@@ -1738,24 +1738,23 @@ impl ChartEngine {
         if matches!(
             options.kind,
             GeneralSeriesKind::Column | GeneralSeriesKind::HorizontalBar
-        ) {
-            if let Some(group_id) = options.group_id.as_deref() {
-                for sibling in self.general_series_iter().filter(|series| {
-                    Some(series.id) != ignored
-                        && series.kind == options.kind
-                        && series.pane_id == pane_id
-                        && series.group_id() == Some(group_id)
-                }) {
-                    let same_category_axis = match options.kind {
-                        GeneralSeriesKind::Column => sibling.x_axis_id == options.x_axis_id,
-                        GeneralSeriesKind::HorizontalBar => sibling.y_axis_id == options.y_axis_id,
-                        _ => true,
-                    };
-                    if !same_category_axis {
-                        return Err(invalid(
-                            "grouped bar series must share the same category axis",
-                        ));
-                    }
+        ) && let Some(group_id) = options.group_id.as_deref()
+        {
+            for sibling in self.general_series_iter().filter(|series| {
+                Some(series.id) != ignored
+                    && series.kind == options.kind
+                    && series.pane_id == pane_id
+                    && series.group_id() == Some(group_id)
+            }) {
+                let same_category_axis = match options.kind {
+                    GeneralSeriesKind::Column => sibling.x_axis_id == options.x_axis_id,
+                    GeneralSeriesKind::HorizontalBar => sibling.y_axis_id == options.y_axis_id,
+                    _ => true,
+                };
+                if !same_category_axis {
+                    return Err(invalid(
+                        "grouped bar series must share the same category axis",
+                    ));
                 }
             }
         }
@@ -2176,51 +2175,48 @@ impl ChartEngine {
             .then(|| vec![(0.0_f64, 0.0_f64); axis_categories.len()]);
         let mut stack_totals = (series.stack_mode == GeneralStackMode::Percent)
             .then(|| vec![(0.0_f64, 0.0_f64); axis_categories.len()]);
-        if series.stack_id.is_some() {
-            if let Some(registry) = self.general_series.as_ref() {
-                if let Some(totals) = stack_totals.as_mut() {
-                    for sibling in registry.series.iter().filter(|candidate| {
-                        candidate.visible && column_stack_matches(series, candidate)
-                    }) {
-                        accumulate_column_values(
-                            self,
-                            sibling,
-                            &axis_lookup,
-                            |axis_index, value| {
-                                if value >= 0.0 {
-                                    totals[axis_index].0 += value;
-                                } else {
-                                    totals[axis_index].1 += -value;
-                                }
-                            },
-                        );
-                    }
-                }
+        if series.stack_id.is_some()
+            && let Some(registry) = self.general_series.as_ref()
+        {
+            if let Some(totals) = stack_totals.as_mut() {
                 for sibling in registry.series.iter().filter(|candidate| {
                     candidate.visible && column_stack_matches(series, candidate)
                 }) {
-                    if sibling.id == series.id {
-                        break;
-                    }
-                    let Some(base) = stack_base.as_mut() else {
-                        break;
-                    };
                     accumulate_column_values(self, sibling, &axis_lookup, |axis_index, value| {
                         if value >= 0.0 {
-                            base[axis_index].0 += value;
+                            totals[axis_index].0 += value;
                         } else {
-                            base[axis_index].1 += value;
+                            totals[axis_index].1 += -value;
                         }
                     });
                 }
-                if let (Some(base), Some(totals)) = (stack_base.as_mut(), stack_totals.as_ref()) {
-                    for (base, total) in base.iter_mut().zip(totals) {
-                        if total.0 > 0.0 {
-                            base.0 /= total.0;
-                        }
-                        if total.1 > 0.0 {
-                            base.1 /= total.1;
-                        }
+            }
+            for sibling in registry
+                .series
+                .iter()
+                .filter(|candidate| candidate.visible && column_stack_matches(series, candidate))
+            {
+                if sibling.id == series.id {
+                    break;
+                }
+                let Some(base) = stack_base.as_mut() else {
+                    break;
+                };
+                accumulate_column_values(self, sibling, &axis_lookup, |axis_index, value| {
+                    if value >= 0.0 {
+                        base[axis_index].0 += value;
+                    } else {
+                        base[axis_index].1 += value;
+                    }
+                });
+            }
+            if let (Some(base), Some(totals)) = (stack_base.as_mut(), stack_totals.as_ref()) {
+                for (base, total) in base.iter_mut().zip(totals) {
+                    if total.0 > 0.0 {
+                        base.0 /= total.0;
+                    }
+                    if total.1 > 0.0 {
+                        base.1 /= total.1;
                     }
                 }
             }
@@ -2256,19 +2252,11 @@ impl ChartEngine {
                 let normalized_value = match stack_totals.as_ref() {
                     Some(totals) if raw_value >= 0.0 => {
                         let total = totals[axis_index].0;
-                        if total > 0.0 {
-                            raw_value / total
-                        } else {
-                            0.0
-                        }
+                        if total > 0.0 { raw_value / total } else { 0.0 }
                     }
                     Some(totals) => {
                         let total = totals[axis_index].1;
-                        if total > 0.0 {
-                            raw_value / total
-                        } else {
-                            0.0
-                        }
+                        if total > 0.0 { raw_value / total } else { 0.0 }
                     }
                     None => raw_value,
                 };
@@ -2382,51 +2370,46 @@ impl ChartEngine {
             .then(|| vec![(0.0_f64, 0.0_f64); axis_categories.len()]);
         let mut stack_totals = (series.stack_mode == GeneralStackMode::Percent)
             .then(|| vec![(0.0_f64, 0.0_f64); axis_categories.len()]);
-        if series.stack_id.is_some() {
-            if let Some(registry) = self.general_series.as_ref() {
-                if let Some(totals) = stack_totals.as_mut() {
-                    for sibling in registry.series.iter().filter(|candidate| {
-                        candidate.visible && horizontal_bar_stack_matches(series, candidate)
-                    }) {
-                        accumulate_column_values(
-                            self,
-                            sibling,
-                            &axis_lookup,
-                            |axis_index, value| {
-                                if value >= 0.0 {
-                                    totals[axis_index].0 += value;
-                                } else {
-                                    totals[axis_index].1 += -value;
-                                }
-                            },
-                        );
-                    }
-                }
+        if series.stack_id.is_some()
+            && let Some(registry) = self.general_series.as_ref()
+        {
+            if let Some(totals) = stack_totals.as_mut() {
                 for sibling in registry.series.iter().filter(|candidate| {
                     candidate.visible && horizontal_bar_stack_matches(series, candidate)
                 }) {
-                    if sibling.id == series.id {
-                        break;
-                    }
-                    let Some(base) = stack_base.as_mut() else {
-                        break;
-                    };
                     accumulate_column_values(self, sibling, &axis_lookup, |axis_index, value| {
                         if value >= 0.0 {
-                            base[axis_index].0 += value;
+                            totals[axis_index].0 += value;
                         } else {
-                            base[axis_index].1 += value;
+                            totals[axis_index].1 += -value;
                         }
                     });
                 }
-                if let (Some(base), Some(totals)) = (stack_base.as_mut(), stack_totals.as_ref()) {
-                    for (base, total) in base.iter_mut().zip(totals) {
-                        if total.0 > 0.0 {
-                            base.0 /= total.0;
-                        }
-                        if total.1 > 0.0 {
-                            base.1 /= total.1;
-                        }
+            }
+            for sibling in registry.series.iter().filter(|candidate| {
+                candidate.visible && horizontal_bar_stack_matches(series, candidate)
+            }) {
+                if sibling.id == series.id {
+                    break;
+                }
+                let Some(base) = stack_base.as_mut() else {
+                    break;
+                };
+                accumulate_column_values(self, sibling, &axis_lookup, |axis_index, value| {
+                    if value >= 0.0 {
+                        base[axis_index].0 += value;
+                    } else {
+                        base[axis_index].1 += value;
+                    }
+                });
+            }
+            if let (Some(base), Some(totals)) = (stack_base.as_mut(), stack_totals.as_ref()) {
+                for (base, total) in base.iter_mut().zip(totals) {
+                    if total.0 > 0.0 {
+                        base.0 /= total.0;
+                    }
+                    if total.1 > 0.0 {
+                        base.1 /= total.1;
                     }
                 }
             }
@@ -2462,19 +2445,11 @@ impl ChartEngine {
                 let normalized_value = match stack_totals.as_ref() {
                     Some(totals) if raw_value >= 0.0 => {
                         let total = totals[axis_index].0;
-                        if total > 0.0 {
-                            raw_value / total
-                        } else {
-                            0.0
-                        }
+                        if total > 0.0 { raw_value / total } else { 0.0 }
                     }
                     Some(totals) => {
                         let total = totals[axis_index].1;
-                        if total > 0.0 {
-                            raw_value / total
-                        } else {
-                            0.0
-                        }
+                        if total > 0.0 { raw_value / total } else { 0.0 }
                     }
                     None => raw_value,
                 };
@@ -6735,11 +6710,13 @@ fn validate_input_for_series(
                 GeneralScaleType::Temporal => GeneralXKind::Temporal,
                 GeneralScaleType::Band | GeneralScaleType::Point => GeneralXKind::Category,
                 GeneralScaleType::RadialLinear | GeneralScaleType::AngularCategory => {
-                    return Err(invalid("error-bar X axis scale is incompatible"))
+                    return Err(invalid("error-bar X axis scale is incompatible"));
                 }
             };
             if input.x_kind() != expected_x {
-                return Err(invalid("a dataset bound to an error-bar series must keep the X kind required by its X axis"));
+                return Err(invalid(
+                    "a dataset bound to an error-bar series must keep the X kind required by its X axis",
+                ));
             }
             input.low_values().ok_or_else(|| {
                 invalid("a dataset bound to an error-bar series must retain its Y-low channel")
@@ -6877,8 +6854,8 @@ fn validate_input_for_series(
             }
             _ => {
                 return Err(invalid(
-                        "a dataset bound to a heatmap-grid series must keep the coordinate shape required by its axes",
-                    ));
+                    "a dataset bound to a heatmap-grid series must keep the coordinate shape required by its axes",
+                ));
             }
         },
         GeneralSeriesKind::Scatter => {

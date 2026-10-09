@@ -1,4 +1,5 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test, wait_for_chart } from "./page-ready.mjs";
 
 // Engine-owned interaction models (`aeris_charts_engine::interaction`): the TypeScript
 // recognizer only classifies events and forwards samples — the axis drag-to-scale, vertical
@@ -7,10 +8,7 @@ import { test, expect } from "@playwright/test";
 // behavior the headless engine tests pin down, including the public reference wheel sensitivity.
 
 async function wait_grid(page) {
-  await page.waitForFunction(() => window.__grid !== undefined && window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
+  await wait_for_chart(page, { grid: true });
 }
 
 const state = (page) =>

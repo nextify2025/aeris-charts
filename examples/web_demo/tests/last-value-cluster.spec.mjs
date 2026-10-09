@@ -1,4 +1,5 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test, monitor_page, wait_for_chart } from "./page-ready.mjs";
 import { PNG } from "pngjs";
 
 // industry-standard last-value cluster: title chip + price text + candle-close countdown row,
@@ -14,23 +15,24 @@ const ROW_CD = 14; // 10px countdown text + 2*2 padding
 const test_port = Number.parseInt(process.env.AERIS_CHARTS_TEST_PORT ?? "4174", 10);
 const test_base_url = `http://127.0.0.1:${test_port}`;
 
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
-}
-
-// Geometry probes default to DPR 1; alignment coverage overrides it when needed.
-async function open_cluster_page(browser, options, deviceScaleFactor = 1, query = "") {
+// Geometry probes default to DPR 1; alignment coverage overrides it when needed. With
+// `pause_at_ms` (milliseconds past a whole second) the page runs on Playwright's fake clock,
+// which is paused at that sub-second phase before the options (and any countdown timer) apply.
+async function open_cluster_page(browser, options, deviceScaleFactor = 1, query = "", { pause_at_ms = null } = {}) {
   const context = await browser.newContext({
     viewport: { width: 1280, height: 720 },
     deviceScaleFactor,
     colorScheme: "light",
   });
   const page = await context.newPage();
+  page.once("close", monitor_page(page));
+  if (pause_at_ms !== null) await page.clock.install();
   await page.goto(`${test_base_url}/${query}`);
   await wait_for_chart(page);
+  if (pause_at_ms !== null) {
+    const now = await page.evaluate(() => Date.now());
+    await page.clock.pauseAt(Math.floor(now / 1000) * 1000 + 2000 + pause_at_ms);
+  }
   await page.evaluate((opts) => {
     // A deterministic final DOWN bar at the current second: the label color is pinned to
     // #f7525f and the countdown always has ~1h left (no hour-boundary flake). The bar is a
@@ -42,6 +44,7 @@ async function open_cluster_page(browser, options, deviceScaleFactor = 1, query 
     window.__main.update({ time: now, open: last.close, high: last.close + 0.6, low: close - 0.6, close });
     window.__main.apply_options({ down_color: "#f7525f", price_line_visible: false, ...opts });
   }, options);
+  if (pause_at_ms !== null) return { context, page };
   await page.evaluate(() => new Promise((resolve) => {
     requestAnimationFrame(() => requestAnimationFrame(resolve));
   }));
@@ -688,23 +691,32 @@ test("cluster parts toggle independently", async ({ browser }) => {
   await context.close();
 });
 
-test("countdown row ticks with the 1s interval timer", async ({ browser }) => {
+test("countdown row ticks on every wall-clock second", async ({ browser }) => {
+  // The countdown timer starts 200 ms into a second on a paused fake clock, so the tick phase
+  // is fixed: a timer tied to its own start phase would tick 200 ms late every second.
   const { context, page } = await open_cluster_page(browser, {
     title: "Aeris",
     title_visible: true,
     countdown_visible: true,
-  });
+  }, 1, "", { pause_at_ms: 200 });
   const anchor = await cluster_anchor(page);
-  // Let the first tick settle (the timer starts on apply; the first capture must be past the
-  // initial pin so both captures read distinct remaining seconds).
-  await page.waitForTimeout(1100);
   const first = await capture(page);
   const box = find_cluster(first, anchor.pane_w);
   expect(box.bottom - box.top).toBeGreaterThanOrEqual(ROW + ROW_CD - 4);
-  await page.waitForTimeout(1300);
-  const second = await capture(page);
   const countdown_row = { left: box.left, right: box.right, top: box.bottom - ROW_CD, bottom: box.bottom };
-  expect(region_diff(first, second, countdown_row)).toBeGreaterThan(0);
+
+  // Late in the same second (x.950) the remaining whole seconds are unchanged.
+  await page.clock.runFor(750);
+  const same_second = await capture(page);
+  expect(region_diff(first, same_second, countdown_row)).toBe(0);
+
+  // Just past the boundary (x+1.020) the row shows the next second, and again one second later.
+  await page.clock.runFor(70);
+  const next_second = await capture(page);
+  expect(region_diff(same_second, next_second, countdown_row)).toBeGreaterThan(0);
+  await page.clock.runFor(1000);
+  const following_second = await capture(page);
+  expect(region_diff(next_second, following_second, countdown_row)).toBeGreaterThan(0);
   await context.close();
 });
 
@@ -712,6 +724,7 @@ test("price and countdown chips share an exact edge at any DPR (no attachment ga
   for (const dpr of [1, 1.35, 2]) {
     const context = await browser.newContext({ viewport: { width: 1280, height: 720 }, deviceScaleFactor: dpr, colorScheme: "light" });
     const page = await context.newPage();
+    page.once("close", monitor_page(page));
     await page.goto(`${test_base_url}/?theme=light`);
     await wait_for_chart(page);
     await page.evaluate(() => {

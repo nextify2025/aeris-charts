@@ -3,21 +3,21 @@
 //! This is intentionally independent of WebGPU, Canvas2D, and DOM types. Hosts may convert the
 //! returned primitives into any raster backend, or inspect them in tests.
 
-use crate::drawings::DrawingKind;
 use crate::SeriesThresholdRegion;
+use crate::drawings::DrawingKind;
 use crate::{
-    ChartEngine, PriceFormatKind, PriceScaleSide, PriceScaleTarget, SeriesKind, SeriesPriceFormat,
-    PANE_SEPARATOR,
+    ChartEngine, PANE_SEPARATOR, PriceFormatKind, PriceScaleSide, PriceScaleTarget, SeriesKind,
+    SeriesPriceFormat,
 };
 use aeris_charts_core::format::percentage_formatter::PercentageFormatter;
 use aeris_charts_core::format::price_formatter::PriceFormatter;
 use aeris_charts_core::format::time_formatter::{
-    format_crosshair_time_in, format_date_pattern, format_tick_label_in, weight_to_tick_mark_type,
-    TickMarkType,
+    TickMarkType, format_crosshair_time_in, format_date_pattern, format_tick_label_in,
+    weight_to_tick_mark_type,
 };
 use aeris_charts_core::format::volume_formatter::VolumeFormatter;
 use aeris_charts_core::model::data_layer::{PointColorChannel, SeriesId};
-use aeris_charts_core::model::magnet::{magnet_snap_coordinate, CrosshairMode};
+use aeris_charts_core::model::magnet::{CrosshairMode, magnet_snap_coordinate};
 use aeris_charts_core::model::plot_list::{
     MinMax, MismatchDirection, PlotListView, PlotValueIndex,
 };
@@ -28,13 +28,13 @@ use aeris_charts_core::style::{
     DEFAULT_CROSSHAIR_LINE_RGB, DEFAULT_PRIMARY_RGB, MARKET_DOWN_RGB, MARKET_UP_RGB,
     MARKET_VOLUME_ALPHA,
 };
-use aeris_charts_render::bars::{build_bars, BarItem, BarsParams};
-use aeris_charts_render::candles::{build_candles, CandleItem, CandlesParams};
+use aeris_charts_render::bars::{BarItem, BarsParams, build_bars};
+use aeris_charts_render::candles::{CandleItem, CandlesParams, build_candles};
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{
     Gradient, IRect, LineStyle, LineType, Prim, RasterImage, TextAlign,
 };
-use aeris_charts_render::histogram::{build_histogram, HistogramItem, HistogramParams};
+use aeris_charts_render::histogram::{HistogramItem, HistogramParams, build_histogram};
 
 const THRESHOLD_REGION_LINE_COLOR: Color = Color::rgb(0x78, 0x7B, 0x86);
 const THRESHOLD_REGION_FILL_COLOR: Color = Color::rgba(0x78, 0x7B, 0x86, 0x33);
@@ -962,14 +962,13 @@ impl ChartEngine {
         // body channel here) wins over the series-level resolution for every kind that reads
         // it (bar/candlestick/line/area/histogram); Baseline's barColor ignores data-item
         // colors (series-bar-colorer.ts Baseline arm).
-        if !matches!(series.kind, SeriesKind::Baseline) {
-            if let Some(c) = self
+        if !matches!(series.kind, SeriesKind::Baseline)
+            && let Some(c) = self
                 .data
                 .point_colors(series.id)
                 .and_then(|colors| colors.color(PointColorChannel::Body, row))
-            {
-                return Color(c);
-            }
+        {
+            return Color(c);
         }
         match series.kind {
             // A line_color still holding the default placeholder resolves to the kind default,
@@ -978,11 +977,7 @@ impl ChartEngine {
             SeriesKind::Area => series_stroke_color(series),
             SeriesKind::Histogram => {
                 let color = verbatim_color(&series.line_color, crate::DEFAULT_LINE_COLOR);
-                if color != LINE {
-                    color
-                } else {
-                    HISTOGRAM
-                }
+                if color != LINE { color } else { HISTOGRAM }
             }
             // reference baseline colorer: top line color at/above the baseline, bottom below it.
             SeriesKind::Baseline => {
@@ -1700,9 +1695,9 @@ impl ChartEngine {
                                 && self.scale_formatter_source(pi, *target).is_some()
                         })
                         .collect();
-                    grid_targets.sort_by_key(|target| {
-                        let order = pane.scale_order(*target).unwrap_or(usize::MAX);
-                        let side = match pane.scale_side(*target) {
+                    crate::sort_scale_targets(&mut grid_targets, &|target| {
+                        let order = pane.scale_order(target).unwrap_or(usize::MAX);
+                        let side = match pane.scale_side(target) {
                             Some(PriceScaleSide::Right) => 0,
                             Some(PriceScaleSide::Left) => 1,
                             None => 2,
@@ -1832,6 +1827,20 @@ impl ChartEngine {
                                 &mut series_layer.layer.prims,
                                 scale,
                             ),
+                            SeriesKind::Line | SeriesKind::Area
+                                if self.custom_marker_plot(rs.id) =>
+                            {
+                                self.build_custom_marker_plot_frame(
+                                    *rs,
+                                    from,
+                                    to,
+                                    pane_w_px as i32,
+                                    hpr,
+                                    vpr,
+                                    &mut series_layer.layer.prims,
+                                    scale,
+                                );
+                            }
                             SeriesKind::Line | SeriesKind::Area => {
                                 if let Some(region) = rs.threshold_region {
                                     let y_upper =
@@ -1911,6 +1920,39 @@ impl ChartEngine {
                             &mut series_layer.layer.points,
                             scale,
                         );
+                        if let Some(binding) = self.indicators.iter().find(|binding| {
+                            binding.outputs.first() == Some(&rs.id)
+                                && (binding.annotations.is_some() || binding.structure.is_some())
+                        }) && let Some(annotations) =
+                            binding.annotations.as_ref().or_else(|| {
+                                binding
+                                    .structure
+                                    .as_ref()
+                                    .map(|structure| structure.annotations())
+                            })
+                        {
+                            self.build_study_annotations_frame(
+                                rs.id,
+                                binding.source,
+                                annotations,
+                                matches!(
+                                    binding.kind,
+                                    crate::IndicatorKind::FairValueGaps {
+                                        show_mitigated: true,
+                                        ..
+                                    } | crate::IndicatorKind::OrderBlocks {
+                                        show_mitigated: true,
+                                        ..
+                                    }
+                                ),
+                                from,
+                                to,
+                                pane_w_px as i32,
+                                hpr,
+                                vpr,
+                                &mut series_layer.layer.prims,
+                            );
+                        }
                         if self
                             .series
                             .iter()
@@ -1962,6 +2004,22 @@ impl ChartEngine {
                             ),
                             _ => {}
                         }
+                        self.build_big_trades_frame(
+                            rs.id,
+                            from,
+                            to,
+                            hpr,
+                            vpr,
+                            &mut cache.chrome.prims,
+                        );
+                        self.build_auction_markers_frame(
+                            rs.id,
+                            from,
+                            to,
+                            hpr,
+                            vpr,
+                            &mut cache.chrome.prims,
+                        );
                     }
                     self.build_depth_event_frame(
                         pi,
@@ -2181,15 +2239,17 @@ impl ChartEngine {
                 cache.top_layer.coordinate_revision,
                 self.frame_invalidation.coordinate
             );
-            debug_assert!(cache
-                .series_layers
-                .iter()
-                .filter(|layer| resolved.iter().any(|series| {
-                    series.id == layer.id && series.pane == Some(pi) && series.visible
-                }))
-                .all(|layer| {
-                    layer.layer.coordinate_revision == self.frame_invalidation.coordinate
-                }));
+            debug_assert!(
+                cache
+                    .series_layers
+                    .iter()
+                    .filter(|layer| resolved.iter().any(|series| {
+                        series.id == layer.id && series.pane == Some(pi) && series.visible
+                    }))
+                    .all(|layer| {
+                        layer.layer.coordinate_revision == self.frame_invalidation.coordinate
+                    })
+            );
             out.top = cache.top;
             out.height = cache.height;
             out.scissor = cache.scissor;
@@ -2215,13 +2275,13 @@ impl ChartEngine {
                     + cache.overlay.points.len();
                 point_count += cache.top_layer.points.len();
                 for rs in &resolved {
-                    if rs.pane == Some(pi) && rs.visible {
-                        if let Some(layer) =
+                    if rs.pane == Some(pi)
+                        && rs.visible
+                        && let Some(layer) =
                             cache.series_layers.iter().find(|layer| layer.id == rs.id)
-                        {
-                            main_prims += layer.layer.prims.len();
-                            point_count += layer.layer.points.len();
-                        }
+                    {
+                        main_prims += layer.layer.prims.len();
+                        point_count += layer.layer.points.len();
                     }
                 }
                 out.under

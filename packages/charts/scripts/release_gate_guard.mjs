@@ -18,14 +18,29 @@ const benchmarkWorkflows = Object.fromEntries(
 const RUST_RELEASE = readFileSync(`${root}/rust-toolchain.toml`, "utf8").match(/^channel\s*=\s*"([^"]+)"/m)?.[1];
 assert.match(RUST_RELEASE ?? "", /^\d+\.\d+\.\d+$/, "rust-toolchain.toml must pin an exact Rust release, not a channel");
 
+// The release itself, or the release with a target triple (the Windows benchmark runner): a triple
+// has three or four `-`-separated parts, so `1.99.0-beta` or a bare `1.99.0-` is not the pin.
+const PINNED_RUST = new RegExp(`^${RUST_RELEASE.replaceAll(".", "\\.")}(-[a-z0-9_]+(-[a-z0-9_]+){2,3})?$`);
+const isPinnedRust = (toolchain) => PINNED_RUST.test(toolchain ?? "");
+
 function assertRustToolchainPinned(source, workflow) {
   const steps = source.split(/\r?\n(?=\s*- )/).filter((step) => step.includes("dtolnay/rust-toolchain@"));
   assert.ok(steps.length > 0, `${workflow} must install Rust through dtolnay/rust-toolchain`);
   for (const step of steps) {
     const toolchain = step.match(/^\s+toolchain:\s*(\S+)/m)?.[1];
     assert.ok(
-      toolchain === RUST_RELEASE || toolchain?.startsWith(`${RUST_RELEASE}-`),
+      isPinnedRust(toolchain),
       `${workflow} must install Rust ${RUST_RELEASE} like rust-toolchain.toml, not ${toolchain ?? "the floating default"}`,
+    );
+  }
+  // RUSTUP_TOOLCHAIN overrides rust-toolchain.toml for every cargo call, so a `stable` here builds the
+  // package and the benchmarks with the runner's Rust even though `toolchain:` installed the pin.
+  // It may be absent; wherever it is set (workflow, job or step env, or written to GITHUB_ENV) it must
+  // name the pinned release.
+  for (const [, value] of source.matchAll(/\bRUSTUP_TOOLCHAIN\s*[:=]\s*["']?([^\s"'#]*)/g)) {
+    assert.ok(
+      isPinnedRust(value),
+      `${workflow} must set RUSTUP_TOOLCHAIN to Rust ${RUST_RELEASE} like rust-toolchain.toml, not ${value || "an empty value"}`,
     );
   }
 }
@@ -85,6 +100,27 @@ function verify(ciSource, publishSource, benchmarkSources = benchmarkWorkflows) 
     "publication must update the latest package tag");
 }
 
+// Replaces a workflow's RUSTUP_TOOLCHAIN, or adds one to its top-level `env:` (a new block before
+// `jobs:` when it has none), so each simulated regression is a workflow GitHub Actions would accept.
+function withRustupToolchain(source, value) {
+  if (/RUSTUP_TOOLCHAIN:/.test(source)) {
+    return source.replace(/RUSTUP_TOOLCHAIN: \S+/, `RUSTUP_TOOLCHAIN: ${value}`);
+  }
+  return /^env:\r?\n/m.test(source)
+    ? source.replace(/^env:\r?\n/m, (env) => `${env}  RUSTUP_TOOLCHAIN: ${value}\n`)
+    : source.replace(/^jobs:/m, `env:\n  RUSTUP_TOOLCHAIN: ${value}\n\njobs:`);
+}
+
+// The variable set below the workflow level: written to GITHUB_ENV by a step, or in a step's `env:`.
+const RUSTFMT_STEP = "      - name: rustfmt\n";
+const withGithubEnvRustupToolchain = (source, value) => source.replace(
+  RUSTFMT_STEP,
+  `      - name: Select Rust\n        run: echo "RUSTUP_TOOLCHAIN=${value}" >> "$GITHUB_ENV"\n${RUSTFMT_STEP}`,
+);
+const withStepRustupToolchain = (source, value) =>
+  source.replace(RUSTFMT_STEP, `${RUSTFMT_STEP}        env:\n          RUSTUP_TOOLCHAIN: ${value}\n`);
+assert.ok(ci.includes(RUSTFMT_STEP), "ci.yml must keep the rustfmt step the RUSTUP_TOOLCHAIN simulations edit");
+
 verify(ci, publish);
 for (const [brokenCi, brokenPublish] of [
   [ci.replace("AERIS_CHARTS_PERF_STRICT: \"1\"", "AERIS_CHARTS_PERF_STRICT: \"0\""), publish],
@@ -100,6 +136,13 @@ for (const [brokenCi, brokenPublish] of [
   [ci.replaceAll(`toolchain: ${RUST_RELEASE}`, "toolchain: stable"), publish],
   [ci.replace(`          toolchain: ${RUST_RELEASE}\n`, ""), publish],
   [ci, publish.replace(`toolchain: ${RUST_RELEASE}`, "toolchain: 1.98.1")],
+  [ci, withRustupToolchain(publish, "stable")],
+  [ci, withRustupToolchain(publish, "\"1.98.1\"")],
+  [ci, withRustupToolchain(publish, `${RUST_RELEASE}-beta`)],
+  [ci, withRustupToolchain(publish, `${RUST_RELEASE}-`)],
+  [withRustupToolchain(ci, "stable"), publish],
+  [withGithubEnvRustupToolchain(ci, "stable"), publish],
+  [withStepRustupToolchain(ci, "stable"), publish],
   [ci, publish.replace(WASM_PACK_INSTALL, "cargo install wasm-pack --locked --version 0.14.0")],
   [ci, publish.replace(WASM_PACK_INSTALL, "curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh")],
 ]) {
@@ -116,5 +159,7 @@ for (const name of Object.keys(benchmarkWorkflows)) {
     [name]: benchmarkWorkflows[name].replace(new RegExp(`toolchain: ${RUST_RELEASE.replaceAll(".", "\\.")}`), "toolchain: stable"),
   };
   assert.throws(() => verify(ci, publish, floating), `a floating Rust toolchain in ${name} was not detected`);
+  const floatingEnv = { ...benchmarkWorkflows, [name]: withRustupToolchain(benchmarkWorkflows[name], "stable") };
+  assert.throws(() => verify(ci, publish, floatingEnv), `a floating RUSTUP_TOOLCHAIN in ${name} was not detected`);
 }
 console.log("release gate policy and failure simulations OK");

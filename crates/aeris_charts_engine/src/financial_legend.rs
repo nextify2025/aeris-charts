@@ -54,6 +54,11 @@ pub struct FinancialLegendRequest<'a> {
     pub logical_index: Option<i64>,
     pub primary_title: &'a str,
     pub show_primary_ohlc: bool,
+    /// Series whose bar values the primary row reads out, such as a footprint drawn over a
+    /// whitespace primary. `None` reads the footprint of the chart's order-flow presentation when
+    /// one is drawn over the primary, else the primary itself. An id that names no live series
+    /// reads the primary.
+    pub primary_values_series: Option<SeriesId>,
     /// Product series placed before native indicator groups, such as volume.
     pub leading_series: &'a [HostLegendSeries<'a>],
     /// Product series placed after native indicator groups, such as order-flow studies.
@@ -67,8 +72,12 @@ impl ChartEngine {
     pub fn financial_legend(&self, request: FinancialLegendRequest<'_>) -> Vec<FinancialLegendRow> {
         let snapshots = self.value_snapshot(request.logical_index);
         let mut rows = Vec::new();
+        let values_series = match request.primary_values_series {
+            Some(id) => self.series_entry(id).map_or(0, |series| series.id),
+            None => self.order_flow_footprint_over(0).unwrap_or(0),
+        };
         if let Some(primary) = self.series_entry(0) {
-            let snapshot = snapshot_for(&snapshots, 0);
+            let snapshot = snapshot_for(&snapshots, values_series);
             rows.push(FinancialLegendRow {
                 identity: FinancialLegendIdentity::Primary,
                 first_series_id: 0,
@@ -92,7 +101,13 @@ impl ChartEngine {
                 settings_available: false,
             });
         }
-        append_host_rows(self, &snapshots, request.leading_series, &mut rows);
+        append_host_rows(
+            self,
+            &snapshots,
+            values_series,
+            request.leading_series,
+            &mut rows,
+        );
 
         let mut emitted_bindings = HashSet::new();
         for &series_id in self.series_order() {
@@ -147,6 +162,10 @@ impl ChartEngine {
                 pane: first.pane_index,
                 title: if info.kind == "ema_ribbon" {
                     "EMA Ribbon".to_string()
+                } else if let Some(template) = &info.parameters.klinechart {
+                    // KLineChart templates share names with built-in studies of different
+                    // formulas (AO, PVT, TRIX, EMV), so their rows say where they come from.
+                    format!("KLineChart {}", template.title())
                 } else {
                     first.title.clone()
                 },
@@ -157,7 +176,13 @@ impl ChartEngine {
             });
         }
 
-        append_host_rows(self, &snapshots, request.trailing_series, &mut rows);
+        append_host_rows(
+            self,
+            &snapshots,
+            values_series,
+            request.trailing_series,
+            &mut rows,
+        );
 
         let outputs = self.external_study_outputs();
         let mut emitted_studies = HashSet::new();
@@ -220,6 +245,7 @@ impl ChartEngine {
 fn append_host_rows(
     chart: &ChartEngine,
     snapshots: &[SeriesValueSnapshot],
+    primary_values_series: SeriesId,
     descriptors: &[HostLegendSeries<'_>],
     rows: &mut Vec<FinancialLegendRow>,
 ) {
@@ -240,7 +266,8 @@ fn append_host_rows(
                 Vec::new()
             },
             tone: if descriptor.tone_from_primary {
-                snapshot_for(snapshots, 0).map_or(FinancialLegendTone::Neutral, snapshot_tone)
+                snapshot_for(snapshots, primary_values_series)
+                    .map_or(FinancialLegendTone::Neutral, snapshot_tone)
             } else {
                 FinancialLegendTone::Neutral
             },
@@ -326,6 +353,7 @@ mod tests {
             logical_index: None,
             primary_title: "BTCUSD",
             show_primary_ohlc: true,
+            primary_values_series: None,
             leading_series: &[HostLegendSeries {
                 identity: 7,
                 series_id: volume,
@@ -348,6 +376,55 @@ mod tests {
     }
 
     #[test]
+    fn klinechart_rows_are_labelled_apart_from_same_named_built_in_studies() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let times = [1.0, 2.0, 3.0, 4.0];
+        let closes = [10.0, 11.0, 10.5, 12.0];
+        chart
+            .set_series_data(0, &times, &closes, &closes, &closes, &closes)
+            .unwrap();
+        let volume = chart.add_series(SeriesKind::Histogram);
+        let volumes = [100.0, 120.0, 140.0, 90.0];
+        chart
+            .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+            .unwrap();
+        let native = chart.add_price_volume_trend(0, volume).unwrap();
+        let template = chart.add_klinechart_indicator(
+            0,
+            aeris_charts_indicators::klinechart::Indicator::Pvt,
+            Some(volume),
+        )[0];
+        let rows = chart.financial_legend(FinancialLegendRequest {
+            logical_index: None,
+            primary_title: "",
+            show_primary_ohlc: false,
+            primary_values_series: None,
+            leading_series: &[],
+            trailing_series: &[],
+        });
+        let title = |id| {
+            rows.iter()
+                .find(|row| row.identity == FinancialLegendIdentity::Indicator(id))
+                .map(|row| row.title.as_str())
+        };
+        assert_eq!(title(native), Some("PVT"));
+        assert_eq!(title(template), Some("KLineChart PVT"));
+        // Output series keep the template's own KLineChart titles; the binding kind tells the
+        // two studies apart for hosts that only read series and indicator info.
+        for id in [native, template] {
+            assert_eq!(chart.series_entry(id).unwrap().title, "PVT");
+        }
+        assert_eq!(
+            chart.indicator_info(native).unwrap().kind,
+            "price_volume_trend"
+        );
+        assert_eq!(
+            chart.indicator_info(template).unwrap().kind,
+            "klinechart_pvt"
+        );
+    }
+
+    #[test]
     fn host_legend_descriptors_are_bounded() {
         let chart = ChartEngine::new(800.0, 500.0, 1.0);
         let descriptors = (0..32)
@@ -363,9 +440,139 @@ mod tests {
             logical_index: None,
             primary_title: "",
             show_primary_ohlc: false,
+            primary_values_series: None,
             leading_series: &descriptors,
             trailing_series: &[],
         });
         assert_eq!(rows.len(), 1 + MAX_HOST_LEGEND_SERIES);
+    }
+
+    #[test]
+    fn a_whitespace_primary_reads_out_its_values_series() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let nan = [f64::NAN; 2];
+        chart
+            .set_series_data(0, &[60.0, 120.0], &nan, &nan, &nan, &nan)
+            .unwrap();
+        let footprint = chart
+            .add_footprint_series(crate::FootprintSeriesOptions {
+                aggregation: crate::FootprintAggregationOptions {
+                    tick_size: 1.0,
+                    ticks_per_row: 1,
+                    ..crate::FootprintAggregationOptions::default()
+                },
+                visual: crate::FootprintVisualOptions::default(),
+            })
+            .unwrap();
+        chart
+            .set_footprint_trades(
+                footprint,
+                vec![crate::FootprintTrade {
+                    timestamp_micros: 120_000_000,
+                    price: 100.0,
+                    volume: 2.0,
+                    aggressor: crate::AggressorSide::Buy,
+                    bid: None,
+                    ask: None,
+                    sequence: None,
+                    trade_id: None,
+                    conditions: 0,
+                    session_id: None,
+                }],
+            )
+            .unwrap();
+        let primary_row = |values_series| {
+            chart
+                .financial_legend(FinancialLegendRequest {
+                    logical_index: None,
+                    primary_title: "BTC",
+                    show_primary_ohlc: true,
+                    primary_values_series: values_series,
+                    leading_series: &[],
+                    trailing_series: &[],
+                })
+                .remove(0)
+        };
+        let blank = primary_row(None);
+        assert!(blank.values.iter().all(|value| value.text.ends_with("--")));
+        let read_out = primary_row(Some(footprint));
+        assert_eq!(read_out.identity, FinancialLegendIdentity::Primary);
+        assert_eq!(read_out.values[3].text, "C 100");
+        assert_eq!(read_out.tone, FinancialLegendTone::Bullish);
+    }
+
+    /// Without a values series the primary row reads the footprint an order-flow presentation
+    /// draws over the whitespace primary, so hosts need no wiring for it. An explicit values
+    /// series keeps full host control, and an id that names no live series reads the primary.
+    #[test]
+    fn the_primary_row_reads_the_order_flow_footprint_unless_the_host_names_a_series() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let nan = [f64::NAN; 2];
+        chart
+            .set_series_data(0, &[60.0, 120.0], &nan, &nan, &nan, &nan)
+            .unwrap();
+        let presentation = chart
+            .add_order_flow_presentation(
+                "CME:ES",
+                0,
+                crate::OrderFlowPresentationOptions {
+                    aggregation: crate::FootprintAggregationOptions {
+                        tick_size: 1.0,
+                        ticks_per_row: 1,
+                        ..crate::FootprintAggregationOptions::default()
+                    },
+                    visual: crate::FootprintVisualOptions::default(),
+                    show_footprint: true,
+                    show_cumulative_delta: true,
+                    show_delta_histogram: false,
+                    big_trades: None,
+                },
+            )
+            .unwrap();
+        let print = |price: f64, aggressor| crate::FootprintTrade {
+            timestamp_micros: 120_000_000,
+            price,
+            volume: 2.0,
+            aggressor,
+            bid: None,
+            ask: None,
+            sequence: None,
+            trade_id: None,
+            conditions: 0,
+            session_id: None,
+        };
+        chart
+            .update_order_flow_presentation(
+                presentation,
+                vec![
+                    print(101.0, crate::AggressorSide::Sell),
+                    print(100.0, crate::AggressorSide::Sell),
+                ],
+                false,
+            )
+            .unwrap();
+        let primary_row = |values_series| {
+            chart
+                .financial_legend(FinancialLegendRequest {
+                    logical_index: None,
+                    primary_title: "ES",
+                    show_primary_ohlc: true,
+                    primary_values_series: values_series,
+                    leading_series: &[],
+                    trailing_series: &[],
+                })
+                .remove(0)
+        };
+        let default = primary_row(None);
+        assert_eq!(default.identity, FinancialLegendIdentity::Primary);
+        assert_eq!(default.values[3].text, "C 100");
+        assert_eq!(default.tone, FinancialLegendTone::Bearish);
+        let footprint = presentation.footprint_series().unwrap();
+        assert_eq!(primary_row(Some(footprint)), default);
+        // Naming the primary keeps it, and an unknown id reads it: the whitespace primary.
+        let blank = primary_row(Some(9_999));
+        assert!(blank.values.iter().all(|value| value.text.ends_with("--")));
+        assert_eq!(blank.tone, FinancialLegendTone::Neutral);
+        assert_eq!(primary_row(Some(0)), blank);
     }
 }

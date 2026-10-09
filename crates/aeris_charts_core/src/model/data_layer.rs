@@ -16,10 +16,10 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::OnceLock;
 
+use crate::TimePointIndex;
 use crate::helpers::algorithms::lower_bound;
 use crate::model::lod::LodPyramid;
 use crate::model::plot_list::{PlotList, PlotListView, PlotValueIndex, PlotValues};
-use crate::TimePointIndex;
 
 /// Opaque chart-local series identity. It is deliberately not a storage position: removed
 /// identities are never reused, while their storage slots are.
@@ -502,10 +502,10 @@ impl MergedTimeMapping {
         let upper = self
             .common_indices
             .partition_point(|&(old_index, _)| (old_index as f64) < logical);
-        if let Some(&(old_index, new_index)) = self.common_indices.get(upper) {
-            if old_index as f64 == logical {
-                return new_index as f64;
-            }
+        if let Some(&(old_index, new_index)) = self.common_indices.get(upper)
+            && old_index as f64 == logical
+        {
+            return new_index as f64;
         }
         if upper == 0 {
             let (old_index, new_index) = self.common_indices[0];
@@ -641,6 +641,20 @@ impl DataLayer {
             .resolved_alias_range(slot)
             .map_or(slot, |(source, _, _)| source);
         Some(self.series[owner].alignment)
+    }
+
+    /// The series whose alignment `id` follows: `id` itself, or the source at the root of an
+    /// aliased output's chain. `None` for an unknown or stale id.
+    pub fn time_alignment_owner(&self, id: SeriesId) -> Option<SeriesId> {
+        let mut owner = id;
+        for _ in 0..self.series.len().max(1) {
+            match self.series[self.series_slot(owner)?].time_alias {
+                Some(alias) => owner = alias.source,
+                None => return Some(owner),
+            }
+        }
+        debug_assert!(false, "series time alias cycle");
+        None
     }
 
     /// Series whose as-of plot rows changed as a side effect of another series' mutation (a new
@@ -3139,7 +3153,7 @@ mod tests {
         let b = dl.add_series();
         set(&mut dl, a, &[1, 2, 3, 4], &[1.0, 2.0, 3.0, 4.0]);
         set(&mut dl, b, &[1, 4], &[9.0, 9.0]); // whitespace at 2,3
-                                               // B gets a point at time 3 (an existing merged time, index 2)
+        // B gets a point at time 3 (an existing merged time, index 2)
         dl.update(b, 3, [7.0, 7.0, 7.0, 7.0]);
         assert_eq!(dl.merged_times(), &[1, 2, 3, 4]);
         assert!(dl.plot(b).contains(2)); // time 3 -> merged index 2
@@ -3418,9 +3432,11 @@ mod tests {
         let rebuilds = dl.index_rebuilds();
         dl.trim_fronts(&[(output, 10)]);
         assert_eq!(dl.index_rebuilds(), rebuilds);
-        assert!(dl.series[dl.series_slot(output).unwrap()]
-            .time_alias
-            .is_none());
+        assert!(
+            dl.series[dl.series_slot(output).unwrap()]
+                .time_alias
+                .is_none()
+        );
         assert_eq!(
             dl.series_data(output).unwrap().0,
             &dl.series_data(a).unwrap().0[2..]
@@ -3543,6 +3559,36 @@ mod tests {
         assert_eq!(dl.base_index(), Some(2));
         dl.set_rows_count_as_data(a, false);
         assert_eq!(dl.base_index(), Some(0));
+    }
+
+    #[test]
+    fn all_whitespace_anchor_series_never_move_the_base_index() {
+        // Fork port of upstream's `whitespace_only_series_are_skipped_by_the_base_index`: the
+        // fork needs no `whitespace_only` flag, because `base_index` finds each series' last
+        // data row through the LOD pyramid (logarithmic) and an all-whitespace column has none.
+        let mut dl = DataLayer::new();
+        let a = dl.add_series();
+        set(&mut dl, a, &[1, 2], &[10.0, 20.0]);
+        assert_eq!(dl.base_index(), Some(1));
+        // A structure-study anchor: aligned to its source, longer than it, and all-whitespace.
+        let anchor = dl.add_series();
+        let nan = f64::NAN;
+        dl.set_data(
+            anchor,
+            vec![1, 2, 3, 4],
+            vec![nan, nan, nan, nan],
+            vec![nan, nan, nan, nan],
+            vec![nan, nan, nan, nan],
+            vec![nan, nan, nan, nan],
+        );
+        assert_eq!(dl.base_index(), Some(1));
+        // Streaming more whitespace rows into the anchor never moves it either.
+        assert!(dl.update(anchor, 5, [nan; 4]));
+        assert_eq!(dl.base_index(), Some(1));
+        // A real row on the source still advances the base index past the anchor's rows.
+        assert!(dl.update(a, 6, [30.0; 4]));
+        assert_eq!(dl.merged_times()[5], 6);
+        assert_eq!(dl.base_index(), Some(5));
     }
 
     #[test]
@@ -4013,11 +4059,7 @@ mod tests {
         }
 
         fn below(&mut self, n: u64) -> u64 {
-            if n == 0 {
-                0
-            } else {
-                self.next() % n
-            }
+            if n == 0 { 0 } else { self.next() % n }
         }
 
         fn chance(&mut self, percent: u64) -> bool {

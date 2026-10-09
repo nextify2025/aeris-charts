@@ -118,20 +118,20 @@ impl ChartEngine {
         else {
             return false;
         };
-        if let Some(price) = patch.price {
-            if price.is_finite() {
-                line.price = price;
-            }
+        if let Some(price) = patch.price
+            && price.is_finite()
+        {
+            line.price = price;
         }
-        if let Some(css) = patch.color {
-            if let Some(c) = Color::parse_css(&css) {
-                line.color = c;
-            }
+        if let Some(css) = patch.color
+            && let Some(c) = Color::parse_css(&css)
+        {
+            line.color = c;
         }
-        if let Some(width) = patch.line_width {
-            if width.is_finite() {
-                line.width = (width.round() as i32).max(1);
-            }
+        if let Some(width) = patch.line_width
+            && width.is_finite()
+        {
+            line.width = (width.round() as i32).max(1);
         }
         if let Some(style) = patch.line_style.as_ref().and_then(parse_line_style) {
             line.style = style;

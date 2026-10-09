@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/aeris_charts_core",
     "crates/aeris_charts_indicators",
@@ -13,7 +13,8 @@ members = [
 
 [workspace.package]
 version = "0.3.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.99"
 license = "AGPL-3.0-only"
 authors = ["Aeris Terminal"]
 repository = "https://github.com/aeristerminal/aeris-charts"

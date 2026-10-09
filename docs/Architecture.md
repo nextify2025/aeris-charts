@@ -44,7 +44,7 @@ GPUI | WebGPU | Canvas2D | 原生 tiny-skia
 | [`aeris_charts_native`](../crates/aeris_charts_native/Cargo.toml) | tiny-skia 渲染、原生图像导出、golden 与 release 性能门禁 | [原生执行](architecture/rendering/backends.md#原生渲染与图像导出) |
 | [`packages/charts`](../packages/charts/package.json) | TypeScript 句柄、DOM 生命周期、平台效果、可选 React 适配器 | [宿主边界](architecture/hosts/browser.md)、[公共 API](api/README.md) |
 
-所有 Rust crate 都是 `publish = false`，宿主通过固定 Git 修订或路径依赖使用。浏览器包 `@aeristerminal/aeris-charts` 是唯一发布的产物。GPUI 执行器当前固定 `gpui-pre =0.3.7`，宿主必须使用同一包与版本；历史升级说明见 [Rust 接入](api/rust.md)。CI 另以 gpui-fast 构建并测试该执行器，作为证据而非发布门禁（见 [gpui-fast 证据线](development/validation.md#gpui-fast-证据线)）。
+所有 Rust crate 都是 `publish = false`，宿主通过固定 Git 修订或路径依赖使用。工作区采用 Rust 2024 版次与 resolver 3，每个 crate 都继承工作区的 `rust-version = "1.99"`，因此宿主需要 rustc 1.99 或更高版本（见 [Rust 分发](api/rust.md#rust-分发)）。浏览器包 `@aeristerminal/aeris-charts` 是唯一发布的产物。GPUI 执行器当前固定 `gpui-pre =0.3.7`，宿主必须使用同一包与版本；历史升级说明见 [Rust 接入](api/rust.md)。CI 另以 gpui-fast 构建并测试该执行器，作为证据而非发布门禁（见 [gpui-fast 证据线](development/validation.md#gpui-fast-证据线)）。
 
 ## 依赖方向
 
@@ -68,11 +68,12 @@ wasm        → core + engine + render + render_wgpu
 | 系列数据、批量、as-of 对齐、摘要与保留 | [规范数据](architecture/data/storage.md) |
 | UTC 时间、交易日、时段槽位、收盘标签、视口重新定基 | [时间](architecture/data/time.md) |
 | 公式、预热、绑定、成交量分布、周期分布、TPO 与分布绘图、外部研究与指标 V3 | [指标](architecture/data/indicators.md) |
+| 结构与时段研究、时段日历、只读研究注释、自定义研究 | [结构、时段与自定义研究](features/studies.md) |
 | 金融窗格、命名比例尺、坐标、自动缩放与选项 | [窗格与比例尺](architecture/engine/panes-and-scales.md) |
 | 非金融域、坐标轴、类型化数据集、通用系列与交互 | [通用图表](architecture/engine/general-charts.md) |
 | 指针、触摸、滚轮、键盘、悬停、取消与动效 | [共享输入控制器](architecture/engine/input.md) |
 | 金融系列几何、基线解析、实时柱缓动、时间线标记带、值快照、官方图元与图例 | [系列与图元](architecture/engine/series.md) |
-| 成交流、深度、回放、非时间柱与重采样 | [行情投影](architecture/engine/market-data.md) |
+| 成交流、大单与拍卖标记、深度、回放、非时间柱与重采样 | [行情投影](architecture/engine/market-data.md) |
 | 持仓、订单、成交、警报、意图与回滚 | [交易与警报](architecture/engine/trading.md) |
 | 绘图状态、时间锚点、历史、复权与测量 | [绘图](architecture/engine/drawings.md) |
 | 工具族、部件、wire id、schema、旧版工具名与文档迁移、新增工具流程 | [绘图族](architecture/engine/drawing-families.md) |
@@ -90,6 +91,8 @@ wasm        → core + engine + render + render_wgpu
 ## 插件与宿主扩展
 
 宿主获得行为，不负责拼装引擎机制。平台输入转换、捕获、光标应用、定时器、菜单、剪贴板、产品持久化和券商操作仍在宿主；交互仲裁与命中、绘图编辑和语义查询留在引擎。
+
+自定义研究是唯一由引擎调度的宿主计算回调：宿主只提供公式，调度、界限、样式、持久化与绘制都留在引擎，输出经共享帧以已有图元绘制，不引入新的图元或场景模型；浏览器中只有主线程图表支持它，worker 图表以 `unsupported` 拒绝。
 
 详见[浏览器与 React 边界](architecture/hosts/browser.md)和[扩展边界](architecture/hosts/extensions.md)。Aeris Terminal 是独立仓库，修改 Charts 不代表已经验证了 Terminal 的集成。
 

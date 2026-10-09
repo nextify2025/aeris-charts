@@ -950,12 +950,11 @@ impl ChartEngine {
             .filter(|id| self.hit_test_one_series(*id, x_css, y_css).is_some())
             .or_else(|| self.hit_test_series(x_css, y_css))
             .or(selected);
-        if let Some(series) = series {
-            if let Some((series_pane, target)) = self.series_price_scale(series) {
-                if series_pane == pane {
-                    return Some(target);
-                }
-            }
+        if let Some(series) = series
+            && let Some((series_pane, target)) = self.series_price_scale(series)
+            && series_pane == pane
+        {
+            return Some(target);
         }
         Some(self.pane_default_scale_target(pane))
     }

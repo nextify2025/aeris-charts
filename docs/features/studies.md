@@ -1,0 +1,144 @@
+# 结构、时段与自定义研究
+
+[文档导航](../README.md) · [指标计算与绑定](../architecture/data/indicators.md) · [指标 API](../api/indicators.md#结构与时段研究)
+
+本页记录七个结构与时段研究的领域契约：摆动点（`swing_points`）、市场结构（`market_structure`）、公允价值缺口（`fair_value_gaps`）、订单块（`order_blocks`）、交易时段高低点（`session_levels`）、上一周期高低收（`previous_period_levels`）与开盘区间（`opening_range`）。它们来自上游 `051a447`..`dc39045`，经合并 `dc39045` 的提交引入。浏览器与 Rust 的调用方式见[指标 API](../api/indicators.md#结构与时段研究)。
+
+本页还记录宿主注册的[自定义研究](#自定义研究)（上游 `1276c5e`..`92aefe5`，经合并 `4c1da4f` 的提交引入）：它们与内置研究共用同一个绑定、输出与依赖路径，只把计算交给宿主提供的运行时。
+
+## 归属
+
+纯计算位于 `aeris_charts_indicators`：`structure_studies` 是逐行推进、带检查点的 OHLC 扫描器，`session_studies` 计算时段与周期水平，`study_annotations` 保存按确认行排序的标记与区域及其区间索引。它们不认识图表、窗格或平台。
+
+引擎把这七个研究作为普通指标绑定安装（`IndicatorKind` 的七个变体），复用源失效、输出别名、依赖传播、元数据、样式与 V3 持久化。结构研究的标记与区域属于绑定本身，不是合成的输出系列；帧构建读取它们并用已有图元绘制。宿主只提供数据（以及可选的时段日历），不参与扫描、确认或绘制。
+
+## 输出与窗格
+
+七个研究都把输出放在源所在的价格窗格与比例尺上：
+
+| 研究 | 输出 | 注释 |
+| --- | --- | --- |
+| 摆动点 | 两条阶梯水平线：最近确认的摆动高点与低点 | 摆动高点/低点箭头 |
+| 市场结构 | 一条全空白的锚定输出 | BOS/CHoCH 线段与文字 |
+| 公允价值缺口 | 一条全空白的锚定输出 | 多头/空头区域 |
+| 订单块 | 一条全空白的锚定输出 | 多头/空头区域 |
+| 交易时段高低点 | 时段内持续发展的高点与低点 | 无 |
+| 上一周期高低收 | 上一个完整的日/周/月的高点、低点与收盘价 | 无 |
+| 开盘区间 | 开盘区间的高点、低点与中点 | 无 |
+
+锚定输出没有数值，它只承担绑定标识、窗格、样式与图层顺序；市场结构与订单块的锚定输出默认为虚线样式，BOS/CHoCH 线段沿用它。结构研究读取完整的 K 线，因此只接受 `close` 输入：其他标量输入被原子拒绝，切换输入也被拒绝；它们的 schema 不列出 `source` 参数，时段研究同样不列出。
+
+## 确认语义
+
+- 摆动点在其右侧 `right` 根柱都已出现后才被确认；水平线从确认行开始，绝不回溯到枢轴所在的行。`left` 与 `right` 为 1 到 50。
+- 市场结构在收盘价（`break_on: "close"`）或影线（`"wick"`）越过最近确认的摆动点时记录突破：与上一次突破同向（或此前没有突破）为 BOS，方向反转为 CHoCH；每个确认的摆动点只被突破一次，每个确认行最多产生两个标记。
+- 公允价值缺口由三根 K 线确认：第三根的低点高于第一根的高点（多头），或第三根的高点低于第一根的低点（空头），且缺口大于 `min_size`。
+- 订单块是确认的结构突破之前最后一根反向 K 线，区域取其影线（`zone: "wick"`）或实体（`"body"`）；向前搜索最多 `MAX_ORDER_BLOCK_SEARCH_ROWS`（500）行。
+- 区域在价格触及（`touch`）、穿过一半（`half`）或完全穿过（`full`）时被缓解，比较价格为影线或收盘价（`mitigation_price`）。每侧最多 64 个活动区域（`max_active` 为 1 到 64）；超出时最旧的区域在该行退役（`retired: true`），仍保留在历史中。`show_mitigated` 决定已缓解与已退役的区域是否继续绘制。
+- 交易时段高低点在每个交易所交易日、UTC 日或宿主时段内持续发展（取决于[时段日历](#时段日历)）。上一周期水平只在下一周期的第一行开始提供。开盘区间从时段开始起持续 `duration_seconds` 秒发展，之后保持不变直到时段结束。
+
+## 空白数据
+
+时段研究遵循本仓库的空白数据契约：非有限或不完整的 OHLC 行不产生点，也不影响累计的水平，如同该行不存在。上一周期水平只把有效行视为观测到的周期数据：整个交易日、周、月或宿主时段都是空白数据时，它不发布新的聚合，下一个有效周期沿用最后一个观测到的周期的水平（上游 `4cfea16`）；交易时段高低点与开盘区间只由当前时段的有效行发展。
+
+结构研究按柱计数：空白数据行位于枢轴窗口中时，该窗口不确认摆动点，而不是像窗口类指标那样跳过该行，这是上游的规则，本仓库保留。空白数据行本身不输出任何值；摆动点在空白数据行上不延续阶梯水平（这一行为与上游 `ef97955` 相同，合并时提前采用，因为本仓库的运行时在数据末端停止，若空白行仍输出阶梯值，增量结果会与重新安装不一致）。
+
+## 空白与预热
+
+本节是内置研究、自定义研究与 KLineChart 指标共同的契约（所有者决定 Q-G 与 Q-H，上游 `0da249d`..`85bc10b`，经合并 `85bc10b` 的提交引入）。
+
+- **缺失的行不存在**。收盘、最高或最低非有限的源行是空白数据：它不是样本，不进入任何窗口或递归，输出在该行为空。递归与累计研究（EMA、RSI、MACD、ATR、OBV、VWAP 等）从最后一个有效样本继续，预热只计入有效样本。窗口与滞后研究（移动平均、布林带、CCI、Donchian、Momentum、ROC、Stochastic 等）的窗口跨越最近 N 个有效行，因此缺口之后的第一行即有值，等于删去缺口行后计算出的值。上游在缺口仍位于窗口内时让这些研究保持空白（例如一分钟的空槽会让 200 周期移动平均空白 200 根柱）；本仓库不采用该规则，这是有意的分歧，与 TradingView 及国内终端“缺失的柱不存在”的行为一致。有限的倒挂柱（最高低于最低）是观测值，照常参与计算；Klinger 与 Mass Index 例外，在这样的柱上不输出、也不重置。
+- **输出从第一个值开始**。每个标量输出的 `data()` 从它第一个有值的时间开始，不再包含开头的空白行；源以空白数据开头时，输出更短、起点更晚。中间的缺口行仍是输出中的空白行。一次修正若使第一个值出现在当前起点之前或改变它，整条输出会被替换，依赖它的研究随之从头重建。市场结构、公允价值缺口与订单块的锚定输出例外，它们保留每个源时间。
+- **预热是静态的**。`indicator_info().warmup_bars` 按无缺口的源度量；源以空白数据开头或预热期内有缺口时，第一个值会晚于该行数。宿主应按时间而不是按行号对齐指标与价格。
+- **自定义研究**与内置研究遵循同一输出形状：运行时写入的开头 NaN 行不被保存，待定或故障时的全空白输出为空。自定义运行时自行决定如何处理空白行；要与内置研究一致，窗口应跨越最近 N 个有效样本。
+
+## 有界工作量
+
+- 扫描器与时段状态每 1,024 行保存一个检查点。追加或填充下一个槽位只处理一行；修订正在形成的柱时，时段研究从保留的尾部状态恢复，只处理一行，结构研究从前一个检查点重放，最多 1,024 行；历史修正重放受影响的后缀加一个检查点区间，以及有界的枢轴/订单块回看，从不因淘汰而回退到全量历史。
+- 检查点只保存扫描器状态与活动区域的索引，从不保存注释历史。注释的区间索引在修复时只清理被截断的叶子并更新受影响的祖先，复用已有分配。标记与区域受保留的源行约束：每个确认行最多两个标记或两个区域。
+- 源的保留裁剪会从保留的行干净地重建结构绑定，注释不保留来自已丢弃行的上下文。
+- 本仓库的调整：结构与时段运行时与内置运行时一样在源的数据末端（最后一个真实行之后）停止，因此在分时图上填充预先安装的交易时段槽位就是一次追加，不会穿过其后的空白槽位重放检查点；输出通过与内置研究相同的输出写入函数只写入变化的行。每次重建扫描的行计入 `last_indicator_work_rows`。
+- 注释、检查点与时段状态的容量计入指标运行时内存遥测。
+- `indicator_info()` 的 `warmup_bars` 对摆动点为 `left + right`（确认第一个枢轴所需的行数），对其他研究为 0；`convergence_bars` 一律为 `null`，因为数值取决于最近确认的枢轴或所在的时段与周期，而不是固定的历史长度。本仓库的这两个字段由研究自身给出，不读取占位的标量运行时。
+
+## 时段日历
+
+时段研究带有日历策略：
+
+- `exchange`（默认，所有者决定 Q-A）：图表的交易所日历，即 `timeScale.timeZone`（或顶层 `timezone`）与 `timeScale.sessionStart` 决定的交易日，与 VWAP 重置和枢轴点使用同一个 `ExchangeTime`。日、从周一开始的周与自然月都按交易日的日期计数：跨越午夜的夜盘属于下一个交易日，也属于该交易日所在的周与月；在负的交易时段起点下，周五夜盘属于下周一的交易日，因此也属于下一周。开盘区间从该交易日第一行之前（含）最近一次本地交易时段起点开始计时（`ExchangeTime::session_open_utc`）：上期所式 21:00 夜盘从当晚 21:00 开始，CME 式周日 17:00 开盘从周日开始，而不是被周末回滚到周五。交易所时间为 UTC 且交易时段起点为 0 时，它与 `utc` 的结果逐行相同。
+- `utc`：UTC 自然日、从周一开始的 UTC 周与 UTC 月。它不读取图表的交易所时区与交易时段起点。
+- `host`：使用宿主通过 `set_study_calendar` 提供的时段。日历最多 20,000 个有序、不相交的区间，校验失败时原子拒绝并保留原日历；相邻且 `session_id` 相同的区间合并为一个时段，未被覆盖的行不属于任何时段（不输出）。宿主时段的交易日取其最后一个包含秒的 UTC 日期，用于上一周期的周与月。宿主可以用 `resample_boundaries` 从交易所时段窗口生成这些区间，无需另写边界逻辑。
+
+`exchange` 的开盘区间锚定在交易时段起点，而不是数据中的第一根柱：交易时段起点为 0 的 A 股图表上，开盘区间从本地午夜开始计时，09:30 的第一根柱已在区间之外；某个交易日没有夜盘（例如长假后的第一个交易日）时，同样没有开盘区间。需要按真实开盘时刻计算时，宿主应把 `sessionStart` 设为开盘时刻，或使用 `host` 策略提供精确的交易时段。
+
+`exchange` 与 `utc` 策略每行只做常数次（或按时区转换点个数取对数次）的日期计算，不保存任何日历数据；追加与修订正在形成的柱仍只处理一行。
+
+交易所时区、交易时段起点或日历日期轴变化时，引擎在同一次调用中通过 `rebuild_calendar_indicators` 从第一行重建每个 `exchange` 策略的绑定、VWAP、VWAP 通道与枢轴点及其依赖的研究，然后重新同步时间点；宿主只需修改选项。`utc` 与 `host` 绑定不受影响。
+
+宿主日历只在运行时存在：它不进入导出的文档，导入不会清除或恢复它，`clear_study_calendar` 清空它。替换或清空宿主日历会从第一行重建每个 `host` 策略的绑定及其依赖的研究，然后重新同步时间点，使用的是同一个引擎函数（`rebuild_calendar_indicators`）。`exchange` 与 `utc` 绑定不受影响。
+
+日历策略属于绑定定义，随 V3 文档持久化（`"exchange"`、`"utc"` 或 `"host"`）；缺少该字段的文档读作 `exchange`。默认值在合并上游后的后续工作 F2(a) 中由 `utc` 改为 `exchange`，兼容性说明见[兼容性](../api/compatibility.md)。
+
+## 注释只用于显示
+
+- 注释没有命中目标：不能被选中、拖动或悬停，点击区域不会选中任何对象。将来若加入交互，应进入引擎输入控制器，而不是宿主。
+- 注释不持久化：V3 只保存研究定义与输出样式，导入后从源数据重新扫描得到注释。
+- 宿主可以按绑定标识（第一个输出）查询注释快照：Rust 的 `ChartEngine::study_annotations`，浏览器的 `chart.study_annotations(binding)`。非结构绑定返回 `unsupported_operation`，未知标识返回 `invalid_handle`。
+
+## 绘制
+
+结构注释在锚定输出所在系列图层中绘制：位于该输出的线条之后、其 `NORMAL` 层级的系列标记之前，因此随锚定输出的 z 序移动。顺序固定为：区域填充（`Rect`，方向色，alpha 38）、区域边框（`RectFrame`）、BOS/CHoCH 线段（`HLine`，锚定输出的线型）及其文字（柱间距不小于 4 CSS px 时才绘制）、摆动点箭头（与系列标记共用的 `push_marker_arrow`）。所有几何裁剪到窗格；只查询区间索引中可见的注释，不扫描全部历史。没有新增图元，后端无需改动。
+
+结构研究不接受 as-of 对齐的源（以及跟随这类源的指标输出）：注释按源自身的行命名，而 as-of 绘图行会重复或跳过源行，注释会落在错误的位置。这样的安装被原子拒绝（浏览器抛出 `invalid_options`），已有结构研究的源（包括结构研究挂在其指标输出链上的源）也不能再切换为 as-of 对齐（`unsupported_operation`）。
+
+## 验证
+
+- `aeris_charts_indicators`：`structure_studies` 与 `study_annotations` 的单元测试、`tests/session_studies.rs`（批量与增量、检查点、宿主时段、交易所日历、周与月）。
+- `aeris_charts_core`：`session_open_is_the_latest_local_session_start_at_or_before_the_time`。
+- 引擎：`structure_engine_tests`、`annotation_binding_tests`、`session_study_regressions`、`study_segment_tests`、`calendar_replacement_*`、`structure_and_session_slot_fill_ticks_take_the_tail_path`、`structure_studies_refuse_as_of_sources_atomically`、`study_outputs_report_warmup_and_no_fixed_convergence`、`structure_anchors_show_no_legend_value_and_are_never_hit`、`exchange_calendar_*` 与 `exchange_time_changes_rebuild_every_exchange_study_in_one_operation`（上期所式夜盘的周与月、UTC 图表上与 `utc` 相同、时区与交易时段起点变化的一次重建、V3 往返），以及包含七个研究的空白数据、随机变更与有界工作量测试。
+- 浏览器：`study-foundation`、`structure-studies`、`session-studies`（含交易所日历的夜盘周与月及时区变化）、`study-replay`、`indicator-catalog` 与 `persistence`（V3 文档中 `exchange` 日历的往返，以及缺少日历字段时读作 `exchange`）规格。
+- 性能：`perf_gate` 的 Target M（studies）在 1,000,000 行上对追加与预先安装的时段槽位计时，并要求每个 Tick 的扫描行数为常数且每个绑定都有报告；Target T 在 1,000,000 行上测量七个研究同时绑定时的末端替换 p99、一次回溯 20,000 行的历史修正，以及一次交易所时区变化对三个时段研究的整段重建。两者的时段研究都使用默认的 `exchange` 日历，图表为 `Asia/Shanghai` 时区、交易时段起点 −3 小时（见[性能契约](../development/performance.md#指标与绘图性能目标)）。Target V 在 10,000 与 1,000,000 行上测量每一种 `IndicatorKind`（含结构与时段研究、KDJ 与 KLineChart 模板）的末端追加与替换 p99：每个绑定 0.5 ms 以内，全部同时绑定 4 ms 以内，增长不超过 10 倍（见[性能契约](../development/performance.md#指标与绘图性能目标)）。
+
+## 自定义研究
+
+自定义研究让宿主在图表内注册自己的公式，同时把调度、界限、样式、依赖与持久化留在引擎中。它与[外部研究](../architecture/data/indicators.md)不同：外部研究由宿主推送已经算好的值，自定义研究由引擎在源变化时调用宿主的运行时计算。
+
+### 注册与绑定
+
+- 宿主注册一个类型化定义：类型标识（小写字母、数字与 `._-`，最多 64 字节）、版本（≥ 1）、标题、参数描述（与内置研究相同的 `IndicatorParameterDescriptor`，`Choice` 参数用 `options` 列出选项）、1 到 5 个输出（每个输出有名称、绘制方式 `line`/`histogram`/`area`/`marker`、窗格 `price`/`dedicated` 与默认样式）以及是否读取成交量。定义在引擎边界一次性校验，失败时原子拒绝。
+- Rust 宿主用 `ChartEngine::register_custom_study(definition, factory)` 注册，工厂按归一化后的参数创建一个实现 `CustomStudyRuntime::compute` 的运行时；浏览器用 `chart.register_custom_study({ type, version, title, parameters, outputs, uses_volume, init, update?, rebuild })`。
+- `add_custom_study(type, source, input, volume, parameters)` 创建绑定：参数先归一化（补全默认值、拒绝未知或越界的参数），输出与内置研究一样别名到源的时间轴，可以被其他研究链式引用，并沿用图例、取值、样式与 `indicator_info`（`kind` 为类型标识，`parameters.custom` 为归一化参数）。`set_custom_study_parameters`、`set_custom_study_source` 与 `retry_custom_study` 保持输出标识与依赖顺序不变。
+- 界限：每个图表最多 64 个注册类型（`MAX_CUSTOM_STUDY_TYPES`）、32 个自定义绑定（`MAX_CUSTOM_STUDY_BINDINGS`）、每个定义 5 个输出（`MAX_CUSTOM_STUDY_OUTPUTS`），最多保留 64 个待取的故障事件（`MAX_CUSTOM_STUDY_FAULTS`）。超出类型或绑定上限返回 `resource_limit`。
+
+### 调度与输入
+
+- 引擎拥有调度：只有在此前的计算连续成功覆盖到当前末端时，才以 `tail: true` 调用运行时（浏览器调用 `update`，未提供时调用 `rebuild`）；否则从变化的后缀或第一行调用 `rebuild`。每次调用携带 `from`，输出只覆盖 `[from, length)`。
+- 本仓库的调整：运行时读取绑定自有的输入列，与内置运行时相同——`hl2`、`hlc3`、`ohlc4`、`hlcc4` 等聚合价格列被保留并只派生变化的行，成交量按时间戳对齐到绑定自有的保留列（`AlignedWeights::full_column`），同样只派生变化的行；成交量序列没有的时间戳（包括成交量序列暂时落后于源时超出其末端的行）为 `NaN`。与上游相同，成交量列要么为空（没有成交量源），要么与时间列等长，运行时可以按源行直接索引。因此每个 Tick 不再为输入分配与历史等长的副本。
+- 本仓库的调整：运行时在源的数据末端（最后一个真实行之后）停止，与内置、结构和时段运行时一致，因此在分时图上填充预先安装的交易时段槽位仍是一次末端更新，不会让运行时重算其后的全部空白槽位；跳过若干槽位的 Tick 从运行时上次停下的位置继续。
+- `NaN` 表示空白数据。每个输出前导的 `NaN` 行不进入其对齐的时间范围，与内置研究的预热一致；内部的 `NaN` 行在范围内保持为空白；待定或故障的输出整体为空。链式研究因此不会把这些空白当作价格读取。
+- 每个绑定报告调用次数与行数（`custom_study_stats`），并计入 `last_indicator_work_rows`；引擎不设不确定的挂钟截止时间。
+
+### 待定、故障与恢复
+
+- 类型未注册、版本不匹配或参数无法归一化时，绑定处于待定状态：输出为空白，依赖照常存在。匹配的类型注册后，引擎应用绘制方式与输出标题（保留已恢复的样式与窗格），重建该绑定及其依赖。
+- 运行时返回错误、输出长度不对或输出含有超出安全范围的值时，绑定进入故障状态：清空全部输出、重建依赖，并把一条故障事件（绑定标识与最多 256 字节的消息）加入有界队列。故障状态下的源更新只写入变化后缀的空白，不再调用运行时；宿主通过 `retry_custom_study`、更换参数或源来恢复。
+- Rust 宿主轮询 `take_custom_study_faults()`；浏览器在每一次可能触发计算的 WASM 调用之后取出故障并投递给 `subscribe_custom_study_fault` 的订阅者（见[浏览器边界](../architecture/hosts/browser.md#自定义研究桥接)）。
+- ponytail：GPUI 宿主目前只能轮询故障；只有当 Aeris Terminal 需要推送式投递时，才在 GPUI 适配层增加一个钩子。
+
+### 持久化与窗格
+
+V3 文档保存自定义绑定的类型标识、精确版本、归一化参数、输出数量、各输出是否位于独立窗格（`dedicated_outputs`）与输出样式，不保存运行时。导入时未注册或版本不匹配的绑定恢复为待定，输出按原顺序恢复到原窗格，并占用恢复游标，使其后的研究保持原位；导入结果的 `unresolved_custom_studies` 列出这些绑定。持久化中的自定义契约（类型标识字符集、版本、1 到 5 个输出、最多 64 个参数且参数序列化后不超过 64 KiB、自定义绑定数量上限、与已注册定义的一致性）在安装任何状态之前校验，失败时原子拒绝。详见[兼容性](../api/compatibility.md#持久化-v3-研究)。
+
+### 绘制
+
+`marker` 输出仍是普通的标量序列，只是绘制方式不同：帧构建逐个可见行（不是 LOD 折线点）在精确价格处画一个圆（`Prim::Circle`），与结构研究的摆动点共用同一个可见性与放置函数，因此缺口与标记价格都保持准确。其余绘制方式沿用折线、直方图与面积。没有新增图元，后端无需改动。
+
+### 只用于显示的状态
+
+研究日历与[拍卖标记](footprint.md#拍卖标记)都只在运行时存在，不进入持久化文档（所有者决定 Q-E）；自定义研究只持久化定义。ponytail：注释、拍卖标记与自定义标记目前都没有命中目标；将来加入悬停或选择时进入引擎输入控制器，而不是宿主。
+
+### 验证
+
+- 引擎：`custom_studies::tests`（调度、链式修复、待定与故障、上限、持久化、多输出预热与内部空白）、`custom_marker_plot_uses_exact_visible_prices_without_line_or_whitespace_marks`、`combined_structure_custom_marker_and_auction_frame_uses_existing_primitives`、`replay_seek_structure_auction_and_custom_study_match_fresh_prefix`，以及本仓库的 `aggregate_input_custom_study_reuses_its_retained_price_column_per_tick`（聚合输入不在每个 Tick 分配 O(n) 副本）与 `custom_study_ticks_filling_pre_installed_session_slots_stay_tail_updates`。
+- GPUI：`studies_and_auction_scene_reaches_canvas_and_gpui_identically_and_replays_deterministically` 在多个 DPR 下比较 Canvas2D 与 GPUI 的绘制流，并在两个引擎实例之间比较帧与执行计划。
+- 浏览器：`custom-studies` 规格（重入、worker 拒绝、环形缓冲区与 `pop` 后的故障投递、跨后端像素一致性）。

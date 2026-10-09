@@ -21,7 +21,7 @@
 
 ## 错误与生命周期
 
-可预期的失败会抛出 `AerisChartsError`，它是 `Error` 的子类，带有以下稳定错误码之一：`disposed`、`invalid_handle`、`stale_handle`、`invalid_data`、`invalid_options`、`unsupported_operation`、`serialization_error`、`persistence_version_error`、`extension_error`、`renderer_platform_error` 或 `resource_limit`。
+可预期的失败会抛出 `AerisChartsError`，它是 `Error` 的子类，带有以下稳定错误码之一：`disposed`、`invalid_handle`、`stale_handle`、`invalid_data`、`invalid_options`、`unsupported_operation`、`serialization_error`、`persistence_version_error`、`extension_error`、`renderer_platform_error`、`resource_limit`、`unsupported` 或 `reentrant_call`。后两个错误码是新增的（上游 `2019f10`，经合并 `4c1da4f` 的提交引入），既有错误码的含义不变：`unsupported` 表示当前图表形态不支持该功能（OffscreenCanvas worker 图表的 `register_custom_study` 与 `add_custom_study`），`reentrant_call` 表示在自定义研究回调执行期间调用了图表 API。按错误码穷尽分派的宿主需要处理这两个新值；渲染期间的宿主回调重入仍为 `unsupported_operation`。
 
 `chart.remove()` 是幂等的。移除之后，每个需要有效图表状态的操作都会抛出 `disposed`。调用方已持有的标识字段仍然可以读取。已移除的系列、绘图、窗格和价格比例尺会抛出 `stale_handle`；过期的句柄绝不会指向替代对象。扩展清理异常仍被隔离，并作为开发警告报告。
 
@@ -67,7 +67,13 @@
 
 ## 持久化 V3 研究
 
-带有引擎持有指标的金融图表导出 schema 版本 3。V3 仍由宿主持有市场历史与普通系列数据，但会持久化有序的研究绑定、标量输入选择、类型化指标参数（包括显式的 seed、histogram 与 estimator 取值）、按时间戳对齐的成交量与成交额来源引用，以及各输出的样式。链式来源被编码为对较早研究输出的引用，因此恢复不依赖旧的实时系列标识。宿主必须在导入 V3 之前重新创建来源系列及其数据；导入会在变更之前校验每一项依赖、参数、输出样式数量和资源限制。V1 和 V2 文档仍被原样接受，且 V3 文档只能恢复到全新的金融图表中。
+带有引擎持有指标的金融图表导出 schema 版本 3。V3 仍由宿主持有市场历史与普通系列数据，但会持久化有序的研究绑定、标量输入选择、类型化指标参数（包括显式的 seed、histogram 与 estimator 取值）、按时间戳对齐的成交量与成交额来源引用，以及各输出的样式。链式来源被编码为对较早研究输出的引用，因此恢复不依赖旧的实时系列标识。宿主必须在导入 V3 之前重新创建来源系列及其数据；导入会在变更之前校验每一项依赖、参数、输出样式数量和资源限制。V1 和 V2 文档仍被原样接受，且 V3 文档只能恢复到全新的金融图表中。广度层的 29 个指标种类（上游 `2f62875` 的 19 个与 `9dd8cff` 的 10 个）以其 `kind` 名称写入同一个 V3 schema，没有提升版本号，因此不包含这些种类的较早修订会拒绝导入含有它们的文档。
+
+七个结构与时段研究（上游 `dc39045`）以新增的 V3 种类标签保存：`swing_points`、`market_structure`、`fair_value_gaps`、`order_blocks`、`session_levels`、`previous_period_levels` 与 `opening_range`，`schema_version` 仍为 3。不认识这些标签的旧构建会拒绝整个文档且不产生变更。只保存研究定义（时段研究包括 `calendar` 策略：`"exchange"`、`"utc"` 或 `"host"`，缺少该字段时读作 `"exchange"`）与输出样式：结构注释与宿主的时段日历不进入文档；`source_input` 不是 `close` 的结构研究、超出范围的摆动窗口或 `max_active`、未知的日历或周期以及为 0 的开盘区间时长都会使导入原子失败。
+
+自定义研究（上游 `1276c5e`..`92aefe5`，经合并 `4c1da4f` 的提交引入）以 `kind: "custom"` 保存类型标识、精确版本、归一化参数与输出数量，并可带 `dedicated_outputs`（各输出是否位于独立窗格），`schema_version` 仍为 3；不认识这些标签或字段的旧构建会拒绝整个文档且不产生变更。只保存定义、窗格位置与输出样式，不保存运行时。类型未注册或版本不匹配时，导入照常完成，绑定处于待定状态（输出为空白），导入结果的 `unresolved_custom_studies` 列出这些绑定的标识（V1/V2 文档的结果不带该字段），宿主注册匹配的类型后自动恢复计算。自定义契约（类型标识字符集与长度、版本、1–5 个输出、最多 64 个参数且序列化后不超过 64 KiB、最多 32 个自定义绑定、与已注册定义一致的输出数量、成交量用法与归一化参数）在安装之前校验，失败时导入原子失败。
+
+拍卖标记与研究日历只在运行时存在，不进入任何版本的文档（所有者决定 Q-E）：导入不会恢复它们，宿主在导入后重新绑定标记、重新提供日历。拍卖标记快照的 `bar_time` 在时间柱上是柱开盘的 UTC 秒；本仓库在非时间柱上使用图表行键（与足迹图行和大单订单相同，保留裁剪不重新分配），而上游使用会在裁剪后重新编号的逻辑索引，因此依赖上游语义比较非时间标记键的宿主需要改为按行键比较。`chart.add_auction_markers` 与 `apply_options` 的拒绝与大单一样带类型：超过 16 组为 `resource_limit`，宿主系列类型不支持为 `unsupported_operation`，未知的流或系列为 `invalid_handle`，选项无效为 `invalid_options`，句柄移除后为 `stale_handle`。
 
 ## 版本策略
 
@@ -78,6 +84,25 @@
 - major（包括最终的 1.0 边界）：移除/重命名/更改稳定 API 的签名、不兼容的稳定行为，或终止文档中记载的持久化兼容窗口。
 
 新增绘图/系列类型通常属于 minor 级别的包功能，但改变既有类型的含义则不兼容。新增持久化 schema 不会使 V1 失效；移除 V1 支持遵循另行记载的持久化窗口，属于 major 级别的兼容性事件。
+
+### 已记录的不兼容变更
+
+- 布林带偏差必须有限且不小于 0（上游 `2f62875`）。`add_bollinger`、`add_bollinger_with_source` 与新增的 `add_bollinger_metrics` 拒绝负偏差（`invalid_options`），V3 导入同样拒绝含负布林带偏差的研究；此前负偏差会被接受并按 0 计算带宽，以前导出的此类文档不再能导入。`indicator_schema(kind)` 同时升为修订 3，新增 `"boolean"` 参数类型，按 `parameter_type` 穷尽分派的宿主编辑器需要处理它。
+- `indicator_schema(kind)` 的隐式默认值改为每个研究的规范默认值（上游 `9dd8cff`）。不传 `period` 与 `deviation` 的查询此前把 14 与 2 代入每个参数（例如 MACD 14/28/14、Stochastic `%D` 14、SuperTrend 倍数 2、EMA 彩带五个 14、VWAP 带 σ 2、KDJ 14/3/3），现在返回 MACD 12/26/9、Stochastic `%D` 3、SuperTrend 3、EMA 彩带 5/10/20/50/200、VWAP 带 σ 1、KDJ 9/3/3；本仓库把同一规则用于 KDJ。查询没有单独的“未传参”信号：浏览器端的 `indicator_schema(kind, period = 14, deviation = 2)` 无法区分省略的参数与显式传入的 14 或 2，引擎因此把 `period` 14 与 `deviation` 2 本身视为隐式查询。显式传入这些值同样返回规范默认值：`period` 14 时的 MACD（此前 14/28/14）、KDJ（此前 14/3/3）、Stochastic `%D`（此前 14）与 EMA 彩带（此前五个 14），以及 `deviation` 2 时的 SuperTrend 倍数（此前 2，现为 3）与 VWAP 带 σ（此前 2，现为 1）。只有其他显式值沿用原来的替换规则（`indicator_schema("macd", 12)` 仍为 12/24/12）。从 schema 默认值构建设置面板的宿主会显示新的默认值。名称解析现由引擎的 `IndicatorKind::schema_definition` 拥有，WebAssembly 不再保留自己的映射表。
+- 选择参数的列表字段由 `choices` 改名为 `options`，`indicator_schema(kind)` 升为修订 4（上游 `051a447`，经合并 `dc39045` 的提交引入）。`indicator_parameter_descriptor.choices` 已移除且没有兼容别名：读取约定参数（`seed`、`estimator`）可选值的宿主需要改读 `options`，Rust 宿主改用 `IndicatorParameterDescriptor::options: Option<Vec<String>>` 与构造函数 `IndicatorParameterDescriptor::choice`。非选择参数不再带该字段。本仓库的修订号自此与上游分离（上游为 2、本仓库为 4），按修订号判断编辑器能力的宿主只应与同一仓库的修订号比较。
+- 大单取代足迹图成交气泡（上游 `9fc3f2b`）。`chart.add_trade_bubbles(series, stream_id, options)` 已移除且没有兼容垫片：其替代品 `chart.add_big_trades(series, stream_id, options)` 的行为不同（先由连续成交重建主动订单再过滤，默认按最近已完成订单的 98 分位数自动过滤，前 128 个订单完成之前不显示任何气泡；气泡是窗格 chrome，不再写入系列标记），并返回一个 `big_trades_api` 句柄；被拒绝时抛出带类型的错误：超过 16 个指标为 `resource_limit`，宿主系列类型不支持为 `unsupported_operation`，未知的流或系列为 `invalid_handle`，选项无效为 `invalid_options`（`apply_options` 在句柄移除后为 `stale_handle`）。`trade_stream_stats` 的 `bubble_trades_scanned` 与 `bubble_markers_sized` 由 `big_trades_prints_scanned` 与 `big_trades_replays` 取代。按上文策略这属于 major 级别的变更，具体版本号在发布时决定。Rust 侧对应的变更见 [Rust 接入](rust.md#更换固定修订)。
+- 足迹图改为真实的 bid × ask 聚簇（上游 `314fdc8`、`a8dad8a`）。这是视觉行为变更，不改变任何函数签名：详细层级从 48 CSS px 柱间距起显示数字（此前要求更宽的柱才显示摘要），柱摘要只剩 `Δ` 与 `V` 两行（不再有 H/L/B/A），POC 改为不遮挡数字的轮廓，柱左缘新增方向区间线，数字保持配置的字号而不随行高变大，小于 0.01 的成交量以两位有效数字显示。`footprint_series_options` 新增可选的 `adaptive_rows`（默认 `false`），按当前缩放以 1-2-5 步长合并行。依赖截图或帧图元比较足迹图的宿主测试需要更新。主系列的行是空白数据时，`histogram_updown` 成交量柱按成交量系列自身的 `histogram_updown_rule`，从同一窗格中可见的足迹图取得涨跌方向（上游 `ea789aa`），没有足迹图柱的位置保持纯色；此前这些柱始终是纯色。Rust 侧的订单流变更见 [Rust 接入](rust.md#更换固定修订)。
+- `indicator_info().kind` 与 `indicator_schema().kind` 的 TypeScript 类型由 `indicator_kind` 放宽为 `indicator_kind | (string & {})`（上游 `1276c5e`..`92aefe5`，经合并 `4c1da4f` 的提交引入）：自定义研究的输出报告其已注册的类型标识，可以是任意字符串。把 `info.kind` 赋给 `indicator_kind` 类型变量、或按 `indicator_kind` 穷尽 `switch` 的宿主将无法通过类型检查，需要先收窄类型或加一个兜底分支。`indicator_info.parameters` 同时新增 `custom` 字段（自定义研究的归一化参数，内置研究为 `null`），列出全部字段的对象字面量需要补上。Rust 侧对应的变更见 [Rust 接入](rust.md#更换固定修订)。
+- 指标输出从第一个值开始（所有者决定 Q-H，上游 `0dcca70`，经合并 `85bc10b` 的提交引入）。内置、自定义与 KLineChart 研究的 `data()` 不再包含开头的空白行：源以空白数据开头时，返回的列表更短、第一个时间更晚；中间的缺口仍是空白行，市场结构、公允价值缺口与订单块的锚定输出仍覆盖每个源时间。假定指标列表从第一行起与价格列表逐行对应的应用需要改为按时间对齐。`indicator_info().warmup_bars` 不变，仍按无缺口的源度量。
+- 缺失柱之后的窗口研究（所有者决定 Q-G）：本仓库让移动平均、布林带、CCI、Donchian、Momentum、ROC、Stochastic 等窗口研究在缺口后的第一行即有值（窗口跨越最近 N 个有效行），这与此前相同；上游自该范围起在缺口仍位于窗口内时让它们保持空白，本仓库不采用。由此，Rust 纯计算函数在含缺口的输入上现在返回与图表相同的值（此前被 NaN 污染），Klinger 不再因空的成交量单元格而重启（按零成交量计入），`±∞` 价格与 NaN 一样被视为空白行。RSI（及 Stochastic RSI）的运行时检查点改为保存 `IndexedRsiState`（附带上一个有效收盘价），因此 RSI 的指标运行时内存遥测约为此前的两倍；该内存仍按检查点计、不随行数增长（见 [Rust 接入](rust.md#更换固定修订)）。
+- 时段研究的默认日历由 `utc` 改为 `exchange`（所有者决定 Q-A，合并上游后的后续工作 F2(a)）。交易时段高低点、上一日/周/月水平与开盘区间新增 `"exchange"` 日历策略，它跟随图表的交易所时区与交易时段起点（与 VWAP 和枢轴点相同的交易日），并成为默认值：浏览器的 `add_session_levels(source)`、`add_previous_period_levels(source, period)`、`add_opening_range(source, duration_seconds)` 省略 `calendar` 时、`indicator_schema(kind)` 报告的 `calendar` 默认值（选项现为 `["exchange", "utc", "host"]`，修订号不变）以及 Rust 的 `IndicatorKind::schema_definition` 都改为 `exchange`。V3 文档写出 `"exchange"`；缺少 `calendar` 字段的时段研究读作 `exchange`。显式写出 `"utc"` 或 `"host"` 的文档与调用不受影响。交易所时间为 UTC 且交易时段起点为 0 的图表上，`exchange` 与 `utc` 的结果逐行相同，因此只有设置了非 UTC 时区或非零交易时段起点、且依赖省略参数的宿主会看到不同的值：日、周、月按交易日切分，跨越午夜的夜盘属于下一个交易日，开盘区间从交易时段起点开始计时。需要旧行为的宿主显式传 `"utc"`。旧构建不认识 `"exchange"`，会原子拒绝含该值的文档；穷尽匹配 `StudyCalendarPolicy` 的 Rust 代码需要新增分支。
+- Choppiness 绘制 Chop Zone（所有者决定 Q-D，合并上游后的后续工作 F2(b)）。`add_choppiness` 的输出现在带有内置阈值区域：振荡器窗格中 38.2 到 61.8 之间的半透明通道与两条点状边界线，样式、层级、随绑定显隐以及持久化行为与 RSI、Stochastic、CCI、Williams %R 和 Stochastic RSI 的阈值区域相同；区域由指标种类推导，不写入文档，导入后自动重建。这与上游的实际输出不同：上游（`9dd8cff`）只在文档中说明 Chop Zone 阈值，图表上不绘制任何区域。这是视觉行为新增，不改变函数签名、`data()` 或持久化文档；依赖 Choppiness 窗格像素与上游一致的截图比对需要更新基线。
+- 图像不透明度在每个后端都量化为 1/255 的整数倍（上游 `b75ec25`），低于 1/510 的不透明度不再绘制；差异肉眼不可见。
+- 绘图期间的十字光标跟随绘图实际生效的磁吸（上游 `71b17a8`，经合并 `2f2012d` 的提交引入）。工具已激活、绘图正在创建或正被拖动时，`Normal` 模式的十字光标现在按该绘图实际生效的磁吸吸附（绘图自身的 `magnet` 与图表的 `set_drawing_magnet_mode` 取较强者，按住 Ctrl/Cmd 时按下一条解析）：`weak` 在 12 CSS px 内吸附到与锚点相同的已渲染 OHLC 值，`strong` 绘图在不按修饰键拖动时也吸附；多锚点绘图的主体拖动不吸附，十字光标同样保持原始位置。此前十字光标只在实际生效的磁吸为 `strong` 的工具已激活时，或在按住 Ctrl/Cmd 拖动时吸附，因此 `weak` 放置和 `strong` 绘图的拖动中十字光标与锚点会落在不同位置。`magnet` 选项与持久化字段（缺少时读作 `"off"`）不变。这是视觉行为变更，不改变函数签名。
+- 按住 Ctrl/Cmd 把绘图自身的磁吸升为 `strong`（上游 `71b17a8`，经合并 `2f2012d` 的提交引入）。绘图自身的 `magnet` 为 `"weak"` 或 `"strong"` 时，按住 Ctrl/Cmd 现在与上游一致，一律按 `strong` 吸附放置、预览、锚点拖动、单锚点主体拖动与派生手柄拖动以及十字光标，无论图表磁吸为何；此前本仓库会把这类已启用的磁吸切换为关闭。自身 `magnet` 为 `"off"`（默认）的绘图不变：按住 Ctrl/Cmd 仍临时切换图表的 `set_drawing_magnet_mode`（未启用时变为 strong，已启用时变为 off）。`weak` 半径仍为本仓库的 12 CSS px（`DRAWING_WEAK_MAGNET_DISTANCE`，同时服务图表级磁吸，保持默认绘图的行为不变），未采用上游的 10 CSS px。依赖“按住修饰键关闭绘图自身磁吸”的用户流程需要改为把该绘图的 `magnet` 设为 `"off"`。函数签名与持久化不变。
+- 足迹图的 `profile_in_bar`、`volume_ladder`、`horizontal_imbalance` 与 `bid_ask_histogram` 单元格模式各自绘制独立的行几何（上游 `71b17a8`，经合并 `2f2012d` 的提交引入；参见[足迹图领域契约](../features/footprint.md#3-聚合与记账)）。此前它们分别与 `total` 或 `bid_ask` 绘制相同的图元；`horizontal_imbalance` 现在在帧构建时比较同一价位的 bid 与 ask，`footprint_bar` 返回的存储失衡标记不变。这是视觉行为变更，不改变函数签名或持久化；依赖截图或帧图元比较这些模式的宿主测试需要更新。
+- 价格坐标轴标签不再互相遮挡（上游 `86e2aa2`，经合并 `86e2aa2` 的提交引入；参见[图层组装与金融控件](../architecture/rendering/frame.md#图层组装与金融控件)）。持仓、订单、止损限价单的触发价与警报标签此前总是位于精确价格，可能与实时价格簇或彼此重叠；现在它们与价格线和绘图标签一起按优先级（持仓、订单、警报、价格线与绘图）在一个 pass 中放置，价格处被占用时取最近的空闲位置，窗格过满时金融操作标签留在原价而价格线与绘图标签被省略。被标签遮挡的价格刻度不再绘制文本，坐标轴宽度不变。这是视觉行为变更，不改变函数签名或持久化；依赖截图或坐标轴标签位置的宿主测试需要更新。
+- 引擎构建的价格文本跟随比例尺格式（上游 `86e2aa2`，经合并 `86e2aa2` 的提交引入；参见[比例尺价格格式](../architecture/engine/panes-and-scales.md#比例尺价格格式)）。持仓、订单与成交读数现在先使用宿主的 `localization.price_formatter`，比例尺选定的格式优先于品种精度；斐波那契档位价格、`price_label` 绘图与绘图的 `price`/`price_change` 标签此前固定为两位小数，现在跟随所绑定比例尺的格式。本仓库各绘图族的统计框沿用其文本约定（两个空格分组、零不带符号、普通连字符时长）。Rust 侧对应的变更见 [Rust 接入](rust.md#更换固定修订)。
 
 ## 品牌更名
 

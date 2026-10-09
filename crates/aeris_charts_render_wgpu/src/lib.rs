@@ -15,10 +15,10 @@ mod tex_quad_pipeline;
 mod tri_executor;
 mod tri_pipeline;
 
-pub use atlas::{AtlasSlot, LabelAtlas, ATLAS_SIZE};
+pub use atlas::{ATLAS_SIZE, AtlasSlot, LabelAtlas};
 pub use frame::{
-    prims_to_group, render_frame, BufferStats, DrawGroup, DrawRun, FrameResources, MsaaTarget,
-    RunPipeline, SAMPLE_COUNT,
+    BufferStats, DrawGroup, DrawRun, FrameResources, MsaaTarget, RunPipeline, SAMPLE_COUNT,
+    prims_to_group, render_frame,
 };
 pub use gpu_timer::GpuTimer;
 pub use quad_executor::{prim_to_instances, prims_to_instances};

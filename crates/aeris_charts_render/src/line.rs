@@ -10,7 +10,7 @@
 
 use crate::color::Color;
 use crate::draw_list::{LineStyle, LineType, Prim};
-use crate::shape::{clip_polyline_to_rect, Rect};
+use crate::shape::{Rect, clip_polyline_to_rect};
 
 /// A vertex the backend will render: bitmap-space position + straight RGBA color.
 /// The stroke pipeline extrudes these with AA; the fill pipeline draws them opaque.
@@ -2055,10 +2055,12 @@ mod tests {
             let (expanded_upper, expanded_lower) = expand_band(&upper, &lower, line_type);
             assert_eq!(expanded_upper.len(), expanded_lower.len());
             assert!(expanded_upper.len() > upper.len());
-            assert!(expanded_upper
-                .iter()
-                .zip(&expanded_lower)
-                .all(|(upper, lower)| (upper.x - lower.x).abs() < f64::EPSILON));
+            assert!(
+                expanded_upper
+                    .iter()
+                    .zip(&expanded_lower)
+                    .all(|(upper, lower)| (upper.x - lower.x).abs() < f64::EPSILON)
+            );
             assert_eq!(expanded_upper.first().unwrap().x, 0.0);
             assert_eq!(expanded_upper.last().unwrap().x, 20.0);
         }
@@ -2217,7 +2219,7 @@ mod tests {
         let mut v = Vec::new();
         build_disc([10.0, 20.0], 4.0, BLUE, &mut v);
         assert_eq!(v.len(), 24 * 3); // 24 fan triangles
-                                     // every triangle's first vertex is the center
+        // every triangle's first vertex is the center
         for tri in v.chunks(3) {
             assert_eq!([tri[0].x, tri[0].y], [10.0, 20.0]);
         }
@@ -2432,9 +2434,11 @@ mod tests {
         );
         assert!(pool.len() <= 32);
         let clip = PANE.inflate(2.0 + 2.0);
-        assert!(pool
-            .iter()
-            .all(|p| f64::from(p[0]) >= clip.left - 24.0 && f64::from(p[0]) <= clip.right + 24.0));
+        assert!(
+            pool.iter().all(
+                |p| f64::from(p[0]) >= clip.left - 24.0 && f64::from(p[0]) <= clip.right + 24.0
+            )
+        );
         let inside: Vec<f32> = runs
             .iter()
             .map(|run| run[0][0])

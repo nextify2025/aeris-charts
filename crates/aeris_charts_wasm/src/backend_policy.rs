@@ -156,8 +156,8 @@ pub(crate) fn surface_error_action(error: &wgpu::CurrentSurfaceTexture) -> Surfa
 #[cfg(test)]
 mod tests {
     use super::{
-        surface_error_action, BackendStartupFailure, BackendStatus, BackendWarningDeduplicator,
-        SurfaceErrorAction,
+        BackendStartupFailure, BackendStatus, BackendWarningDeduplicator, SurfaceErrorAction,
+        surface_error_action,
     };
 
     #[test]

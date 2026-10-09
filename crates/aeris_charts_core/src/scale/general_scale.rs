@@ -524,11 +524,7 @@ fn nice_step(raw_step: f64) -> f64 {
         10.0
     };
     let step = factor * power;
-    if step.is_finite() {
-        step
-    } else {
-        raw_step
-    }
+    if step.is_finite() { step } else { raw_step }
 }
 
 fn normalized_unit(value: f64, from: f64, to: f64) -> Option<f64> {
@@ -565,11 +561,7 @@ fn project_from_start(range_from: f64, range_to: f64, offset: f64) -> f64 {
 }
 
 fn normalize_zero(value: f64) -> f64 {
-    if value == 0.0 {
-        0.0
-    } else {
-        value
-    }
+    if value == 0.0 { 0.0 } else { value }
 }
 
 #[cfg(test)]

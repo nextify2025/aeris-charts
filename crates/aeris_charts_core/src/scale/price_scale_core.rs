@@ -1,10 +1,10 @@
 //! Price scale coordinate math and interactions. Port of `src/model/price-scale.ts`
 //! (data-source management and formatter selection live at a higher layer).
 
-use crate::model::price_range::PriceRange;
-use crate::scale::log_formula::{self, LogFormula, DEF_LOG_FORMULA};
-use crate::scale::price_tick_span_calculator::{align_span_to_min_move, composite_tick_span};
 use crate::Coordinate;
+use crate::model::price_range::PriceRange;
+use crate::scale::log_formula::{self, DEF_LOG_FORMULA, LogFormula};
+use crate::scale::price_tick_span_calculator::{align_span_to_min_move, composite_tick_span};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PriceScaleMode {
@@ -1255,7 +1255,7 @@ mod tests {
         s.set_auto_scale(false);
         s.start_scale(150.0); // start point (inverted): 50
         s.scale_to(100.0); // x' = 100
-                           // coeff = (50 + 199*0.2) / (100 + 199*0.2) = 89.8 / 139.8
+        // coeff = (50 + 199*0.2) / (100 + 199*0.2) = 89.8 / 139.8
         let coeff: f64 = 89.8 / 139.8;
         let r = s.price_range().unwrap();
         let expected_half = 50.0 * coeff;
@@ -1316,7 +1316,7 @@ mod tests {
 
     #[test]
     fn tick_labels_lie_on_every_min_move_grid_and_are_unique() {
-        use crate::format::price_formatter::{precision_by_min_move, PriceFormatter};
+        use crate::format::price_formatter::{PriceFormatter, precision_by_min_move};
         use crate::scale::price_tick_span_calculator::is_multiple_of;
         let min_moves = [0.02, 0.05, 0.005, 0.2, 1.0, 2.0, 5.0, 0.25, 0.03125];
         let centers = [0.8, 9.9, 15.0, 25.0, 97.5, 250.0, 1_234.0, 7_500.0];
@@ -1389,13 +1389,7 @@ mod tests {
         use crate::scale::price_tick_span_calculator::is_multiple_of;
         // A two-band ladder: 0.01 below 10, 1 from 10 up. An interval's grid is its coarsest
         // band, which every sub-interval's grid divides.
-        let band = |price: f64| -> f64 {
-            if price.abs() < 10.0 {
-                0.01
-            } else {
-                1.0
-            }
-        };
+        let band = |price: f64| -> f64 { if price.abs() < 10.0 { 0.01 } else { 1.0 } };
         let grid = |low: f64, high: f64| band(low).max(band(high));
         let mut s = PriceScaleCore::new(PriceScaleCoreOptions {
             mode: PriceScaleMode::Logarithmic,

@@ -4,8 +4,8 @@
 use super::*;
 use crate::timeline_marks::TIMELINE_LANE_RESERVATION_CSS as LANE;
 use crate::{
-    PointerInput, TimelineGlyphShape, TimelineMark, TimelineMarkGlyph, TimelineMarkGroup,
-    TimelineMarksSnapshot, TRADING_TOOLTIP_DWELL_MS,
+    PointerInput, TRADING_TOOLTIP_DWELL_MS, TimelineGlyphShape, TimelineMark, TimelineMarkGlyph,
+    TimelineMarkGroup, TimelineMarksSnapshot,
 };
 
 const BARS: usize = 80;
@@ -178,11 +178,13 @@ fn tokens_letters_and_counts_land_in_the_chrome_layer() {
 
     // Same-slot pair of one group: the earliest mark's glyph (square, green) with the count.
     let (x50, _) = token_center(&chart, 50);
-    assert!(prims
-        .iter()
-        .any(|prim| matches!(prim, Prim::RoundRect { x, w, fill, .. }
+    assert!(
+        prims
+            .iter()
+            .any(|prim| matches!(prim, Prim::RoundRect { x, w, fill, .. }
         if *fill == Color::rgb(0, 0xff, 0) && (*w - 18.0).abs() < 1e-4
-            && ((*x + *w / 2.0) - x50.round() as f32).abs() < 1e-4)));
+            && ((*x + *w / 2.0) - x50.round() as f32).abs() < 1e-4))
+    );
     // Mixed cluster of two groups one bar apart (10 px): a neutral bordered square with the count.
     let (x60, _) = token_center(&chart, 60);
     let text_color = chart.primary_text_color();
@@ -193,10 +195,12 @@ fn tokens_letters_and_counts_land_in_the_chrome_layer() {
     ));
     // A pin is a disc over a triangle; a diamond is two triangles; a letterless mark prints none.
     let (x70, _) = token_center(&chart, 70);
-    assert!(prims
-        .iter()
-        .any(|prim| matches!(prim, Prim::Triangle { c, color, .. }
-        if *color == Color::rgb(0xab, 0xcd, 0xef) && (c[0] - x70.round() as f32).abs() < 1e-4)));
+    assert!(
+        prims
+            .iter()
+            .any(|prim| matches!(prim, Prim::Triangle { c, color, .. }
+        if *color == Color::rgb(0xab, 0xcd, 0xef) && (c[0] - x70.round() as f32).abs() < 1e-4))
+    );
     let triangles = prims
         .iter()
         .filter(|prim| matches!(prim, Prim::Triangle { color, .. } if *color == Color::rgb(0xfe, 0xdc, 0xba)))
@@ -386,9 +390,11 @@ fn projected_marks_draw_in_the_whitespace_only_while_a_bar_is_visible() {
         .time_scale
         .logical_to_coordinate((BARS - 1) as f64 + 5.0)
         .round() as f32;
-    assert!(prims
-        .iter()
-        .any(|prim| matches!(prim, Prim::Circle { cx, .. } if (*cx - expected_x).abs() < 1e-4)));
+    assert!(
+        prims
+            .iter()
+            .any(|prim| matches!(prim, Prim::Circle { cx, .. } if (*cx - expected_x).abs() < 1e-4))
+    );
     let hit = chart
         .timeline_mark_hit_at(f64::from(expected_x), token_center(&chart, 0).1)
         .expect("the projected token hits");

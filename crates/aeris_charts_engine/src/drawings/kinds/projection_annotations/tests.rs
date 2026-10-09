@@ -287,10 +287,12 @@ fn armed_tools_place_every_kind() {
         assert_eq!(chart.selected_drawing(), Some(id));
     }
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .points
-        .iter()
-        .all(|point| point[0].is_finite() && point[1].is_finite()));
+    assert!(
+        frame.panes[0]
+            .points
+            .iter()
+            .all(|point| point[0].is_finite() && point[1].is_finite())
+    );
 }
 
 #[test]
@@ -348,30 +350,38 @@ fn forecasts_evaluate_success_failure_and_pending_from_the_source_series() {
         Some("+5.0% · target reached")
     );
     // A target no bar reaches fails once the data passes it.
-    assert!(chart
-        .set_drawing_anchors(id, &[p(10.0, 101.0).into(), p(20.0, 107.0).into()])
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[p(10.0, 101.0).into(), p(20.0, 107.0).into()])
+            .is_ok()
+    );
     assert_eq!(forecast_outcome(&chart, id), Some(false));
     assert!(forecast_label(&mut chart).unwrap().ends_with("expired"));
     // A target beyond the data is pending.
-    assert!(chart
-        .set_drawing_anchors(id, &[p(10.0, 101.0).into(), p(45.0, 107.0).into()])
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[p(10.0, 101.0).into(), p(45.0, 107.0).into()])
+            .is_ok()
+    );
     assert_eq!(forecast_outcome(&chart, id), None);
     assert!(forecast_label(&mut chart).unwrap().ends_with("pending"));
     // A target on the latest bar stays pending while that bar may still form; the next bar
     // decides the failure.
-    assert!(chart
-        .set_drawing_anchors(id, &[p(30.0, 101.0).into(), p(39.0, 107.0).into()])
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[p(30.0, 101.0).into(), p(39.0, 107.0).into()])
+            .is_ok()
+    );
     assert_eq!(forecast_outcome(&chart, id), None);
     assert!(chart.update_series_bar(0, 40.0 * HOUR, [100.0, 100.5, 99.5, 100.0]));
     assert_eq!(forecast_outcome(&chart, id), Some(false));
     assert!(forecast_label(&mut chart).unwrap().ends_with("expired"));
     // Falling targets test the lows; the line hits.
-    assert!(chart
-        .set_drawing_anchors(id, &[p(13.0, 106.0).into(), p(20.0, 100.0).into()])
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[p(13.0, 106.0).into(), p(20.0, 100.0).into()])
+            .is_ok()
+    );
     assert_eq!(forecast_outcome(&chart, id), Some(true));
     let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
     assert_eq!(hit(&chart, (a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0), Some(id));
@@ -473,9 +483,11 @@ fn ranges_measure_with_fills_arrows_and_engine_stats() {
     assert_eq!(arrowheads, 2, "a price arrow and a time arrow");
     // Hiding the stats removes the box.
     assert!(chart.drawing_apply_options(both, r#"{"labels":[]}"#));
-    assert!(!texts_of(&mut chart)
-        .iter()
-        .any(|text| text.contains("bars")));
+    assert!(
+        !texts_of(&mut chart)
+            .iter()
+            .any(|text| text.contains("bars"))
+    );
 }
 
 #[test]
@@ -645,14 +657,18 @@ fn stats_labels_and_hits_follow_the_drawing_onto_a_lower_pane() {
         )
         .unwrap();
     let frame = chart.build_frame();
-    assert!(frame.panes[pane]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "10 bars  10h")));
-    assert!(!frame.panes[0]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Text { text, .. } if text.contains("bars"))));
+    assert!(
+        frame.panes[pane]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "10 bars  10h"))
+    );
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Text { text, .. } if text.contains("bars")))
+    );
     let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
     assert_eq!(
         hit(&chart, (a.0 + b.0) / 2.0 + 7.0, (a.1 + b.1) / 2.0 + 5.0),
@@ -928,14 +944,18 @@ fn forecasts_stay_pending_over_future_whitespace_session_slots() {
     };
     assert_eq!(outcome(&mut chart), None, "empty slots are not bars");
     // A target inside the empty slots stays pending as well.
-    assert!(chart
-        .set_drawing_anchors(id, &[p(10.0, 101.0).into(), p(30.0, 107.0).into()])
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[p(10.0, 101.0).into(), p(30.0, 107.0).into()])
+            .is_ok()
+    );
     assert_eq!(outcome(&mut chart), None);
     // The first traded bar after the target decides the failure.
-    assert!(chart
-        .set_drawing_anchors(id, &[p(10.0, 101.0).into(), p(20.0, 107.0).into()])
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[p(10.0, 101.0).into(), p(20.0, 107.0).into()])
+            .is_ok()
+    );
     assert!(chart.update_series_bar(0, 21.0 * HOUR, [100.0, 100.5, 99.5, 100.0]));
     assert_eq!(outcome(&mut chart), Some(false));
     assert!(forecast_label(&mut chart).unwrap().ends_with("expired"));
@@ -1622,10 +1642,11 @@ fn forecasts_and_bars_patterns_read_an_as_of_sources_own_bars() {
         )
         .unwrap();
     let frame = chart.build_frame();
-    assert!(frame.panes[1]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Text { text, .. } if text.ends_with("target reached"))));
+    assert!(
+        frame.panes[1].main.iter().any(
+            |prim| matches!(prim, Prim::Text { text, .. } if text.ends_with("target reached"))
+        )
+    );
     chart.remove_drawing(id);
 
     // A pattern over logical 0..=4 copies the overlay's own bars at their axis offsets (upstream's
@@ -1894,9 +1915,10 @@ fn fork_form_projection_fills_the_sector_and_upstream_keeps_its_triangle() {
     let (arc, hub, fill) = &fills[0];
     assert_eq!(*fill, with_alpha(ink(), 51));
     assert!(hub.iter().all(|&point| close(point, pivot, 0.01)));
-    assert!(arc
-        .iter()
-        .all(|&(x, y)| ((x - pivot.0).hypot(y - pivot.1) - radius).abs() < 0.5));
+    assert!(
+        arc.iter()
+            .all(|&(x, y)| ((x - pivot.0).hypot(y - pivot.1) - radius).abs() < 0.5)
+    );
     // From the horizontal ray on the target's side to the target.
     assert!(close(arc[0], (pivot.0 + radius, pivot.1), 0.5));
     assert!(close(*arc.last().unwrap(), target, 0.5));
@@ -1904,9 +1926,11 @@ fn fork_form_projection_fills_the_sector_and_upstream_keeps_its_triangle() {
     assert_eq!(outline.len(), 1);
     let outline = &outline[0].0;
     assert!(close(outline[0], pivot, 0.01) && close(*outline.last().unwrap(), pivot, 0.01));
-    assert!(outline[1..outline.len() - 1]
-        .iter()
-        .all(|&(x, y)| ((x - pivot.0).hypot(y - pivot.1) - radius).abs() < 0.5));
+    assert!(
+        outline[1..outline.len() - 1]
+            .iter()
+            .all(|&(x, y)| ((x - pivot.0).hypot(y - pivot.1) - radius).abs() < 0.5)
+    );
     // The arc hits; the interior only while selected; past the arc never.
     let bisector = (target.1 - pivot.1).atan2(target.0 - pivot.0) / 2.0;
     let along = |distance: f64| {
@@ -1996,9 +2020,11 @@ fn a_fork_form_projection_paints_its_stats_box_beside_the_target() {
     );
     // A stats box on the stroke color at the stats alpha, and a body target.
     let stroke = Color::parse_css(crate::DRAWING_DEFAULT_COLOR).unwrap();
-    assert!(rects(&mut chart)
-        .iter()
-        .any(|rect| rect.4 == with_alpha(stroke, crate::drawings::parts::STATS_ALPHA)));
+    assert!(
+        rects(&mut chart)
+            .iter()
+            .any(|rect| rect.4 == with_alpha(stroke, crate::drawings::parts::STATS_ALPHA))
+    );
     assert_eq!(hit(&chart, x + 2.0, *y), Some(id));
     // Upstream form keeps the generic label pass.
     chart.remove_drawing(id);
@@ -2111,9 +2137,11 @@ fn fork_form_notes_stand_a_pin_and_reveal_their_box_on_focus() {
     chart.set_hovered_drawing(Some(upstream));
     chart.build_frame();
     assert_eq!(chart.frame_build_stats().drawing_rebuilds, 0);
-    assert!(rects(&mut chart)
-        .iter()
-        .any(|rect| rect.4 == Color::parse_css("#facc1533").unwrap()));
+    assert!(
+        rects(&mut chart)
+            .iter()
+            .any(|rect| rect.4 == Color::parse_css("#facc1533").unwrap())
+    );
 }
 
 #[test]
@@ -2131,10 +2159,12 @@ fn fork_form_comments_and_price_labels_are_speech_bubbles_at_their_anchor() {
     assert_eq!(fills.len(), 1);
     let (upper, lower, color) = &fills[0];
     assert_eq!(*color, ink());
-    assert!(upper
-        .iter()
-        .chain(lower)
-        .any(|&point| close(point, tip, 1e-3)));
+    assert!(
+        upper
+            .iter()
+            .chain(lower)
+            .any(|&point| close(point, tip, 1e-3))
+    );
     let runs = text_runs(&mut chart);
     let (_, x, y, color) = run_of(&runs, "Hi");
     assert!(*x >= tip.0 + 8.0 - 1e-3 && *y < tip.1 - 10.0, "{runs:?}");
@@ -2166,7 +2196,7 @@ fn fork_form_comments_and_price_labels_are_speech_bubbles_at_their_anchor() {
                 .any(|&point| close(point, tip, 1e-3)),
         "the tail's tip is the anchor: {fills:?}"
     );
-    let price = chart.drawing_price_text(chart.drawing(label).unwrap(), 103.0);
+    let price = chart.format_drawing_price(chart.drawing(label).unwrap(), 103.0);
     let runs = text_runs(&mut chart);
     let (_, x, y, _) = run_of(&runs, &price);
     assert!(
@@ -2211,7 +2241,7 @@ fn a_fork_form_price_note_boxes_its_price_and_text_in_its_text_slot() {
         &fork(&format!(r##""text":"memo","color":"{INK}""##)),
     );
     let line_y = anchor(&chart, id, 0).1;
-    let price = chart.drawing_price_text(chart.drawing(id).unwrap(), 103.0);
+    let price = chart.format_drawing_price(chart.drawing(id).unwrap(), 103.0);
     let runs = text_runs(&mut chart);
     let (_, px, py, color) = run_of(&runs, &price);
     let (_, mx, my, _) = run_of(&runs, "memo");
@@ -2266,9 +2296,11 @@ fn coincident_signposts_stand_a_pole_whose_top_handle_drags_from_where_it_is_pai
     let points = &chart.drawing(id).unwrap().points;
     assert_eq!(points[0], points[1]);
     // Distinct anchors keep upstream's handles and stem.
-    assert!(chart
-        .set_drawing_anchors(id, &[p(15.0, 103.0).into(), p(15.0, 104.0).into()])
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[p(15.0, 103.0).into(), p(15.0, 104.0).into()])
+            .is_ok()
+    );
     let top = anchor(&chart, id, 1);
     let grabbed = chart.hit_test_drawing(top.0, top.1).unwrap();
     assert_eq!(grabbed.part, DrawingDragPart::Anchor(1));
@@ -2419,12 +2451,14 @@ fn fork_form_signposts_and_arrow_marks_box_their_text_and_keep_one_editor_owner(
         } else {
             vec![p(25.0, 103.0)]
         };
-        assert!(chart
-            .set_drawing_anchors(
-                empty,
-                &points.into_iter().map(Into::into).collect::<Vec<_>>()
-            )
-            .is_ok());
+        assert!(
+            chart
+                .set_drawing_anchors(
+                    empty,
+                    &points.into_iter().map(Into::into).collect::<Vec<_>>()
+                )
+                .is_ok()
+        );
         assert!(
             chart.drawing_text_edit_layout(empty).unwrap().multiline,
             "{kind:?}"
@@ -2547,8 +2581,8 @@ fn fork_form_forecasts_box_the_source_and_target_on_market_colors() {
     );
     let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
     let drawing = chart.drawing(id).unwrap().clone();
-    let source = chart.drawing_price_text(&drawing, 101.0);
-    let change = format!("+{} (+4.95%)", chart.drawing_price_text(&drawing, 5.0));
+    let source = chart.format_drawing_price(&drawing, 101.0);
+    let change = format!("+{} (+4.95%)", chart.format_drawing_price(&drawing, 5.0));
     let runs = text_runs(&mut chart);
     // The source price left of the source, the change, time, and outcome right of the target.
     let (_, sx, sy, _) = run_of(&runs, &source);
@@ -2561,9 +2595,11 @@ fn fork_form_forecasts_box_the_source_and_target_on_market_colors() {
     run_of(&runs, &time);
     assert!(forecast_label(&mut chart).is_none(), "no upstream label");
     let up = Color::parse_css(aeris_charts_core::style::MARKET_UP_CSS).unwrap();
-    assert!(rects(&mut chart)
-        .iter()
-        .any(|rect| rect.4 == with_alpha(up, crate::drawings::parts::STATS_ALPHA)));
+    assert!(
+        rects(&mut chart)
+            .iter()
+            .any(|rect| rect.4 == with_alpha(up, crate::drawings::parts::STATS_ALPHA))
+    );
     let frame = chart.build_frame();
     assert!(frame.panes[0].main.iter().any(|prim| matches!(
         prim,
@@ -2573,26 +2609,36 @@ fn fork_form_forecasts_box_the_source_and_target_on_market_colors() {
     assert_eq!(hit(&chart, b.0 + 20.0, b.1), Some(id));
     assert_eq!(hit(&chart, sx + 2.0, *sy), Some(id));
     // Failure on the market's down color; nothing while pending.
-    assert!(chart
-        .set_drawing_anchors(id, &[p(10.0, 101.0).into(), p(20.0, 107.0).into()])
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[p(10.0, 101.0).into(), p(20.0, 107.0).into()])
+            .is_ok()
+    );
     let down = Color::parse_css(aeris_charts_core::style::MARKET_DOWN_CSS).unwrap();
     assert!(texts_of(&mut chart).contains(&"Failure".to_string()));
-    assert!(rects(&mut chart)
-        .iter()
-        .any(|rect| rect.4 == with_alpha(down, crate::drawings::parts::STATS_ALPHA)));
-    assert!(chart
-        .set_drawing_anchors(id, &[p(10.0, 101.0).into(), p(45.0, 107.0).into()])
-        .is_ok());
+    assert!(
+        rects(&mut chart)
+            .iter()
+            .any(|rect| rect.4 == with_alpha(down, crate::drawings::parts::STATS_ALPHA))
+    );
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[p(10.0, 101.0).into(), p(45.0, 107.0).into()])
+            .is_ok()
+    );
     let texts = texts_of(&mut chart);
-    assert!(!texts
-        .iter()
-        .any(|text| text == "Success" || text == "Failure"));
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text == "Success" || text == "Failure")
+    );
     // A target on the latest bar stays pending until the next streamed bar decides it, and the
     // retained frame repaints the box.
-    assert!(chart
-        .set_drawing_anchors(id, &[p(30.0, 101.0).into(), p(39.0, 107.0).into()])
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(id, &[p(30.0, 101.0).into(), p(39.0, 107.0).into()])
+            .is_ok()
+    );
     assert!(!texts_of(&mut chart).contains(&"Failure".to_string()));
     assert!(chart.update_series_bar(0, 40.0 * HOUR, [100.0, 100.5, 99.5, 100.0]));
     assert!(texts_of(&mut chart).contains(&"Failure".to_string()));
@@ -2793,16 +2839,18 @@ fn wide_bars_pattern_sources_aggregate_into_bucket_index_offsets() {
     assert_eq!(copy.len(), 512);
     assert_eq!((copy[0].close, copy[511].offset), (close[10], 511));
     // A source edit widening past the bound commits: 1491 slots in buckets of 3.
-    assert!(chart
-        .set_drawing_anchors(
-            narrow,
-            &[
-                p(10.0, 100.0).into(),
-                p(1500.0, 101.0).into(),
-                p(100.0, 105.0).into()
-            ]
-        )
-        .is_ok());
+    assert!(
+        chart
+            .set_drawing_anchors(
+                narrow,
+                &[
+                    p(10.0, 100.0).into(),
+                    p(1500.0, 101.0).into(),
+                    p(100.0, 105.0).into()
+                ]
+            )
+            .is_ok()
+    );
     let widened = &chart.drawing(narrow).unwrap().bars_pattern;
     assert_eq!(widened.len(), 497);
     assert_eq!(widened[1].open, open[13]);
@@ -2907,9 +2955,10 @@ fn wide_as_of_bars_patterns_merge_their_own_rows_into_bucket_index_offsets() {
         .map(|bar| (bar.offset, bar.open, bar.high, bar.low, bar.close))
         .collect::<Vec<_>>();
     assert_eq!(copy.len(), (last - first + 1).div_ceil(stride));
-    assert!(copy
-        .iter()
-        .all(|bar| usize::from(bar.0) < crate::drawings::MAX_BARS_PATTERN_BARS));
+    assert!(
+        copy.iter()
+            .all(|bar| usize::from(bar.0) < crate::drawings::MAX_BARS_PATTERN_BARS)
+    );
     assert_eq!(copy, expected);
 }
 

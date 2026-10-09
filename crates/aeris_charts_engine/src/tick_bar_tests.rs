@@ -173,7 +173,9 @@ fn a_share_hour_candles_from_ticks_open_at_each_session_window() {
     // bar and shifts the whole afternoon to 12:30/13:30/14:30.
     assert_eq!(
         local_times(&zone, &rows(&tick.chart, tick.candles)),
-        ["08:30", "09:30", "10:30", "11:30", "12:30", "13:30", "14:30"]
+        [
+            "08:30", "09:30", "10:30", "11:30", "12:30", "13:30", "14:30"
+        ]
     );
 
     tick.chart
@@ -308,7 +310,9 @@ fn a_share_minute_candles_skip_the_lunch_break_and_fold_closing_prints() {
     let candles = rows(&tick.chart, tick.candles);
     assert_eq!(
         local_times(&zone, &candles),
-        ["09:30", "10:29", "10:30", "11:29", "13:00", "14:00", "14:59"]
+        [
+            "09:30", "10:29", "10:30", "11:29", "13:00", "14:00", "14:59"
+        ]
     );
     // 11:29 and 13:00 are neighbours on the ordinal time axis: the lunch break takes no width.
     assert_eq!(
@@ -554,7 +558,12 @@ fn retention_keeps_a_folded_auction_print_with_its_bar() {
         ])
         .unwrap();
     assert_eq!(stream.bars().len(), 3);
-    stream.retain_last_bars(1);
+    // Sealing releases the two older bars' prints and keeps the bars as history; evicting them
+    // keeps the newest bar with the auction print it folded in.
+    assert_eq!(stream.seal_bars(2), 2);
+    assert_eq!(stream.bars().len(), 3);
+    assert_eq!(stream.trades().len(), 2);
+    stream.evict_sealed_bars(2);
     let bars = stream.bars();
     assert_eq!(bars.len(), 1);
     assert_eq!(
@@ -565,26 +574,165 @@ fn retention_keeps_a_folded_auction_print_with_its_bar() {
     assert_eq!(stream.trades().len(), 2);
 }
 
-/// Local `HH:MM` of every bubble marker on `series`.
-fn bubble_times(chart: &ChartEngine, zone: &UtcOffsetSchedule, series: SeriesId) -> Vec<String> {
-    let markers = &chart.series_entry(series).unwrap().markers;
-    let rows = markers
+/// The order-flow trade budget is a ceiling on the whole raw tape, not only on bar prints: prints
+/// the exclude policy keeps out of every bar (here a busy lunch break after each day's only bar)
+/// count toward it, so the raw bars and the excluded prints between them never pass it once the
+/// oldest bars are sealed.
+#[test]
+fn trade_budget_counts_session_excluded_prints() {
+    const CEILING: usize = 64;
+    let zone = shanghai();
+    let mut stream = FootprintAggregator::new(time_bars(HOUR, 0)).unwrap();
+    let mut exchange = crate::ExchangeTime::default();
+    exchange.set_offsets(zone.clone());
+    stream
+        .set_sessions(
+            Some(&a_share_sessions(OutOfSessionPolicy::Exclude)),
+            &exchange,
+        )
+        .unwrap();
+    let mut trims = 0;
+    for day in 1..=30 {
+        let mut prints = vec![
+            trade(&zone, &format!("2026-09-{day:02} 09:31:00"), 10.0, 1.0),
+            trade(&zone, &format!("2026-09-{day:02} 09:32:00"), 10.1, 1.0),
+        ];
+        prints.extend((0..6).map(|minute| {
+            trade(
+                &zone,
+                &format!("2026-09-{day:02} 12:0{minute}:00"),
+                10.2,
+                1.0,
+            )
+        }));
+        stream.update_trades(prints).unwrap();
+        let seal = stream.bars_to_seal(CEILING);
+        if seal > 0 {
+            stream.seal_bars(seal);
+            trims += 1;
+            assert!(
+                stream.trades().len() <= CEILING,
+                "day {day}: {} prints",
+                stream.trades().len()
+            );
+        }
+        assert!(stream.trades().len() <= CEILING + 8, "day {day}");
+    }
+    assert!(
+        trims > 0 && stream.bars().len() > stream.sealed_bar_count(),
+        "{trims}"
+    );
+}
+
+/// Sealing releases exactly the prints its bars own and the excluded prints before the first
+/// print a later bar keeps (lunch and after-hours prints the exclude policy leaves out of every
+/// bar). The sealed bars and the raw bars rebuilt from the released prints' seed are the bars of
+/// the unsealed stream, also after later tips; excluded prints never reach a session delta.
+#[test]
+fn sealing_with_the_exclude_policy_releases_the_excluded_prints_it_precedes() {
+    let zone = shanghai();
+    let mut exchange = crate::ExchangeTime::default();
+    exchange.set_offsets(zone.clone());
+    let mut unsealed = FootprintAggregator::new(time_bars(HOUR, 0)).unwrap();
+    unsealed
+        .set_sessions(
+            Some(&a_share_sessions(OutOfSessionPolicy::Exclude)),
+            &exchange,
+        )
+        .unwrap();
+    let sell = |text: &str, price: f64, volume: f64| FootprintTrade {
+        aggressor: AggressorSide::Sell,
+        ..trade(&zone, text, price, volume)
+    };
+    unsealed
+        .set_trades(vec![
+            trade(&zone, "2026-09-24 09:31:00", 10.00, 1.0),
+            sell("2026-09-24 12:05:00", 10.10, 50.0),
+            trade(&zone, "2026-09-24 13:01:00", 10.20, 2.0),
+            sell("2026-09-24 15:30:00", 10.30, 70.0),
+            trade(&zone, "2026-09-25 09:31:00", 10.40, 3.0),
+            sell("2026-09-25 12:10:00", 10.50, 90.0),
+            trade(&zone, "2026-09-25 13:05:00", 10.60, 4.0),
+        ])
+        .unwrap();
+    assert_eq!(unsealed.bars().len(), 4);
+    let mut sealed = unsealed.clone();
+    // The two 2026-09-24 bars own two prints; the lunch and after-hours prints before the next
+    // bar's first print leave with them.
+    assert_eq!(sealed.raw_trades_of_bars(2), 4);
+    assert_eq!(sealed.seal_bars(2), 4);
+    assert_eq!(sealed.sealed_bar_count(), 2);
+    assert_eq!(sealed.bars(), unsealed.bars());
+    let raw = sealed
+        .trades()
+        .map(|print| (print.timestamp_micros, print.volume))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        raw,
+        [
+            (at(&zone, "2026-09-25 09:31:00") * MICROS, 3.0),
+            (at(&zone, "2026-09-25 12:10:00") * MICROS, 90.0),
+            (at(&zone, "2026-09-25 13:05:00") * MICROS, 4.0),
+        ]
+    );
+    // A late print rebuilds the raw bars from the seed of the released prints: they stay the
+    // unsealed stream's bars.
+    let late = vec![trade(&zone, "2026-09-25 13:04:00", 10.55, 1.0)];
+    assert_eq!(
+        sealed.update_trades(late.clone()).unwrap(),
+        FootprintUpdateKind::Historical
+    );
+    unsealed.update_trades(late).unwrap();
+    assert_eq!(sealed.bars(), unsealed.bars());
+    let next = vec![
+        sell("2026-09-25 15:20:00", 10.70, 30.0),
+        trade(&zone, "2026-09-26 09:40:00", 10.80, 5.0),
+    ];
+    sealed.update_trades(next.clone()).unwrap();
+    unsealed.update_trades(next).unwrap();
+    assert_eq!(sealed.bars(), unsealed.bars());
+    assert_eq!(
+        sealed
+            .bars()
+            .iter()
+            .map(|bar| bar.session_delta)
+            .collect::<Vec<_>>(),
+        [1.0, 3.0, 6.0, 11.0, 16.0]
+    );
+}
+
+/// Local `HH:MM` of the bar every big-trades order of `id` opened in.
+fn order_bar_times(
+    chart: &ChartEngine,
+    zone: &UtcOffsetSchedule,
+    id: crate::NativePrimitiveId,
+) -> Vec<String> {
+    let rows = chart
+        .big_trades_snapshot(id)
+        .unwrap()
+        .bubbles
         .iter()
-        .map(|marker| (marker.time, [0.0; 4]))
+        .map(|order| (order.bar_time, [0.0; 4]))
         .collect::<Vec<_>>();
     local_times(zone, &rows)
 }
 
+/// Every print its own order: one exact timestamp per print, and every print qualifies.
+fn every_print_options() -> crate::BigTradesOptions {
+    crate::BigTradesOptions {
+        filter: crate::BigTradesFilter::Fixed {
+            minimum_volume: 0.5,
+        },
+        grouping_window_micros: 0,
+        ..crate::BigTradesOptions::default()
+    }
+}
+
 #[test]
-fn trade_bubbles_sit_on_the_bar_holding_their_print() {
+fn big_trades_sit_on_the_bar_holding_their_print() {
     let zone = shanghai();
-    let bubbles = crate::TradeBubbleOptions {
-        minimum_volume: 0.0,
-        max_markers: 64,
-        aggregation_window_micros: 0,
-    };
-    // Plain grid: a print inside a bar used to carry its own second, which markers snap to the
-    // NEXT bar.
+    // Plain grid: an order inside a bar carries that bar's open, not its print's own second,
+    // which the time axis would snap to the NEXT bar.
     let mut plain = tick_chart(
         zone.clone(),
         time_bars(HOUR, at(&zone, "2026-09-25 09:30:00")),
@@ -593,23 +741,23 @@ fn trade_bubbles_sit_on_the_bar_holding_their_print() {
         .chart
         .set_trade_stream_trades(plain.stream, a_share_day("2026-09-25")[1..5].to_vec())
         .unwrap();
-    plain
+    let orders = plain
         .chart
-        .add_trade_bubbles(plain.stream, plain.candles, bubbles)
+        .add_big_trades(plain.stream, plain.candles, every_print_options())
         .unwrap();
     assert_eq!(
-        bubble_times(&plain.chart, &zone, plain.candles),
+        order_bar_times(&plain.chart, &zone, orders),
         ["09:30", "09:30", "10:30", "10:30"]
     );
     let candle_times = rows(&plain.chart, plain.candles)
         .iter()
         .map(|&(time, _)| time)
         .collect::<Vec<_>>();
-    for marker in &plain.chart.series_entry(plain.candles).unwrap().markers {
-        assert!(candle_times.contains(&marker.time), "{}", marker.time);
+    for order in plain.chart.big_trades_snapshot(orders).unwrap().bubbles {
+        assert!(candle_times.contains(&order.bar_time), "{}", order.bar_time);
     }
-    // Session anchoring: the auction print sits on the 09:30 bar and the 11:30 print on the
-    // 10:30 bar; excluded pre-open and lunch prints have no bar and no bubble.
+    // Session anchoring: the auction print opens an order on the 09:30 bar and the 11:30 print
+    // on the 10:30 bar; excluded pre-open and lunch prints have no bar and open no order.
     let mut tape = a_share_day("2026-09-25");
     tape.insert(6, trade(&zone, "2026-09-25 12:10:00", 10.00, 5.0));
     for (outside, expected) in [
@@ -634,11 +782,71 @@ fn trade_bubbles_sit_on_the_bar_holding_their_print() {
         tick.chart
             .set_trade_stream_trades(tick.stream, tape.clone())
             .unwrap();
-        tick.chart
-            .add_trade_bubbles(tick.stream, tick.candles, bubbles)
+        let orders = tick
+            .chart
+            .add_big_trades(tick.stream, tick.candles, every_print_options())
             .unwrap();
         assert_eq!(
-            bubble_times(&tick.chart, &zone, tick.candles),
+            order_bar_times(&tick.chart, &zone, orders),
+            expected,
+            "{outside:?}"
+        );
+    }
+}
+
+/// A print the session policy leaves out of every bar neither starts nor extends an order, even
+/// inside the grouping window of an open one; a folded print continues it like any other.
+#[test]
+fn session_excluded_prints_never_start_or_extend_an_order() {
+    let zone = shanghai();
+    let at_micros = |text: &str, micros: i64| at(&zone, text) * MICROS + micros;
+    let print = |timestamp_micros: i64, price: f64, volume: f64| FootprintTrade {
+        timestamp_micros,
+        ..trade(&zone, "2026-09-25 09:30:00", price, volume)
+    };
+    let tape = vec![
+        // The window's closing second is in session; the lunch prints follow 0.5 ms apart,
+        // inside the 1 ms grouping window and with the aggressor.
+        print(at_micros("2026-09-25 11:30:00", 999_600), 10.00, 5.0),
+        print(at_micros("2026-09-25 11:30:01", 100), 10.01, 400.0),
+        print(at_micros("2026-09-25 11:30:01", 600), 10.02, 400.0),
+        print(at_micros("2026-09-25 13:00:01", 0), 10.03, 7.0),
+    ];
+    for (outside, expected) in [
+        (OutOfSessionPolicy::Exclude, vec![(5.0, 1), (7.0, 1)]),
+        (OutOfSessionPolicy::Fold, vec![(805.0, 3), (7.0, 1)]),
+    ] {
+        let mut tick = tick_chart(zone.clone(), time_bars(HOUR, 0));
+        tick.chart
+            .set_trade_stream_sessions(tick.stream, Some(a_share_sessions(outside)))
+            .unwrap();
+        let orders = tick
+            .chart
+            .add_big_trades(
+                tick.stream,
+                tick.candles,
+                crate::BigTradesOptions {
+                    grouping_window_micros: 1_000,
+                    ..every_print_options()
+                },
+            )
+            .unwrap();
+        // Live tips and a clean load fold the same orders.
+        for print in &tape {
+            tick.chart
+                .update_trade_stream_trades(tick.stream, vec![print.clone()])
+                .unwrap();
+        }
+        let live = tick.chart.big_trades_snapshot(orders).unwrap();
+        tick.chart
+            .set_trade_stream_trades(tick.stream, tape.clone())
+            .unwrap();
+        assert_eq!(tick.chart.big_trades_snapshot(orders).unwrap(), live);
+        assert_eq!(
+            live.bubbles
+                .iter()
+                .map(|order| (order.volume, order.prints))
+                .collect::<Vec<_>>(),
             expected,
             "{outside:?}"
         );
@@ -765,7 +973,9 @@ fn footprint_option_changes_keep_sessions_the_replay_clock_and_hidden_prints() {
     // prints into 11:00 and 14:30.
     assert_eq!(
         local_times(&zone, &footprint_rows[..7]),
-        ["09:30", "10:00", "10:30", "11:00", "13:00", "14:00", "14:30"]
+        [
+            "09:30", "10:00", "10:30", "11:00", "13:00", "14:00", "14:30"
+        ]
     );
     for chart in [&mut chart, &mut reference] {
         chart.set_replay_clock_micros(None).unwrap();
@@ -822,12 +1032,13 @@ fn a_session_change_that_folds_a_hidden_print_into_another_session_is_refused() 
         ),
         Err(FootprintError::ProjectionTimeCollision)
     );
-    assert!(tick
-        .chart
-        .trade_stream(tick.stream)
-        .unwrap()
-        .session_grid()
-        .is_none());
+    assert!(
+        tick.chart
+            .trade_stream(tick.stream)
+            .unwrap()
+            .session_grid()
+            .is_none()
+    );
     assert_eq!(rows(&tick.chart, tick.candles), before);
     // Excluding the lunch print leaves nothing to collide.
     tick.chart

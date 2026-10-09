@@ -5,7 +5,7 @@ use crate::native_primitives::{
     NativeSeriesPrimitiveKind, OverlayPriceScaleSide,
 };
 use aeris_charts_core::format::time_formatter::{
-    format_date_pattern, format_tick_label_in, TickMarkType,
+    TickMarkType, format_date_pattern, format_tick_label_in,
 };
 use aeris_charts_core::scale::exchange_time::ExchangeTime;
 use aeris_charts_render::draw_list::TextAlign;
@@ -737,10 +737,9 @@ impl ChartEngine {
                         for &time in times {
                             if let Some(color) =
                                 session_color(time, state.options, &self.exchange_time)
+                                && let Some(logical) = at(time)
                             {
-                                if let Some(logical) = at(time) {
-                                    append(logical, color);
-                                }
+                                append(logical, color);
                             }
                         }
                     }
@@ -1216,45 +1215,44 @@ impl ChartEngine {
                             }
                         }
                     }
-                    if state.extend_naked_levels {
-                        if let Ok(levels) =
+                    if state.extend_naked_levels
+                        && let Ok(levels) =
                             self.naked_profile_levels(state.request.source, &profiles)
-                        {
-                            for level in levels {
-                                let Some(start_logical) = self.time_to_index(
-                                    level.start_timestamp_micros.div_euclid(1_000_000) as f64,
-                                    true,
-                                ) else {
-                                    continue;
-                                };
-                                let end_logical = level.touched_timestamp_micros.and_then(|time| {
-                                    self.time_to_index(time.div_euclid(1_000_000) as f64, true)
-                                });
-                                if end_logical.is_some_and(|end| end < from) || start_logical > to {
-                                    continue;
-                                }
-                                let x0 = self.time_scale.index_to_coordinate(start_logical)
-                                    + self.time_scale.bar_spacing() * 0.5;
-                                let x1 = end_logical.map_or(self.pane_w, |end| {
-                                    self.time_scale.index_to_coordinate(end)
-                                });
-                                if x1 <= x0 {
-                                    continue;
-                                }
-                                out.push(Prim::HLine {
-                                    y: (scale.price_to_coordinate(level.price, base_value) * vpr)
-                                        .round() as i32,
-                                    x0: (x0 * hpr).round() as i32,
-                                    x1: (x1 * hpr).round() as i32,
-                                    width: vpr.round().max(1.0) as i32,
-                                    style: LineStyle::Solid,
-                                    color: if level.kind == crate::NakedProfileLevelKind::Poc {
-                                        state.colors[3]
-                                    } else {
-                                        state.colors[4]
-                                    },
-                                });
+                    {
+                        for level in levels {
+                            let Some(start_logical) = self.time_to_index(
+                                level.start_timestamp_micros.div_euclid(1_000_000) as f64,
+                                true,
+                            ) else {
+                                continue;
+                            };
+                            let end_logical = level.touched_timestamp_micros.and_then(|time| {
+                                self.time_to_index(time.div_euclid(1_000_000) as f64, true)
+                            });
+                            if end_logical.is_some_and(|end| end < from) || start_logical > to {
+                                continue;
                             }
+                            let x0 = self.time_scale.index_to_coordinate(start_logical)
+                                + self.time_scale.bar_spacing() * 0.5;
+                            let x1 = end_logical.map_or(self.pane_w, |end| {
+                                self.time_scale.index_to_coordinate(end)
+                            });
+                            if x1 <= x0 {
+                                continue;
+                            }
+                            out.push(Prim::HLine {
+                                y: (scale.price_to_coordinate(level.price, base_value) * vpr)
+                                    .round() as i32,
+                                x0: (x0 * hpr).round() as i32,
+                                x1: (x1 * hpr).round() as i32,
+                                width: vpr.round().max(1.0) as i32,
+                                style: LineStyle::Solid,
+                                color: if level.kind == crate::NakedProfileLevelKind::Poc {
+                                    state.colors[3]
+                                } else {
+                                    state.colors[4]
+                                },
+                            });
                         }
                     }
                 }

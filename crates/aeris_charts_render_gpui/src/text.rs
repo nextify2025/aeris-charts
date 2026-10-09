@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{text_font_spec, TextAlign};
+use aeris_charts_render::draw_list::{TextAlign, text_font_spec};
 
 use crate::scene::TextRun;
 
@@ -405,11 +405,11 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert!(cache.heap_bytes() > 0);
 
-        let gen = cache.generation();
+        let before = cache.generation();
         cache.invalidate();
         assert!(cache.is_empty());
         assert_eq!(cache.heap_bytes(), 0);
-        assert_eq!(cache.generation(), gen + 1);
+        assert_eq!(cache.generation(), before + 1);
 
         let mut remeasured = false;
         cache.measure_with(key, || {

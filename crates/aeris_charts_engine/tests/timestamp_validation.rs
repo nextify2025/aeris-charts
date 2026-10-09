@@ -1,5 +1,5 @@
 use aeris_charts_core::model::data_validation::{
-    TimestampErrorCategory, ValidationError, MAX_TIMESTAMP, MIN_TIMESTAMP,
+    MAX_TIMESTAMP, MIN_TIMESTAMP, TimestampErrorCategory, ValidationError,
 };
 use aeris_charts_engine::ChartEngine;
 

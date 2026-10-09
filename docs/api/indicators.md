@@ -2,9 +2,22 @@
 
 [文档导航](../README.md) · [架构总览](../Architecture.md) · [API 入口](README.md)
 
+- [空白数据与输出起点](#空白数据与输出起点)
 - [成交量分布](#成交量分布)
 - [指标约定](#指标约定)
+- [广度层指标](#广度层指标)
+  - [广度层补全](#广度层补全)
 - [KLineChart 指标](#klinechart-指标)
+
+## 空白数据与输出起点
+
+以下规则对所有内置、自定义与 KLineChart 研究成立（所有者决定 Q-G 与 Q-H；领域契约见[空白与预热](../features/studies.md#空白与预热)）：
+
+- 没有值的源条目（空白数据，例如交易时段网格上没有成交的一分钟）不是样本。在该时间，指标的 `data()` 条目没有 `value`。递归研究（EMA、RSI、MACD、ATR、OBV、VWAP 等）从上一个有效样本继续；窗口研究（SMA、布林带、CCI、Donchian、Momentum、ROC、Stochastic 等）跨越最近 N 个有效条目，因此缺口之后的第一个条目即有值，等于删去缺口后计算出的值。
+- 每个输出的 `data()` 从其第一个有值的时间开始，不包含开头的空白条目；源以空白数据开头时，返回的列表更短。修正若使第一个值提前或改变，整条输出被替换，依赖它的研究随之重建。市场结构、公允价值缺口与订单块的锚定输出例外，覆盖每个源时间。请按 `time` 对齐指标与价格，不要按下标对齐。
+- `indicator_info().warmup_bars` 按无缺口的源度量；源以空白数据开头时第一个值会更晚出现。
+- Klinger 把价格有效但成交量为空的柱按零成交量计入：它不贡献力量，也不重启三条 EMA，与 OBV 及其他成交量研究对缺失成交量的处理一致。
+- Rust 的纯计算函数（`aeris_charts_indicators::sma` 等）在含 NaN 或 ±∞ 的输入上遵循同一规则，返回与图表相同的值。只接收成交量列的函数（`relative_volume`、`volume_oscillator`）无法区分空白柱与没有成交量的柱，把非有限的成交量视为空白行，与图表在空白槽位上的值相同。
 
 ## 成交量分布
 
@@ -97,11 +110,13 @@ const [k, d, j] = chart.add_kdj(candles, 9, 3, 3);
 
 未验证：通达信/同花顺/富途终端的确切输出（因此不声称 China 预设与富途一致），终端如何处理平坦窗口（东方财富和新浪的网页图表使用 RSV 0，而不是重复上一个 RSV；通达信的公式帮助未记载除以零的处理），以及富途的网页图表（其页面处于机器人验证之后）。同花顺的旧版网页图表使用其他的 KDJ 起始方式（以 100 起始并裁剪，或对前 N 根柱使用滚动均值），不被视为终端定义。
 
-`indicator_schema(kind)` 为修订 2：约定参数以带有 `choices` 列表的 `"choice"` 参数形式出现，VWAP 会列出一个可选的 `amount_source` 系列。
+`indicator_schema(kind)` 为修订 4：约定参数以带有 `options` 列表（按编辑器显示顺序）的 `"choice"` 参数形式出现，非选择参数不带 `options`；开关参数（包络线的 `exponential`）以 `"boolean"` 参数形式出现，VWAP 会列出一个可选的 `amount_source` 系列。修订 4 把此前的 `choices` 字段改名为上游的 `options`（见[兼容性](compatibility.md#已记录的不兼容变更)）；本仓库的修订号与上游不同（上游为 2），宿主不应跨仓库比较修订号。属性面板按 `parameter_type` 分派编辑器时，需要处理 `"integer"`、`"number"`、`"boolean"`、`"source"`、`"series"` 与 `"choice"` 六种取值。
+
+`indicator_schema(kind, period = 14, deviation = 2)` 的名称解析由引擎拥有（`IndicatorKind::schema_definition`）。不传 `period` 与 `deviation` 时，返回每个研究自己的规范默认值：MACD 12/26/9、Stochastic `%D` 3、SuperTrend 倍数 3、EMA 彩带 5/10/20/50/200、VWAP 带 σ 1、Chaikin 3/10、KDJ 9/3/3，以及下文广度层各研究的默认值。签名无法表达“未传参”：`period` 14 与 `deviation` 2 本身即被视为隐式查询，即使显式传入也是如此，因此 `period` 14 时的 MACD、KDJ、Stochastic 与 EMA 彩带，以及 `deviation` 2 时的 SuperTrend 与 VWAP 带，同样返回上述规范默认值。只有其他显式值沿用原来的替换规则（例如 `indicator_schema("macd", 12)` 为 12/24/12，`indicator_schema("kdj", 9)` 为 9/3/3）。具有固定多参数默认值的种类忽略 `period`：KST、TSI、Mass Index、Klinger、KAMA、线性回归、Chaikin 振荡器、Coppock 曲线、终极振荡器与成交量振荡器始终返回各自的默认值（线性回归同样忽略 `deviation`）。带种子的种类报告 `seed: "sma"`，MACD 报告 `histogram_multiplier: 1`，布林带报告 `estimator: "population"`；`klinechart_*` 报告对应模板的默认参数；未知名称抛出 `invalid_options`。此前隐式查询会把 14 与 2 代入每个参数，变更记录见[兼容性](compatibility.md)。
 
 **空白数据源**。指标源中的空白数据行（`{ time }`）保留其时间槽位，但绝不进入计算状态。每个研究都在该处输出一条空白数据输出行，并完全按该行不存在的方式继续计算：暂停的交易时段或预先填充的未来槽位不会重置或污染 EMA/RSI/MACD 递推，窗口类研究使用最近 N 根真实柱。之后填充某个空白槽位时，会从该行起重新计算。
 
-**预热查询与历史数据加载**。`indicator_info()` 为每个输出报告 `warmup_bars`（第一个值之前根价格源的柱数）和 `convergence_bars`（经过这么多柱的历史数据后，数值不再取决于已加载历史数据从何处开始：窗口类研究为预热柱数，再加上使每个递归种子的权重降到 0.1% 以下所需的柱数）。两者都包含链式源，因此 RSI 之上的 SMA 报告的是二者之和。当任何柱数都不足以满足时，`convergence_bars` 为 `null`：交易时段 VWAP 和枢轴点取决于时间锚点，OBV、Parabolic SAR、SuperTrend 和 ZigZag 则取决于整条路径。
+**预热查询与历史数据加载**。`indicator_info()` 为每个输出报告 `warmup_bars`（第一个值之前根价格源的柱数）和 `convergence_bars`（经过这么多柱的历史数据后，数值不再取决于已加载历史数据从何处开始：窗口类研究为预热柱数，再加上使每个递归种子的权重降到 0.1% 以下所需的柱数）。两者都包含链式源，因此 RSI 之上的 SMA 报告的是二者之和。当任何柱数都不足以满足时，`convergence_bars` 为 `null`：交易时段 VWAP 和枢轴点取决于时间锚点，OBV、累积/派发、价量趋势、Parabolic SAR、SuperTrend、ZigZag、Klinger 和 McGinley Dynamic 则取决于整条路径；七个结构与时段研究同样为 `null`（数值取决于最近确认的枢轴，或所在的时段与周期），其 `warmup_bars` 对摆动点为 `left + right`，对其他研究为 0。
 
 若要从第一根可见柱起就显示已收敛的值，请求其之前的历史数据：
 
@@ -119,6 +134,89 @@ chart.time_scale().set_visible_logical_range({ from: needed, to: needed + visibl
 **均价（分时均价）**。`add_vwap(price, volume, options, { amount_source: turnover })` 按每个 VWAP 重置周期报告 `sum(amount) / sum(volume)`，而不是对典型价格加权。成交量与成交额按时间戳与价格行对齐；没有正成交量或有限成交额的分钟，以及空白数据价格行，均不贡献任何内容，且在该周期的第一笔成交之前线条为空白。`indicator_info().amount_source` 标识成交额系列；移除它会移除该研究。重置周期遵循 VWAP 的交易时段键。
 
 **线条在重置处重新开始**。每条 VWAP 线（典型价格或按成交额加权）、每个 VWAP 带输出以及每个枢轴水平位，都在其周期重置处结束线条：新交易时段（VWAP 带则为新的一周或一月）中第一条被绘制的行开始新的一段连续线，没有任何线段、填充或命中区域将其与上一周期相连。周期遵循图表的交易所交易日（`time_zone`、`session_start`），与数值重置的方式完全一致，无论是完整安装之后还是实时更新之后均如此。某个周期中唯一被绘制的行就是其第一行时，会绘制一条一根柱宽的水平线段，因此日线柱上的交易时段 VWAP 每根柱显示一条短线段。普通的折线、面积和基线系列会跨日连接，除非 `break_on_trading_day: true` 要求它们在每个交易所交易日处断开（在 Renko 或 Tick 柱等非时间柱轴上，取每根柱开盘时间所在的日）；空白数据行绝不会使线断开。
+
+## 广度层指标
+
+广度层共 29 个内置研究。以下 19 个方法（上游 `2f62875`）在源系列上添加内置研究，返回值与其他内置研究一样是普通的 `series_api` 输出句柄；`options` 应用于每个输出。参数无效、或成交量研究缺少独立的标量成交量系列时抛出 `invalid_options`。所有周期必须为正整数。
+
+| 方法 | 参数（默认值） | 输出与窗格 |
+| --- | --- | --- |
+| `add_aroon(source, period)` | | `Aroon Up`、`Aroon Down`，振荡器窗格 |
+| `add_awesome_oscillator(source)` | 固定 5/34 | `AO`，动量柱状图 |
+| `add_dpo(source, period)` | | `DPO` |
+| `add_chande_momentum(source, period)` | | `CMO` |
+| `add_bollinger_metrics(source, period, deviation)` | `deviation` 有限且不小于 0 | `%B` 与 `BandWidth`，各占一个振荡器窗格 |
+| `add_envelopes(source, period, percent, exponential = false)` | `percent` 有限且不小于 0；`exponential` 选择 EMA 基线 | `Upper`、`Basis`、`Lower`，价格窗格，上下轨之间带状填充 |
+| `add_alma(source, period, offset = 0.85, sigma = 6)` | `offset` 在 0–1，`sigma` 在 0.01–1,000,000 | `ALMA`，价格窗格 |
+| `add_accumulation_distribution(source, volume_source)` | | `A/D` |
+| `add_price_volume_trend(source, volume_source)` | | `PVT` |
+| `add_chaikin_oscillator(source, fast, slow, volume_source)` | `fast < slow` | `Chaikin Oscillator` |
+| `add_relative_volume(source, period, volume_source)` | | `Relative Volume`；基线为零时为空缺 |
+| `add_volume_oscillator(source, fast, slow, signal, volume_source)` | `fast < slow` | `PVO`、`Signal`、`Histogram`（动量柱状图），同一窗格 |
+| `add_elder_force(source, period, volume_source)` | | `Elder Force` |
+| `add_ease_of_movement(source, period, volume_source, divisor = 100_000_000)` | `divisor` 有限且为正 | `EOM`；窗口含零成交量柱时为空缺 |
+| `add_historical_volatility(source, period, annualization = 252)` | `period` 至少为 2；`annualization` 为每年的柱数 | `HV`（百分比） |
+| `add_trix(source, period, signal = 9)` | | `TRIX`、`Signal` |
+| `add_coppock_curve(source, long_period = 14, short_period = 11, smoothing = 10)` | | `Coppock Curve` |
+| `add_fisher_transform(source, period = 10)` | | `Fisher`、`Trigger`（上一 Fisher 值） |
+| `add_ultimate_oscillator(source, short_period = 7, medium_period = 14, long_period = 28)` | | `Ultimate Oscillator` |
+
+`indicator_kind` 相应新增 `aroon`、`awesome_oscillator`、`dpo`、`chande_momentum`、`bollinger_metrics`、`envelopes`、`alma`、`accumulation_distribution`、`price_volume_trend`、`chaikin_oscillator`、`relative_volume`、`volume_oscillator`、`elder_force`、`ease_of_movement`、`historical_volatility`、`trix`、`coppock_curve`、`fisher_transform` 与 `ultimate_oscillator`。`indicator_info().parameters` 新增 `exponential`、`offset`、`sigma`、`divisor`、`annualization`、`long_period`、`short_period` 与 `smoothing`（对不使用它们的种类为 `null`）；`deviation` 对布林带指标报告偏差，对包络线报告百分比，对成交量振荡器与 TRIX 报告信号周期。
+
+七个成交量研究（以及下文的 Klinger）把成交量序列中缺失的源时间戳视为零成交量。与其他研究一样，空白数据源行不进入计算，其输出为空白数据行。这些研究的 EMA 一律以前 N 个样本的均值起始，`{ convention: "china" }` 不适用于它们；布林带指标只使用总体标准差。
+
+AO、PVT、TRIX 与 EMV 同时存在内置研究和同名的 KLineChart 模板（`klinechart_ao`、`klinechart_pvt`、`klinechart_trix`、`klinechart_emv`），二者公式不同：内置 PVT 把缺失成交量记为 0 并截断负成交量，模板沿用 KLineChart 的缺失成交量 1；内置 TRIX 的 `period` 必填、`signal` 默认 9，信号线为 EMA，模板默认 12/9，`MATRIX` 为简单移动平均；内置 EOM 在零成交量处为空缺且只输出平滑值，模板在零成交量或零区间处记 0 并另外输出 EMV；AO 的核心公式相同，但模板可配置周期并沿用 KLineChart 的柱体呈现。引擎图例中 KLineChart 绑定的行标题带 `KLineChart` 前缀（例如 `KLineChart PVT` 与内置的 `PVT`）。各输出系列的 `title` 则沿用模板自身的输出名，以保持与 KLineChart 的显示一致，因此内置 PVT 与模板 PVT 的系列标题（名称徽标）都是 `PVT`；宿主需要区分时应读取 `indicator_info().kind`（`price_volume_trend` 与 `klinechart_pvt`）。详见[指标计算与绑定](../architecture/data/indicators.md#广度层指标)。
+
+### 广度层补全
+
+上游 `9dd8cff` 新增以下 10 个方法，约定与上表相同。所有周期为 1 到 1,000,000 的整数；参数无效时抛出 `invalid_options`，且不创建任何输出或窗格。
+
+| 方法 | 参数（默认值） | 输出与窗格 |
+| --- | --- | --- |
+| `add_kst(source, roc = [10, 15, 20, 30], smoothing = [10, 10, 10, 15], signal = 9)` | `roc` 与 `smoothing` 为四元组（`kst_periods`） | `KST`、`Signal`，振荡器窗格 |
+| `add_tsi(source, long = 25, short = 13, signal = 13)` | | `TSI`（−100 到 100）、`Signal`，振荡器窗格 |
+| `add_mass_index(source, ema_period = 9, sum_period = 25)` | | `Mass Index`，振荡器窗格 |
+| `add_vortex(source, period = 14)` | | `VI+`、`VI-`，振荡器窗格 |
+| `add_klinger(source, fast = 34, slow = 55, signal = 13, volume_source)` | `fast < slow`；成交量系列必填，位于周期之后（传 `undefined` 使用默认周期） | `Klinger`、`Signal`，振荡器窗格 |
+| `add_kama(source, period = 10, fast = 2, slow = 30)` | `fast < slow` | `KAMA`，价格窗格 |
+| `add_mcginley(source, period = 14)` | | `McGinley`，价格窗格 |
+| `add_linear_regression(source, period = 20, deviation = 2)` | `deviation` 有限且不小于 0 | `Curve`、`Upper`、`Lower`（残差标准差通道），价格窗格 |
+| `add_choppiness(source, period = 14)` | `period` 至少为 2 | `Choppiness`（0–100），振荡器窗格，带 38.2/61.8 Chop Zone 阈值区域 |
+| `add_atr_bands(source, period = 14, multiplier = 2)` | `multiplier` 有限且不小于 0 | `Upper`、`Basis`（收盘价）、`Lower`，价格窗格 |
+
+`indicator_kind` 相应新增 `kst`、`tsi`、`mass_index`、`vortex`、`klinger`、`kama`、`mcginley`、`linear_regression`、`choppiness` 与 `atr_bands`。`indicator_info().parameters` 新增 `multiplier`（ATR 带）、`roc` 与 `smoothing_periods`（KST）、`ema_period` 与 `sum_period`（Mass Index），对不使用它们的种类为 `null`；KST、TSI 与 Klinger 的信号周期报告在 `signal`，TSI 的长短周期报告在 `long_period` 与 `short_period`，Klinger 与 KAMA 的快慢周期报告在 `fast` 与 `slow`。
+
+这些研究同样把空白数据行视为不存在。TSI、KAMA、Klinger、McGinley、Mass Index 与 ATR 带从最后一个有效样本继续，与上游相同；KST、线性回归、Choppiness 与 Vortex 的窗口跨越最近 N 个有效行，上游则在缺口仍位于窗口内时让它们保持空白，本仓库不采用（参见[与上游空白规则的对照](../architecture/data/indicators.md#广度层指标)）。Klinger 与 McGinley 的 `convergence_bars` 为 `null`。TSI、Klinger、Mass Index 与 KAMA 以 SMA 起始，McGinley 以第一个收盘价起始；它们没有 `seed` 参数，`{ convention: "china" }` 不适用。Chop Zone 是 Choppiness 输出上的 38.2/61.8 阈值，引擎把它绘制为内置阈值区域：振荡器窗格中 38.2 到 61.8 之间的半透明通道加两条点状边界线，与 RSI、Stochastic 的阈值区域相同，随绑定显隐，持久化恢复后自动重建；上游只在文档中说明该阈值而不绘制（参见[已记录的不兼容变更](compatibility.md#已记录的不兼容变更)）。线性回归指标是滚动端点序列，与在两个锚点之间做一次拟合的 `regression_trend` 绘图不同；二者都使用残差的总体标准差。公式与空白数据处理详见[广度层补全](../architecture/data/indicators.md#广度层补全)。
+
+## 结构与时段研究
+
+上游 `051a447`..`dc39045` 新增七个研究。它们都在源的价格窗格与比例尺上输出，参数无效、源不是可用的 K 线源或结构研究的源为 as-of 对齐时抛出 `invalid_options`，且不创建任何输出：
+
+| 方法 | 参数（默认值） | 输出 |
+| --- | --- | --- |
+| `add_swing_points(source, left = 5, right = 5)` | `left`、`right` 为 1 到 50 的整数 | `[摆动高点, 摆动低点]` 两条阶梯水平线 |
+| `add_market_structure(source, left = 5, right = 5, break_on = "close")` | `break_on`：`"close"` 或 `"wick"` | 一个空白锚定输出；BOS/CHoCH 由引擎绘制 |
+| `add_fair_value_gaps(source, { min_size = 0, mitigation = "touch", mitigation_price = "wick", max_active = 20, show_mitigated = false })` | `mitigation`：`"touch"`、`"half"`、`"full"`；`mitigation_price`：`"wick"`、`"close"`；`max_active` 为 1 到 64 | 一个空白锚定输出；区域由引擎绘制 |
+| `add_order_blocks(source, { left = 5, right = 5, break_on = "close", zone = "wick", mitigation, mitigation_price, max_active = 20, show_mitigated = false })` | `zone`：`"wick"` 或 `"body"`；其余同上 | 一个空白锚定输出；区域由引擎绘制 |
+| `add_session_levels(source, calendar = "exchange")` | `calendar`：`"exchange"`、`"utc"` 或 `"host"` | `[时段高点, 时段低点]` |
+| `add_previous_period_levels(source, period = "day", calendar = "exchange")` | `period`：`"day"`、`"week"`、`"month"` | `[上一周期高点, 低点, 收盘价]` |
+| `add_opening_range(source, duration_seconds, calendar = "exchange")` | `duration_seconds` 为正的 32 位整数 | `[开盘区间高点, 低点, 中点]` |
+
+每个方法最后都可以再传一个 `options`（`Partial<series_options>`），应用于每个输出。`indicator_kind` 相应新增这七个 id，`indicator_schema(kind)` 以 `"choice"` 参数报告 `break_on`、`zone`、`mitigation`、`mitigation_price`、`period` 与 `calendar`，摆动窗口的上限为 50，`max_active` 的上限为 64；这些种类不列出 `source` 参数。结构研究只接受 `close` 输入，也不能切换输入。
+
+**注释快照**。`chart.study_annotations(binding)` 返回结构研究按确认行排序的 `{ markers, zones }`：标记带有 `row`、`confirm_row`、`price`、`kind`（`"swing_high"`、`"swing_low"`、`{ bos: { up } }` 或 `{ choch: { up } }`）与 `from_row`（BOS/CHoCH 线段的起点行），区域带有 `start_row`、`confirm_row`、`top`、`bottom`、`bullish`、`end_row`（缓解或退役的行）与 `retired`。`binding` 须为该研究的第一个输出；非结构研究抛出 `unsupported_operation`，失效的句柄抛出 `invalid_handle`。注释只用于显示，没有命中目标，也不持久化。
+
+**日历策略**。`calendar` 默认为 `"exchange"`：按图表的交易所时区与交易时段起点（`time_scale().apply_options({ time_zone, session_start })`）计算交易日，与 VWAP 和枢轴点相同，跨越午夜的夜盘属于下一个交易日及其所在的周与月；修改时区或交易时段起点时引擎自动重建这些研究。交易所时间为 UTC 且交易时段起点为 0 时，它与 `"utc"` 的结果相同。`"utc"` 按 UTC 自然日、周与月计算；`"host"` 使用下述宿主时段。`indicator_schema(kind)` 报告 `calendar` 的默认值 `"exchange"` 与选项 `["exchange", "utc", "host"]`。完整语义见[时段日历](../features/studies.md#时段日历)。
+
+**时段日历**。`chart.set_study_calendar(boundaries)` 以 `resample_boundary` 行（`startTime`、`endTime`、`sessionId`，UTC 秒）原子地替换运行时日历：最多 20,000 行，有序且不相交，违反时抛出 `invalid_options` 并保留原日历；空列表与 `chart.clear_study_calendar()` 都会清空它。`calendar: "host"` 的研究使用这些时段，替换日历会重建它们及其依赖的研究，`"exchange"` 与 `"utc"` 研究不受影响。日历不进入导出的文档。可以用 `resample_boundaries(options)` 从交易所时段窗口生成这些行。
+
+Rust 宿主使用 `ChartEngine::{add_swing_points, add_market_structure, add_fair_value_gaps, add_order_blocks, add_session_levels, add_previous_period_levels, add_opening_range}`（拒绝时返回空列表；日历策略为 `StudyCalendarPolicy::{Exchange, Utc, Host}`，`Default` 为 `Exchange`）、`ChartEngine::study_annotations(binding)`、`set_study_calendar(Vec<ResampleBoundary>)` 与 `clear_study_calendar()`。确认语义、空白数据规则、检查点与绘制顺序见[结构与时段研究](../features/studies.md)。
+
+## 自定义研究
+
+浏览器宿主用 `chart.register_custom_study(definition)` 注册一个同步计算的研究类型：`definition` 给出 `type`（小写字母、数字与 `._-`，最多 64 字节）、`version`、`title`、`parameters`（与 `indicator_schema` 相同的参数描述，`choice` 参数带 `options`）、1 到 5 个 `outputs`（`name`、`plot`：`"line"`/`"histogram"`/`"area"`/`"marker"`、`pane`：`"price"`/`"dedicated"`、可选的 `default_style`）、可选的 `uses_volume`，以及回调 `init(params) → state`、可选的 `update(state, ctx)` 与必需的 `rebuild(state, ctx)`。`ctx` 携带 `from`、`length`、`tail` 与 `time`、`open`、`high`、`low`、`close`、`volume` 六个 `Float64Array`，回调把 `[from, length)` 的结果写入 `ctx.outputs`，`NaN` 表示空白。`chart.add_custom_study(type, source, params?, { input_source?, volume_source?, ...series_options })` 绑定该类型并按输出顺序返回 `series_api`；输出可以作为其他研究的源。`chart.subscribe_custom_study_fault(callback)` 订阅故障事件（`{ binding, message }`），返回取消订阅函数。回调中调用任何图表 API 都抛出 `reentrant_call`；OffscreenCanvas worker 图表的这两个方法抛出 `unsupported`。
+
+Rust 宿主使用 `ChartEngine::register_custom_study(CustomStudyDefinition, CustomStudyFactory)`、`add_custom_study`、`set_custom_study_parameters`、`set_custom_study_source`、`retry_custom_study`、`custom_study_stats` 与 `take_custom_study_faults`（需要轮询）。调度、界限、待定与故障状态、持久化与绘制见[自定义研究](../features/studies.md#自定义研究)。
 
 ## KLineChart 指标
 

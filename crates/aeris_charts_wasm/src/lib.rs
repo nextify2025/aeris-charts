@@ -35,6 +35,10 @@ mod session_slots;
 // target too so its state rules are tested outside the browser.
 #[cfg(any(target_arch = "wasm32", test))]
 mod stroke_state;
+// Image-run admission is pure; exercise its zero-opacity skip on the host without a GPU device.
+#[cfg(test)]
+#[path = "chart/image_runs.rs"]
+mod image_runs;
 
 #[cfg(target_arch = "wasm32")]
 mod canvas2d_target;
@@ -44,7 +48,7 @@ mod chart;
 mod workspace;
 
 #[cfg(target_arch = "wasm32")]
-pub use chart::{create_chart, AerisChart};
+pub use chart::{AerisChart, create_chart};
 #[cfg(target_arch = "wasm32")]
 pub use workspace::AerisWorkspace;
 
@@ -57,7 +61,7 @@ pub use smoke::render_prim_smoke_2d;
 #[cfg(target_arch = "wasm32")]
 mod smoke {
     use crate::canvas2d_target::WasmCanvas2d;
-    use aeris_charts_render::canvas2d::{execute, Viewport};
+    use aeris_charts_render::canvas2d::{Viewport, execute};
     use aeris_charts_render::color::Color;
     use aeris_charts_render::draw_list::{Gradient, IRect, LineStyle, LineType, Prim};
     use wasm_bindgen::prelude::*;

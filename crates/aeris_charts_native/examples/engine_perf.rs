@@ -14,7 +14,9 @@ fn benchmark_frame(chart: &mut ChartEngine, bars: usize, kind: SeriesKind, label
         .iter()
         .map(|pane| pane.under.len() + pane.main.len())
         .sum();
-    println!("{label} conflation: {bars} installed source points -> {points} points / {primitives} primitives in {elapsed:?}");
+    println!(
+        "{label} conflation: {bars} installed source points -> {points} points / {primitives} primitives in {elapsed:?}"
+    );
 }
 
 fn main() {

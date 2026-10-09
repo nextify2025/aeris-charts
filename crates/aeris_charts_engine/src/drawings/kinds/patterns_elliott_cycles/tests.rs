@@ -552,10 +552,12 @@ fn family_tools_paint_and_hit_on_a_lower_pane() {
         })
         .expect("the A label on the lower pane");
     assert!(label_y > top && label_y < bottom);
-    assert!(!frame.panes[0]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "A")));
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "A"))
+    );
     let repeats = frame.panes[pane]
         .main
         .iter()
@@ -565,9 +567,11 @@ fn family_tools_paint_and_hit_on_a_lower_pane() {
         })
         .collect::<Vec<_>>();
     assert!(repeats.len() > 5);
-    assert!(repeats
-        .iter()
-        .all(|&(y0, y1)| y0 == top.round() as i32 && y1 == bottom.round() as i32));
+    assert!(
+        repeats
+            .iter()
+            .all(|&(y0, y1)| y0 == top.round() as i32 && y1 == bottom.round() as i32)
+    );
     // Legs, labels, and far repeats hit on that pane.
     let (a, b) = (anchor(&chart, pattern, 0), anchor(&chart, pattern, 1));
     assert!(a.1 > top && b.1 > top);
@@ -590,22 +594,26 @@ fn family_tools_paint_and_hit_on_a_lower_pane() {
 fn family_tools_tolerate_charts_without_data_and_degenerate_anchors() {
     let mut empty = ChartEngine::new(800.0, 500.0, 1.0);
     for kind in KINDS {
-        assert!(empty
-            .add_drawing(kind, 0, zigzag_points(kind), None)
-            .is_some());
+        assert!(
+            empty
+                .add_drawing(kind, 0, zigzag_points(kind), None)
+                .is_some()
+        );
     }
     empty.build_frame();
     assert_eq!(empty.hit_test_drawing(100.0, 100.0), None);
 
     let mut chart = chart();
-    assert!(chart
-        .add_drawing(
-            DrawingKind::SineLine,
-            0,
-            vec![p(f64::NAN, 1.0), p(2.0, 3.0)],
-            None
-        )
-        .is_none());
+    assert!(
+        chart
+            .add_drawing(
+                DrawingKind::SineLine,
+                0,
+                vec![p(f64::NAN, 1.0), p(2.0, 3.0)],
+                None
+            )
+            .is_none()
+    );
     assert!(
         chart
             .add_drawing(
@@ -622,10 +630,12 @@ fn family_tools_tolerate_charts_without_data_and_degenerate_anchors() {
         assert!(chart.add_drawing(kind, 0, points, None).is_some());
     }
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .points
-        .iter()
-        .all(|point| point[0].is_finite() && point[1].is_finite()));
+    assert!(
+        frame.panes[0]
+            .points
+            .iter()
+            .all(|point| point[0].is_finite() && point[1].is_finite())
+    );
 }
 
 #[test]
@@ -647,10 +657,12 @@ fn log_and_percentage_scales_keep_indexed_hits_equal_to_brute_force() {
         }
         chart.set_price_scale_mode(0, false, mode);
         let frame = chart.build_frame();
-        assert!(frame.panes[0]
-            .points
-            .iter()
-            .all(|point| point[0].is_finite() && point[1].is_finite()));
+        assert!(
+            frame.panes[0]
+                .points
+                .iter()
+                .all(|point| point[0].is_finite() && point[1].is_finite())
+        );
         for gy in 0..16 {
             for gx in 0..26 {
                 let (x, y) = (f64::from(gx) * 30.0 + 3.0, f64::from(gy) * 30.0 + 4.0);
@@ -795,9 +807,11 @@ fn xabcd_draws_dashed_ratio_connectors_and_ratios_by_default() {
         chart.drawing_apply_options(id, r#"{"tool_options":{"pattern":{"show_ratios":false}}}"#)
     );
     assert!(!texts_of(&mut chart).iter().any(|run| run == "0.618"));
-    assert!(ink_polylines(&mut chart)
-        .iter()
-        .all(|(_, width, _)| *width == 2.0));
+    assert!(
+        ink_polylines(&mut chart)
+            .iter()
+            .all(|(_, width, _)| *width == 2.0)
+    );
     assert!(!main_has_rect(&mut chart));
     assert_eq!(hit(&chart, on_xd), None);
 }
@@ -957,9 +971,11 @@ fn head_and_shoulders_draws_the_neckline_between_the_outer_legs() {
         HEAD_AND_SHOULDERS.map(|(logical, price)| DrawingAnchor::from(p(logical, 206.0 - price)));
     assert!(chart.set_drawing_anchors(id, &mirrored).is_ok());
     let start = px(&chart, 4.0 + 4.0 / 3.0, 104.0);
-    assert!(ink_polylines(&mut chart)
-        .iter()
-        .any(|(points, ..)| points.len() == 2 && close(points[0], start, 0.01)));
+    assert!(
+        ink_polylines(&mut chart)
+            .iter()
+            .any(|(points, ..)| points.len() == 2 && close(points[0], start, 0.01))
+    );
 }
 
 /// The triangle pattern's sides reach their apex only with the extend flag of their direction
@@ -1015,12 +1031,16 @@ fn triangle_pattern_extends_converging_sides_to_their_apex_when_extended() {
     assert!(chart.set_drawing_anchors(id, &diverging).is_ok());
     let (c, d) = (anchor(&chart, id, 2), anchor(&chart, id, 3));
     let lines = ink_polylines(&mut chart);
-    assert!(lines
-        .iter()
-        .any(|(line, ..)| line.len() == 2 && close(line[0], a, 0.01) && close(line[1], c, 0.01)));
-    assert!(lines
-        .iter()
-        .any(|(line, ..)| line.len() == 2 && close(line[0], b, 0.01) && close(line[1], d, 0.01)));
+    assert!(
+        lines.iter().any(|(line, ..)| line.len() == 2
+            && close(line[0], a, 0.01)
+            && close(line[1], c, 0.01))
+    );
+    assert!(
+        lines.iter().any(|(line, ..)| line.len() == 2
+            && close(line[0], b, 0.01)
+            && close(line[1], d, 0.01))
+    );
     assert_eq!(ink_fills(&mut chart), 1);
     // Without the flag the fill alone shades the quad.
     assert!(chart.drawing_apply_options(id, r#"{"extend_right":false}"#));
@@ -1372,10 +1392,12 @@ fn placement_previews_the_legs_labels_ratios_and_fills_placed_so_far() {
             chart.drawing_tool_activate(x, y, DrawingModifiers::default());
             chart.drawing_tool_pointer_move(x + 30.0, y - 40.0, DrawingModifiers::default(), false);
             let frame = chart.build_frame();
-            assert!(frame.panes[0]
-                .points
-                .iter()
-                .all(|point| point[0].is_finite() && point[1].is_finite()));
+            assert!(
+                frame.panes[0]
+                    .points
+                    .iter()
+                    .all(|point| point[0].is_finite() && point[1].is_finite())
+            );
         }
         chart.set_drawing_tool(None, None, None);
     }
@@ -1541,8 +1563,9 @@ fn pattern_decorations_scale_with_the_device_pixel_ratio() {
             })
             .unwrap();
         assert_eq!(ratio, 12.0 * dpr);
-        assert!(main
-            .iter()
-            .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "a")));
+        assert!(
+            main.iter()
+                .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "a"))
+        );
     }
 }

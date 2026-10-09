@@ -5,11 +5,11 @@
 
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, Prim};
-use aeris_charts_render::shape::{self, Point, Rect, MAX_FLATTEN_POINTS};
+use aeris_charts_render::shape::{self, MAX_FLATTEN_POINTS, Point, Rect};
 
 use super::super::super::DrawingTextLayout;
 use super::ShapeToolOptions;
-use crate::drawings::{resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions};
+use crate::drawings::{DrawingBodyGeometry, DrawingGeometryOptions, resolve_drawing_geometry};
 use crate::{
     ChartEngine, DrawingAnchor, DrawingDragPart, DrawingId, DrawingKind, DrawingMagnetMode,
     DrawingModifiers, DrawingPoint,
@@ -204,9 +204,10 @@ fn dashed_outlines_split_into_solid_runs_for_every_executor() {
         })
         .collect::<Vec<_>>();
     assert!(runs.len() > 10, "{} dash runs", runs.len());
-    assert!(runs
-        .iter()
-        .all(|(_, style)| *style == aeris_charts_render::draw_list::LineStyle::Solid));
+    assert!(
+        runs.iter()
+            .all(|(_, style)| *style == aeris_charts_render::draw_list::LineStyle::Solid)
+    );
     // Six-width dashes and gaps: the runs cover half the perimeter.
     let length = |line: &[Point]| {
         line.windows(2)
@@ -540,28 +541,34 @@ fn shapes_tolerate_charts_without_data_and_degenerate_anchors() {
     for kind in SHAPE_KINDS {
         let point = p(12.0, 102.0);
         let count = points_for(kind).len();
-        assert!(chart
-            .add_drawing(
-                kind,
-                0,
-                vec![point; count],
-                Some(r#"{"fill_enabled":true}"#)
-            )
-            .is_some());
+        assert!(
+            chart
+                .add_drawing(
+                    kind,
+                    0,
+                    vec![point; count],
+                    Some(r#"{"fill_enabled":true}"#)
+                )
+                .is_some()
+        );
     }
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .points
-        .iter()
-        .all(|point| point[0].is_finite() && point[1].is_finite()));
-    assert!(chart
-        .add_drawing(
-            DrawingKind::Circle,
-            0,
-            vec![p(f64::NAN, 1.0), p(2.0, 3.0)],
-            None
-        )
-        .is_none());
+    assert!(
+        frame.panes[0]
+            .points
+            .iter()
+            .all(|point| point[0].is_finite() && point[1].is_finite())
+    );
+    assert!(
+        chart
+            .add_drawing(
+                DrawingKind::Circle,
+                0,
+                vec![p(f64::NAN, 1.0), p(2.0, 3.0)],
+                None
+            )
+            .is_none()
+    );
     let _ = chart.hit_test_drawing(300.0, 200.0);
 }
 
@@ -1159,11 +1166,13 @@ fn curves_extend_along_their_end_tangents() {
     assert!((edge.0 - b.0) * (b.0 - control.0) > 0.0, "beyond the end");
     // The fill keeps to the curve and its chord.
     let region = fills(&mut chart, wash());
-    assert!(region[0]
-        .0
-        .iter()
-        .chain(&region[0].1)
-        .all(|point| point.0 <= b.0 + 1e-3));
+    assert!(
+        region[0]
+            .0
+            .iter()
+            .chain(&region[0].1)
+            .all(|point| point.0 <= b.0 + 1e-3)
+    );
     // The extension selects the drawing as its body.
     let on_extension = shape::midpoint(b, edge);
     let hit_part = chart.hit_test_drawing(on_extension.0, on_extension.1);
@@ -1499,10 +1508,12 @@ fn clicking_the_first_vertex_closes_a_polyline() {
             None
         ));
         for (x, y) in vertices {
-            assert!(chart
-                .drawing_tool_activate(x, y, modifiers)
-                .created
-                .is_none());
+            assert!(
+                chart
+                    .drawing_tool_activate(x, y, modifiers)
+                    .created
+                    .is_none()
+            );
         }
     };
     let near_first = (vertices[0].0 + 3.0, vertices[0].1 - 2.0);
@@ -1551,10 +1562,12 @@ fn clicking_the_first_vertex_closes_a_polyline() {
 
     // The path has no close: a click on its first vertex places another vertex.
     place(&mut chart, DrawingKind::Path);
-    assert!(chart
-        .drawing_tool_activate(near_first.0, near_first.1, modifiers)
-        .created
-        .is_none());
+    assert!(
+        chart
+            .drawing_tool_activate(near_first.0, near_first.1, modifiers)
+            .created
+            .is_none()
+    );
     let id = chart.drawing_tool_finish().created.unwrap();
     assert_eq!(chart.drawing(id).unwrap().points.len(), 4);
 }
@@ -2070,9 +2083,11 @@ fn rotated_rectangles_and_triangles_outline_as_one_seamless_run() {
         vec![p(10.0, 101.0), p(20.0, 104.0)],
         r##"{"color":"#123456"}"##,
     );
-    assert!(polylines(&mut chart, ink())
-        .iter()
-        .all(|(line, _)| line.len() == 2));
+    assert!(
+        polylines(&mut chart, ink())
+            .iter()
+            .all(|(line, _)| line.len() == 2)
+    );
 }
 
 /// The culled hit path agrees with brute force for the re-applied options: caps reaching past the

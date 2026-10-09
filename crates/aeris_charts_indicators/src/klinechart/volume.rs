@@ -1,7 +1,7 @@
 //! `VOL` (成交量). Ported from KLineChart `src/extension/indicator/volume.ts`.
 
-use super::stepper::{fold, rolling_mean_step, Window};
 use super::Column;
+use super::stepper::{Window, fold, rolling_mean_step};
 use crate::MAX_OUTPUTS;
 
 /// One running sum per period. The first output of a VOL binding is the volume bar itself, so

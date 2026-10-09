@@ -1208,7 +1208,7 @@ export interface comparison_legend_entry {
 
 /** Scalar input accepted by a built-in indicator. The source series may itself be an indicator output. */
 export type indicator_input_source = "open" | "high" | "low" | "close" | "hl2" | "hlc3" | "ohlc4" | "hlcc4";
-export type indicator_kind = "sma" | "ema" | "dema" | "tema" | "smma" | "hma" | "vwma" | "standard_deviation" | "cci" | "williams_r" | "stochastic_rsi" | "momentum" | "roc" | "donchian" | "pivot_points" | "zigzag" | "keltner" | "adx_dmi" | "parabolic_sar" | "supertrend" | "ichimoku" | "ema_ribbon" | "bollinger" | "rsi" | "macd" | "stochastic" | "atr" | "vwap" | "obv" | "cmf" | "mfi" | "volume" | "vwap_bands" | "wma" | "kdj" | klinechart_indicator_kind;
+export type indicator_kind = "session_levels" | "previous_period_levels" | "opening_range" | "swing_points" | "market_structure" | "fair_value_gaps" | "order_blocks" | "aroon" | "awesome_oscillator" | "dpo" | "chande_momentum" | "bollinger_metrics" | "envelopes" | "alma" | "accumulation_distribution" | "price_volume_trend" | "chaikin_oscillator" | "klinger" | "kama" | "mcginley" | "linear_regression" | "choppiness" | "atr_bands" | "relative_volume" | "volume_oscillator" | "elder_force" | "ease_of_movement" | "historical_volatility" | "trix" | "kst" | "tsi" | "mass_index" | "vortex" | "coppock_curve" | "fisher_transform" | "ultimate_oscillator" | "sma" | "ema" | "dema" | "tema" | "smma" | "hma" | "vwma" | "standard_deviation" | "cci" | "williams_r" | "stochastic_rsi" | "momentum" | "roc" | "donchian" | "pivot_points" | "zigzag" | "keltner" | "adx_dmi" | "parabolic_sar" | "supertrend" | "ichimoku" | "ema_ribbon" | "bollinger" | "rsi" | "macd" | "stochastic" | "atr" | "vwap" | "obv" | "cmf" | "mfi" | "volume" | "vwap_bands" | "wma" | "kdj" | klinechart_indicator_kind;
 /**
  * One KLineChart indicator template with its parameters, as {@link chart_api.add_klinechart_indicator}
  * takes it and `indicator_info().parameters.klinechart` reports it. `indicator` names the template and
@@ -1282,6 +1282,38 @@ export type klinechart_indicator =
 export type klinechart_indicator_name = klinechart_indicator["indicator"];
 /** The {@link indicator_kind} of a KLineChart binding (and the `kind` {@link chart_api.indicator_schema} takes): `klinechart_` followed by the template name. */
 export type klinechart_indicator_kind = `klinechart_${klinechart_indicator_name}`;
+/**
+ * Calendar of the session studies (session levels, previous day/week/month levels, opening range).
+ * `exchange` (the default) follows the chart's exchange time zone and trading-session start
+ * ({@link time_scale_options.time_zone} and {@link time_scale_options.session_start}, or the
+ * declarative `timeScale.timeZone` / `timeScale.sessionStart`), the calendar VWAP resets and
+ * pivots use: days, Monday weeks and months are counted on the trading date, so a night session
+ * that crosses midnight belongs to the next trading day, week and month, and an opening range
+ * starts at the session start. Changing the time zone or the session start recomputes these
+ * studies. On a chart whose exchange time is UTC with a midnight session start it equals `utc`.
+ * `utc` groups by UTC calendar day/week/month; `host` uses spans supplied by set_study_calendar.
+ */
+export type study_calendar_policy = "exchange" | "utc" | "host";
+export type previous_period = "day" | "week" | "month";
+export type structure_break_on = "close" | "wick";
+export type structure_mitigation = "touch" | "half" | "full";
+export type structure_mitigation_price = "wick" | "close";
+export type order_block_zone = "wick" | "body";
+export interface structure_zone_options {
+  mitigation?: structure_mitigation;
+  mitigation_price?: structure_mitigation_price;
+  max_active?: number;
+  show_mitigated?: boolean;
+}
+export interface fair_value_gap_options extends structure_zone_options {
+  min_size?: number;
+}
+export interface order_block_options extends structure_zone_options {
+  left?: number;
+  right?: number;
+  break_on?: structure_break_on;
+  zone?: order_block_zone;
+}
 export type pivot_kind = "standard" | "fibonacci" | "camarilla" | "woodie" | "demark";
 /** VWAP reset period in exchange trading days: one day, a Monday-start week, or a calendar month. */
 export type vwap_reset = "session" | "weekly" | "monthly";
@@ -1337,15 +1369,37 @@ export interface vwap_parameters {
    */
   amount_source?: series_api | null;
 }
-export type indicator_parameter_type = "integer" | "number" | "source" | "series" | "choice";
+export type indicator_parameter_type = "integer" | "number" | "boolean" | "source" | "series" | "choice";
 export interface indicator_parameter_descriptor {
   name: string;
   parameter_type: indicator_parameter_type;
   default: unknown;
   min: number | null;
   max: number | null;
-  /** Allowed values of a `"choice"` parameter. */
-  choices?: string[];
+  /** Present only for choice parameters, in editor display order. */
+  options?: string[];
+}
+export type study_marker_kind = "swing_high" | "swing_low" | { bos: { up: boolean } } | { choch: { up: boolean } };
+export interface study_marker {
+  row: number;
+  confirm_row: number;
+  price: number;
+  kind: study_marker_kind;
+  from_row: number | null;
+}
+export interface study_zone {
+  start_row: number;
+  confirm_row: number;
+  top: number;
+  bottom: number;
+  bullish: boolean;
+  end_row: number | null;
+  /** True when max_active retired this zone rather than price mitigating it. */
+  retired: boolean;
+}
+export interface study_annotations {
+  markers: study_marker[];
+  zones: study_zone[];
 }
 export interface indicator_output_descriptor {
   name: string;
@@ -1366,9 +1420,52 @@ export interface indicator_output_style {
 }
 export interface indicator_schema {
   revision: number;
-  kind: indicator_kind;
+  kind: indicator_kind | (string & {});
   parameters: indicator_parameter_descriptor[];
   outputs: indicator_output_descriptor[];
+}
+
+/** The engine calls these functions synchronously. Output arrays cover only [from, length). */
+export interface custom_study_context {
+  from: number;
+  length: number;
+  tail: boolean;
+  time: Float64Array;
+  open: Float64Array;
+  high: Float64Array;
+  low: Float64Array;
+  close: Float64Array;
+  volume: Float64Array;
+  outputs: Float64Array[];
+}
+export interface custom_study_output {
+  name: string;
+  plot: "line" | "histogram" | "area" | "marker";
+  pane: "price" | "dedicated";
+  default_style?: Partial<indicator_output_style>;
+}
+export type custom_study_parameter_descriptor = Omit<indicator_parameter_descriptor, "min" | "max"> & {
+  min?: number | null;
+  max?: number | null;
+};
+export interface custom_study_definition<State = unknown> {
+  type: string;
+  version: number;
+  title: string;
+  parameters: custom_study_parameter_descriptor[];
+  outputs: custom_study_output[];
+  uses_volume?: boolean;
+  init(params: Record<string, unknown>): State;
+  update?(state: State, ctx: custom_study_context): void;
+  rebuild(state: State, ctx: custom_study_context): void;
+}
+export interface custom_study_fault_event {
+  binding: number;
+  message: string;
+}
+export interface custom_study_binding_options extends Partial<series_options> {
+  input_source?: indicator_input_source;
+  volume_source?: series_api | null;
 }
 
 /**
@@ -1381,13 +1478,27 @@ export interface indicator_schema {
 export interface indicator_info {
   /** Stable identity shared by all outputs in one indicator binding. */
   binding_id: number;
-  kind: indicator_kind;
+  kind: indicator_kind | (string & {});
   /** Complete structured parameters. Fields not used by this kind are `null`. */
   parameters: {
+    calendar: study_calendar_policy | null;
+    previous_period: previous_period | null;
+    duration_seconds: number | null;
+    left: number | null;
+    right: number | null;
+    break_on: structure_break_on | null;
+    min_size: number | null;
+    mitigation: structure_mitigation | null;
+    mitigation_price: structure_mitigation_price | null;
+    max_active: number | null;
+    show_mitigated: boolean | null;
+    zone: order_block_zone | null;
     period: number | null;
     periods: [number, number, number, number, number] | null;
     pivot_kind: pivot_kind | null;
     deviation: number | null;
+    /** ATR bands width in ATRs (`close ± multiplier × ATR`). Keltner and SuperTrend report theirs as `deviation`. */
+    multiplier: number | null;
     fast: number | null;
     slow: number | null;
     signal: number | null;
@@ -1396,6 +1507,21 @@ export interface indicator_info {
     reset: vwap_reset | null;
     standard_deviation: number | null;
     percent: number | null;
+    exponential: boolean | null;
+    offset: number | null;
+    sigma: number | null;
+    divisor: number | null;
+    annualization: number | null;
+    long_period: number | null;
+    short_period: number | null;
+    smoothing: number | null;
+    /** KST rate-of-change lags. */
+    roc: [number, number, number, number] | null;
+    /** KST SMA lengths, one per rate of change. */
+    smoothing_periods: [number, number, number, number] | null;
+    /** Mass Index EMA length and ratio-sum length. */
+    ema_period: number | null;
+    sum_period: number | null;
     /** EMA/DEMA/TEMA/MACD/RSI seed convention. */
     seed: indicator_seed | null;
     /** MACD histogram scale. */
@@ -1410,10 +1536,13 @@ export interface indicator_info {
     /** The complete KLineChart definition of a `klinechart_*` binding, as passed to
      *  {@link chart_api.add_klinechart_indicator}. Absent for every other kind. */
     klinechart?: klinechart_indicator;
+    /** Normalized registered custom-study parameters (null for built-in kinds). */
+    custom: Record<string, unknown> | null;
   };
   /** For a KLineChart template, its first period (0 for `avp`, `pvt`, and `sar`, which have none). */
   period: number;
-  /** Second parameter when the kind has one: Bollinger deviation, MACD signal period,
+  /** Second parameter when the kind has one: Bollinger and Bollinger metrics deviation, Envelopes
+   *  percent, MACD, Volume Oscillator, and TRIX signal period, Keltner and SuperTrend multiplier,
    *  Stochastic %D period; otherwise `null`. KLineChart bindings always report `null`. */
   deviation: number | null;
   source: series_api;
@@ -1445,6 +1574,7 @@ export interface indicator_info {
 
 /** Five EMA periods in fastest-to-slowest output order. */
 export type ema_ribbon_periods = readonly [number, number, number, number, number];
+export type kst_periods = readonly [number, number, number, number];
 
 /** Per-output style overrides in the same order as {@link ema_ribbon_periods}. */
 export type ema_ribbon_options = readonly [
@@ -1556,7 +1686,7 @@ export interface time_scale_options {
    * negative start every Saturday or Sunday instant belongs to Monday, and window placement
    * (`session_slot_times`, `resample_boundaries`, `set_trade_stream_sessions`) assumes the week
    * opens on Friday evening. Drives Day/Month/Year tick marks, VWAP session/weekly/monthly
-   * resets, and pivot sessions.
+   * resets, pivot sessions, and the `exchange` calendar of the session studies.
    */
   session_start?: number;
   /**
@@ -2490,6 +2620,7 @@ export interface footprint_series_options {
   imbalance_ratio: number;
   imbalance_minimum_volume: number;
   stacked_imbalance_levels: number;
+  /** Row presentation; every mode paints the same stored bars (see docs/features/footprint.md). */
   cell_mode: "bid_ask" | "total" | "delta" | "profile_in_bar" | "volume_ladder" | "horizontal_imbalance" | "bid_ask_histogram";
   font_size: number;
   bid_color: string;
@@ -2502,6 +2633,8 @@ export interface footprint_series_options {
   stacked_bid_color: string;
   stacked_ask_color: string;
   show_bar_summary: boolean;
+  /** Merge rows in 1-2-5 steps so cells stay legible at the current zoom. Defaults to false. */
+  adaptive_rows?: boolean;
 }
 
 /** Engine-owned price-action transform applied to canonical host OHLC source bars. */
@@ -3007,6 +3140,13 @@ export type drawing_text_h_align = "left" | "center" | "right";
 /** Vertical label alignment: above / inline with / below the tool at the selected horizontal slot. */
 export type drawing_text_v_align = "top" | "middle" | "bottom";
 export type drawing_line_cap = "none" | "arrow" | "circle";
+/**
+ * Anchor magnet of one drawing (or of the chart, `set_drawing_magnet_mode`): `strong` always snaps
+ * to the nearest rendered OHLC price, `weak` snaps only within 12 CSS px of it, and `off` keeps the
+ * pointer's point. A drawing uses the stronger of its own and the chart mode. Holding Ctrl/Cmd
+ * upgrades a drawing's own `weak` or `strong` magnet to `strong`; for a drawing whose own magnet
+ * is `off` it toggles the chart mode (off becomes strong, weak or strong becomes off).
+ */
 export type drawing_magnet_mode = "off" | "weak" | "strong";
 export type drawing_interval_unit = "seconds" | "minutes" | "hours" | "days" | "weeks" | "months" | "ticks" | "ranges";
 export interface drawing_interval { unit: drawing_interval_unit; value: number }
@@ -3578,13 +3718,16 @@ export interface trade_stream_stats {
   dependent_rows_computed: number;
   /** Lifetime footprint and bound candle/bar rows projected; a live tip adds only its active bars. */
   bar_rows_projected: number;
-  /** Lifetime tape trades folded into bubble markers; a live tip adds only its new trades. */
-  bubble_trades_scanned: number;
   /**
-   * Lifetime bubble marker sizes computed; a live tip sizes only its new or merged bubbles unless
-   * the peak retained bubble volume changes, which rescales every retained bubble once.
+   * Lifetime prints big-trades indicators folded into rebuilt orders; a live tip adds only its
+   * new prints, and a retention trim evicts orders in place and adds none.
    */
-  bubble_markers_sized: number;
+  big_trades_prints_scanned: number;
+  /**
+   * Lifetime big-trades replays of the visible tape (tape replacement, corrections, replay seeks,
+   * filter or grouping changes); live tips and retention trims add none.
+   */
+  big_trades_replays: number;
 }
 
 export interface replay_seek_stats {
@@ -3659,9 +3802,11 @@ export interface chart_state_v3 {
   drawings: persisted_drawing_v1[];
   indicators: {
     /** Engine indicator definition: `{ kind: indicator_kind, ...parameters }`. A KLineChart study stores
-     *  `kind: "klinechart"` beside its {@link klinechart_indicator} fields. */
+     *  `kind: "klinechart"` beside its {@link klinechart_indicator} fields; a custom study stores its
+     *  registered `type_id`, `version`, normalized `parameters`, and `output_count`. */
     kind:
       | ({ kind: "klinechart" } & klinechart_indicator)
+      | { kind: "custom"; type_id: string; version: number; parameters: Record<string, unknown>; output_count: number }
       | ({ kind: Exclude<indicator_kind, klinechart_indicator_kind> } & Record<string, unknown>);
     source: persisted_indicator_source_v3;
     source_input: indicator_input_source;
@@ -3669,6 +3814,9 @@ export interface chart_state_v3 {
     /** Turnover series of an amount-weighted VWAP; absent when the study has none. */
     amount_source?: persisted_indicator_source_v3 | null;
     styles: indicator_output_style[];
+    /** Custom-study output placement (true = dedicated pane), kept so an import without the
+     *  registered type restores its panes; absent for built-in studies. */
+    dedicated_outputs?: boolean[];
   }[];
   drawing_price_basis?: string;
   /** Drawing catalog marker; see {@link chart_state_v1.drawing_catalog}. */
@@ -3684,6 +3832,8 @@ export interface persistence_restore_result {
   panes: number;
   drawings: number;
   points: number;
+  /** V3 pending binding identities; absent on legacy V1/V2 documents. */
+  unresolved_custom_studies?: number[];
 }
 
 /** A live handle to an engine-owned drawing. */
@@ -4731,6 +4881,92 @@ export interface volume_profile_indicator_api {
   remove(): void;
 }
 
+/** Which orders become bubbles. `auto` keeps orders above a percentile of the recently completed
+ * orders (weak 95th, medium 98th, strong 99.5th); `fixed` keeps orders of at least the volume. */
+export type big_trades_filter =
+  | { mode: "auto"; intensity: "weak" | "medium" | "strong" }
+  | { mode: "fixed"; minimum_volume: number };
+/** Large aggressive orders rebuilt from consecutive same-aggressor prints, then filtered. */
+export interface big_trades_options {
+  /** Default `{ mode: "auto", intensity: "medium" }`. */
+  filter: big_trades_filter;
+  /** Largest gap between prints of one order, 0-1,000,000 µs. Default 1000. */
+  grouping_window_micros: number;
+  /** Bubble diameter range. Default `medium`. */
+  size: "small" | "medium" | "large";
+  /** Draw the order volume inside bubbles large enough to hold it. Default true. */
+  show_volume: boolean;
+  visible: boolean;
+  buy_color: string;
+  sell_color: string;
+  buy_border_color: string;
+  sell_border_color: string;
+  /** `null` follows the chart layout text color. */
+  text_color: string | null;
+}
+export interface big_trade {
+  side: "buy" | "sell";
+  volume: number;
+  prints: number;
+  /** Volume-weighted fill price; the bubble is centred here. */
+  vwap: number;
+  low: number;
+  high: number;
+  start_timestamp_micros: number;
+  end_timestamp_micros: number;
+  /**
+   * UTC-second open of the bar the order opened in, or that bar's row key on trade, volume, and
+   * range bars. Retention never re-keys it: an order leaves with the bar it opened in.
+   */
+  bar_time: number;
+}
+export interface big_trades_snapshot {
+  /** The filter applied, or `null` while the automatic filter is still sampling. */
+  threshold: number | null;
+  /** Qualifying orders oldest first, ending with the still-forming order when it qualifies; the
+   * newest 4096 completed orders are kept. */
+  bubbles: readonly big_trade[];
+}
+export interface big_trades_api {
+  readonly id: number;
+  options(): big_trades_options;
+  /** Throws `invalid_options` for rejected options and `stale_handle` after removal. */
+  apply_options(options: Partial<big_trades_options>): void;
+  snapshot(): big_trades_snapshot;
+  remove(): void;
+}
+
+/** Tape-derived footprint auction event rules; all volumes use the stream's native units. */
+export interface auction_marker_options {
+  min_side_volume: number;
+  exhaustion_max_volume: number;
+  exhaustion_levels: number;
+  absorption_min_volume: number;
+  absorption_ratio: number;
+  extreme_levels: number;
+  min_rejection_rows: number;
+  extend_until_revisited: boolean;
+  include_forming_bar: boolean;
+  visible: boolean;
+}
+export interface auction_mark {
+  /** UTC seconds for time bars; the chart row key for non-time bars (the key footprint rows and
+   *  big-trades orders carry, which retention never re-keys). */
+  bar_time: number;
+  kind: "unfinished_auction" | "exhaustion" | "absorption";
+  side: "high" | "low";
+  price: number;
+  volume: number;
+}
+export interface auction_markers_api {
+  readonly id: number;
+  options(): auction_marker_options;
+  apply_options(options: Partial<auction_marker_options>): void;
+  /** Tape-derived marks in engine order. */
+  snapshot(): readonly auction_mark[];
+  remove(): void;
+}
+
 /** The chart. Create with {@link create_chart}. */
 export interface chart_api {
   /** Format a time with the chart's time zone, date pattern, and crosshair time formatter. */
@@ -4851,7 +5087,20 @@ export interface chart_api {
    * work.
    */
   add_delta_series(stream_id: number, pane?: number): series_api;
-  add_trade_bubbles(series: series_api | number, stream_id: number, options?: { minimum_volume?: number; max_markers?: number; aggregation_window_micros?: number }): void;
+  /**
+   * Draw a trade stream's large aggressive orders as volume bubbles over a price series. Throws
+   * `resource_limit` past 16 indicators, `unsupported_operation` for a series type that cannot
+   * host bubbles, `invalid_handle` for an unknown stream or series, and `invalid_options` for
+   * rejected options.
+   */
+  add_big_trades(series: series_api | number, stream_id: number, options?: Partial<big_trades_options>): big_trades_api;
+  /**
+   * Present tape-derived auction markers (unfinished auctions, exhaustion, absorption) on a price
+   * series. Runtime-only: marks are not persisted. Throws `resource_limit` past 16 marker sets,
+   * `unsupported_operation` for a series type that cannot host them, `invalid_handle` for an
+   * unknown stream or series, and `invalid_options` for rejected options.
+   */
+  add_auction_markers(series: series_api | number, stream_id: number, options?: Partial<auction_marker_options>): auction_markers_api;
   /**
    * Anchor a time-bar trade stream to exchange-local session windows in the chart's `time_zone`
    * and `session_start`: each window restarts the bar grid (A-share 60-minute bars open at 09:30,
@@ -4893,6 +5142,10 @@ export interface chart_api {
   resampled_bars(target: series_api | number): readonly resampled_bar[] | null;
   /** Lifetime work counters of a resampled series, or `null` when it is not resampled. */
   resample_stats(target: series_api | number): resample_stats | null;
+  /** Replace runtime-only UTC session spans atomically; an empty list clears them. */
+  set_study_calendar(boundaries: readonly resample_boundary[]): void;
+  clear_study_calendar(): void;
+  study_annotations(binding: series_api): study_annotations;
   volume_profile_snapshot(request: profile_request): profile_snapshot | null;
   periodic_volume_profiles(source: profile_source, boundaries: readonly resample_boundary[], tick_size: number, row_count: number, value_area_percent: number): readonly profile_snapshot[] | null;
   periodic_naked_profile_levels(source: profile_source, boundaries: readonly resample_boundary[], tick_size: number, row_count: number, value_area_percent: number): readonly naked_profile_level[] | null;
@@ -4952,6 +5205,31 @@ export interface chart_api {
   set_series_order(ordered: series_api[]): boolean;
   /** Add a Rust-native simple moving-average line derived from an existing series. */
   add_sma(source: series_api, period: number, options?: Partial<series_options>): series_api;
+  /** Register a synchronous chart-local study implementation. Worker charts do not support callbacks. */
+  register_custom_study<State>(definition: custom_study_definition<State>): void;
+  add_custom_study(type: string, source: series_api, params?: Record<string, unknown>, options?: custom_study_binding_options): series_api[];
+  subscribe_custom_study_fault(callback: (event: custom_study_fault_event) => void): () => void;
+  add_aroon(source: series_api, period: number, options?: Partial<series_options>): [series_api, series_api];
+  /** Confirmed pivot levels and marker snapshots; levels begin at confirmation, never at the pivot. */
+  add_swing_points(source: series_api, left?: number, right?: number, options?: Partial<series_options>): [series_api, series_api];
+  /** Intraday running session high/low. The calendar defaults to `exchange`; host policy uses set_study_calendar boundaries. */
+  add_session_levels(source: series_api, calendar?: study_calendar_policy, options?: Partial<series_options>): [series_api, series_api];
+  /** Completed previous day/week/month high/low/close, available only in the next period (calendar defaults to `exchange`). */
+  add_previous_period_levels(source: series_api, period?: previous_period, calendar?: study_calendar_policy, options?: Partial<series_options>): [series_api, series_api, series_api];
+  /** Running opening high/low/mid, fixed after duration_seconds from the session start (calendar defaults to `exchange`). */
+  add_opening_range(source: series_api, duration_seconds: number, calendar?: study_calendar_policy, options?: Partial<series_options>): [series_api, series_api, series_api];
+  /** BOS/CHoCH segments rendered by the engine; the returned anchor is whitespace. */
+  add_market_structure(source: series_api, left?: number, right?: number, break_on?: structure_break_on, options?: Partial<series_options>): series_api;
+  /** Three-candle imbalance zones with bounded active retention; returns a whitespace anchor. */
+  add_fair_value_gaps(source: series_api, config?: fair_value_gap_options, options?: Partial<series_options>): series_api;
+  /** Last opposite candle before a confirmed swing break; returns a whitespace anchor. */
+  add_order_blocks(source: series_api, config?: order_block_options, options?: Partial<series_options>): series_api;
+  add_awesome_oscillator(source: series_api, options?: Partial<series_options>): series_api;
+  add_dpo(source: series_api, period: number, options?: Partial<series_options>): series_api;
+  add_chande_momentum(source: series_api, period: number, options?: Partial<series_options>): series_api;
+  add_bollinger_metrics(source: series_api, period: number, deviation: number, options?: Partial<series_options>): [series_api, series_api];
+  add_envelopes(source: series_api, period: number, percent: number, exponential?: boolean, options?: Partial<series_options>): [series_api, series_api, series_api];
+  add_alma(source: series_api, period: number, offset?: number, sigma?: number, options?: Partial<series_options>): series_api;
   /** Add an SMA using an explicit OHLC/aggregate input from the source series. */
   add_sma_with_source(source: series_api, input: indicator_input_source, period: number, options?: Partial<series_options>): series_api;
   /** Add a Rust-native exponential moving-average line derived from an existing series.
@@ -5023,6 +5301,33 @@ export interface chart_api {
    *  supplies per-bar volume (e.g. the volume histogram series); `null`/omitted = unit weights. */
   add_vwap(source: series_api, volume_source?: series_api | null, options?: Partial<series_options>, parameters?: vwap_parameters): series_api;
   add_obv(source: series_api, volume_source: series_api, options?: Partial<series_options>): series_api;
+  add_accumulation_distribution(source: series_api, volume_source: series_api, options?: Partial<series_options>): series_api;
+  add_price_volume_trend(source: series_api, volume_source: series_api, options?: Partial<series_options>): series_api;
+  add_chaikin_oscillator(source: series_api, fast: number, slow: number, volume_source: series_api, options?: Partial<series_options>): series_api;
+  /** Klinger line and signal. Pass `undefined` for default periods (34/55/13); volume is required. */
+  add_klinger(source: series_api, fast: number | undefined, slow: number | undefined, signal: number | undefined, volume_source: series_api, options?: Partial<series_options>): [series_api, series_api];
+  add_kama(source: series_api, period?: number, fast?: number, slow?: number, options?: Partial<series_options>): series_api;
+  add_mcginley(source: series_api, period?: number, options?: Partial<series_options>): series_api;
+  /** Regression curve, upper and lower residual-deviation bands. */
+  add_linear_regression(source: series_api, period?: number, deviation?: number, options?: Partial<series_options>): [series_api, series_api, series_api];
+  /** Choppiness Index (0–100), in a separate oscillator pane (dotted 38.2/61.8 Chop Zone lines and
+   *  the translucent channel strip between them). */
+  add_choppiness(source: series_api, period?: number, options?: Partial<series_options>): series_api;
+  /** Price-pane bands in upper, close-basis, lower order using Wilder ATR. */
+  add_atr_bands(source: series_api, period?: number, multiplier?: number, options?: Partial<series_options>): [series_api, series_api, series_api];
+  add_relative_volume(source: series_api, period: number, volume_source: series_api, options?: Partial<series_options>): series_api;
+  add_volume_oscillator(source: series_api, fast: number, slow: number, signal: number, volume_source: series_api, options?: Partial<series_options>): [series_api, series_api, series_api];
+  add_elder_force(source: series_api, period: number, volume_source: series_api, options?: Partial<series_options>): series_api;
+  add_ease_of_movement(source: series_api, period: number, volume_source: series_api, divisor?: number, options?: Partial<series_options>): series_api;
+  add_historical_volatility(source: series_api, period: number, annualization?: number, options?: Partial<series_options>): series_api;
+  add_trix(source: series_api, period: number, signal?: number, options?: Partial<series_options>): [series_api, series_api];
+  add_kst(source: series_api, roc?: kst_periods, smoothing?: kst_periods, signal?: number, options?: Partial<series_options>): [series_api, series_api];
+  add_tsi(source: series_api, long?: number, short?: number, signal?: number, options?: Partial<series_options>): [series_api, series_api];
+  add_mass_index(source: series_api, ema_period?: number, sum_period?: number, options?: Partial<series_options>): series_api;
+  add_vortex(source: series_api, period?: number, options?: Partial<series_options>): [series_api, series_api];
+  add_coppock_curve(source: series_api, long_period?: number, short_period?: number, smoothing?: number, options?: Partial<series_options>): series_api;
+  add_fisher_transform(source: series_api, period?: number, options?: Partial<series_options>): [series_api, series_api];
+  add_ultimate_oscillator(source: series_api, short_period?: number, medium_period?: number, long_period?: number, options?: Partial<series_options>): series_api;
   add_cmf(source: series_api, period: number, volume_source: series_api, options?: Partial<series_options>): series_api;
   add_mfi(source: series_api, period: number, volume_source: series_api, options?: Partial<series_options>): series_api;
   add_volume(source: series_api, period: number, volume_source: series_api, options?: Partial<series_options>): [series_api, series_api];
@@ -5249,8 +5554,9 @@ export interface chart_api {
   /**
    * Persistent chart drawing magnet (the toolbar magnet, default `"off"`): `"weak"` snaps anchor
    * placement and editing to the nearest OHLC value only within a small pixel distance,
-   * `"strong"` always snaps. A drawing's own `magnet` option can raise it for that drawing, and
-   * holding Ctrl/Cmd toggles the effective magnet temporarily. Touch input uses this mode.
+   * `"strong"` always snaps. A drawing's own `magnet` option can raise it for that drawing.
+   * Holding Ctrl/Cmd upgrades a drawing's own magnet to `"strong"` and otherwise toggles this
+   * mode temporarily. Touch input uses this mode.
    */
   set_drawing_magnet_mode(mode: drawing_magnet_mode): void;
   drawing_magnet_mode(): drawing_magnet_mode;

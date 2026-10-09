@@ -103,11 +103,12 @@ fn push_run(runs: &mut Vec<DrawRun>, pipeline: RunPipeline, first: u32, count: u
     if count == 0 {
         return;
     }
-    if let Some(last) = runs.last_mut() {
-        if last.pipeline == pipeline && last.first + last.count == first {
-            last.count += count;
-            return;
-        }
+    if let Some(last) = runs.last_mut()
+        && last.pipeline == pipeline
+        && last.first + last.count == first
+    {
+        last.count += count;
+        return;
     }
     runs.push(DrawRun {
         pipeline,
@@ -285,13 +286,13 @@ impl ReusableBuffer {
             self.uploaded_revision = None;
             stats.allocations += 1;
         }
-        if self.uploaded_revision != Some(revision) {
-            if let Some(buffer) = &self.buffer {
-                queue.write_buffer(buffer, 0, contents);
-                self.uploaded_revision = Some(revision);
-                stats.write_calls += 1;
-                stats.uploaded_bytes += required;
-            }
+        if self.uploaded_revision != Some(revision)
+            && let Some(buffer) = &self.buffer
+        {
+            queue.write_buffer(buffer, 0, contents);
+            self.uploaded_revision = Some(revision);
+            stats.write_calls += 1;
+            stats.uploaded_bytes += required;
         }
     }
 }
@@ -475,11 +476,11 @@ pub fn render_frame(
             }
             // A directly populated tex buffer with no scheduled runs keeps the previous
             // whole-buffer, drawn-last behavior (textured quads paint above everything).
-            if needs_legacy_tex_fallback(group) {
-                if let Some(b) = &bufs.tex.buffer {
-                    tex.draw(&mut pass, b, 0, group.tex_quads.len() as u32);
-                    draw_calls += 1;
-                }
+            if needs_legacy_tex_fallback(group)
+                && let Some(b) = &bufs.tex.buffer
+            {
+                tex.draw(&mut pass, b, 0, group.tex_quads.len() as u32);
+                draw_calls += 1;
             }
         }
     }

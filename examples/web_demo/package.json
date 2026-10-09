@@ -9,6 +9,7 @@
   "devDependencies": {
     "@hugeicons/core-free-icons": "^4.3.5",
     "@playwright/test": "1.63.0",
+    "axe-core": "^4.12.1",
     "esbuild": "^0.28.2",
     "lightweight-charts": "5.2.1",
     "pixelmatch": "7.2.0",

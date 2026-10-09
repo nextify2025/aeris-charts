@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ChartEngine, ChartError, DrawingId, DrawingKind, DrawingPriceScale, ErrorCode, HitProfile,
-    PriceScaleTarget, PANELESS,
+    PANELESS, PriceScaleTarget,
 };
 use aeris_charts_core::style::{
     DEFAULT_PRIMARY_RGB, MARKET_DOWN_RGB, MARKET_UP_RGB, MARKET_WARNING_RGB,
@@ -1854,10 +1854,10 @@ impl ChartEngine {
         };
         // Moving a protection order asserts its bracket, so the connector chrome comes up with the
         // change rather than waiting on the host — the same moment the line itself moves.
-        if preview.role != OrderRole::Working {
-            if let Some(group) = self.trading_group_key_for_preview(&preview) {
-                self.trading_state.group_visual = TradingGroupVisualState::Active(group);
-            }
+        if preview.role != OrderRole::Working
+            && let Some(group) = self.trading_group_key_for_preview(&preview)
+        {
+            self.trading_state.group_visual = TradingGroupVisualState::Active(group);
         }
         self.trading_state.interaction =
             TradingInteractionState::PendingHostAck { sequence, rollback };
@@ -3634,9 +3634,11 @@ pub(crate) mod tests {
                 .count()
                 >= 3
         );
-        assert!(trading
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::Circle { .. })));
+        assert!(
+            trading
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::Circle { .. }))
+        );
         assert!(!trading.iter().any(
             |primitive| matches!(primitive, Prim::Text { text, .. } if text == "B" || text == "S")
         ));
@@ -3650,10 +3652,11 @@ pub(crate) mod tests {
             ("99.00", chart.trading_style().stop_loss),
             ("103.00", chart.trading_style().take_profit),
         ] {
-            assert!(axis
-                .labels
-                .iter()
-                .any(|label| label.text == price && label.border == Some((1.0, color))));
+            assert!(
+                axis.labels
+                    .iter()
+                    .any(|label| label.text == price && label.border == Some((1.0, color)))
+            );
         }
         let mut axis_primitives = Vec::new();
         chart.build_axis_primitives_into(&axis, &mut axis_primitives);
@@ -4106,7 +4109,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn position_axis_tag_hollows_at_live_price_without_leaving_its_line() {
+    fn position_axis_tag_hollows_and_stacks_beside_the_live_price() {
         let mut chart = chart_with_market();
         let secondary = chart.add_series(crate::SeriesKind::Line);
         chart
@@ -4160,7 +4163,6 @@ pub(crate) mod tests {
         let expected_y = chart
             .trading_price_coordinate(0, TradingPriceScale::Right, 102.0)
             .unwrap();
-        assert!((colliding.y - expected_y).abs() <= f64::EPSILON);
         let primary_index = axis
             .labels
             .iter()
@@ -4169,6 +4171,14 @@ pub(crate) mod tests {
             })
             .expect("primary live-price label");
         assert!(trading_index < primary_index, "primary label paints last");
+        // The live price keeps its slot; the position tag stacks flush against it instead of
+        // hiding beneath it.
+        let (_, tag_top, _, tag_height, _) = colliding.background.unwrap();
+        let (_, live_top, _, live_height, _) = axis.labels[primary_index].background.unwrap();
+        assert!(
+            tag_top + tag_height <= live_top + 1e-9 || live_top + live_height <= tag_top + 1e-9
+        );
+        assert!((colliding.y - expected_y).abs() <= tag_height + 1e-9);
 
         let mut separated_position = position(PositionSide::Long);
         separated_position.average_price = 99.0;
@@ -4192,6 +4202,334 @@ pub(crate) mod tests {
         assert_eq!(separated.background.unwrap().4, color);
     }
 
+    fn axis_measure(text: &str, _bold: bool) -> f64 {
+        text.len() as f64 * 7.0
+    }
+
+    fn countdown_measure(text: &str, _bold: bool) -> f64 {
+        text.len() as f64 * 6.0
+    }
+
+    /// Visible boxed tags on the right price axis as `(text, top, bottom)`.
+    fn right_axis_tags(axis: &crate::AxisFrame) -> Vec<(String, f64, f64)> {
+        axis.labels
+            .iter()
+            .filter(|label| !label.text.is_empty() && label.align == crate::AxisTextAlign::Left)
+            .filter_map(|label| {
+                let (_, top, _, height, _) = label.background?;
+                Some((label.text.clone(), top, top + height))
+            })
+            .collect()
+    }
+
+    fn assert_no_tag_overlap(axis: &crate::AxisFrame) {
+        let tags = right_axis_tags(axis);
+        for (index, (text, top, bottom)) in tags.iter().enumerate() {
+            for (other, other_top, other_bottom) in &tags[index + 1..] {
+                assert!(
+                    bottom <= &(other_top + 1e-9) || other_bottom <= &(top + 1e-9),
+                    "{text} [{top}, {bottom}] overlaps {other} [{other_top}, {other_bottom}]"
+                );
+            }
+        }
+        let text_height = crate::axis_metrics::AxisMetrics::new(12.0).axis;
+        for tick in axis.labels.iter().filter(|label| {
+            label.background.is_none()
+                && !label.text.is_empty()
+                && label.align == crate::AxisTextAlign::Left
+        }) {
+            let (top, bottom) = (tick.y - text_height / 2.0, tick.y + text_height / 2.0);
+            for (text, tag_top, tag_bottom) in &tags {
+                assert!(
+                    bottom <= *tag_top || *tag_bottom <= top,
+                    "tick {} shows through tag {text}",
+                    tick.text
+                );
+            }
+        }
+    }
+
+    /// `(paint index, top, fill)` of every boxed tag showing `text`.
+    fn tags_named(axis: &crate::AxisFrame, text: &str) -> Vec<(usize, f64, Color)> {
+        axis.labels
+            .iter()
+            .enumerate()
+            .filter(|(_, label)| label.text == text)
+            .filter_map(|(index, label)| label.background.map(|bg| (index, bg.1, bg.4)))
+            .collect()
+    }
+
+    #[test]
+    fn trading_axis_tags_follow_the_selected_scale_precision_without_widening_the_axis() {
+        let mut chart = chart_with_market();
+        chart
+            .set_instrument_metadata(InstrumentMetadata {
+                tick_size: Some(0.25),
+                ..InstrumentMetadata::default()
+            })
+            .unwrap();
+        assert!(chart.set_price_format_for_scale(0, PriceScaleTarget::Right, 0, 1.0));
+        chart.fit_content();
+        chart.recompute_layout_with_measure(true, axis_measure, countdown_measure);
+        let width = chart.price_scale_axis_width(0, PriceScaleTarget::Right);
+
+        let mut held = position(PositionSide::Long);
+        held.average_price = 100.5;
+        let limit = order("limit-1", OrderRole::Working, 102.25);
+        let mut stop_limit = order("stop-limit-1", OrderRole::Working, 98.75);
+        stop_limit.kind = OrderKind::StopLimit;
+        stop_limit.stop_price = Some(99.25);
+        chart
+            .set_trading_snapshot(TradingSnapshot {
+                positions: vec![held],
+                orders: vec![limit, stop_limit],
+                ..TradingSnapshot::default()
+            })
+            .unwrap();
+        chart.recompute_layout_with_measure(false, axis_measure, countdown_measure);
+        chart.build_frame();
+        let axis = chart.build_axis_frame(100.0, axis_measure, countdown_measure);
+        let texts: Vec<String> = right_axis_tags(&axis)
+            .into_iter()
+            .map(|(text, _, _)| text)
+            .collect();
+        for expected in ["100", "102", "98", "99"] {
+            assert!(
+                texts.iter().any(|text| text == expected),
+                "{expected} in {texts:?}"
+            );
+        }
+        assert!(texts.iter().all(|text| !text.contains('.')), "{texts:?}");
+        assert_eq!(
+            chart.price_scale_axis_width(0, PriceScaleTarget::Right),
+            width
+        );
+    }
+
+    #[test]
+    fn order_and_price_line_tags_stack_around_the_live_price_without_covering_it() {
+        let mut chart = ChartEngine::new(800.0, 800.0, 1.0);
+        let times = [10.0, 20.0, 30.0];
+        chart
+            .set_series_data(
+                0,
+                &times,
+                &[31_434.0, 31_436.0, 31_438.0],
+                &[31_442.0, 31_442.0, 31_442.0],
+                &[31_432.0, 31_432.0, 31_432.0],
+                &[31_436.0, 31_438.0, 31_440.0],
+            )
+            .unwrap();
+        chart.time_scale.set_width(800.0);
+        chart
+            .set_instrument_metadata(InstrumentMetadata {
+                tick_size: Some(0.25),
+                ..InstrumentMetadata::default()
+            })
+            .unwrap();
+        assert!(chart.set_price_format_for_scale(0, PriceScaleTarget::Right, 2, 0.25));
+        chart.fit_content();
+        let live = 31_440.0;
+        let tick = 0.25;
+        for ticks in [3.0, 4.0, 5.0, 8.0, 12.0] {
+            chart.create_price_line(
+                0,
+                live - ticks * tick,
+                Color::rgb(200, 40, 40),
+                1,
+                aeris_charts_render::draw_list::LineStyle::Solid,
+                "",
+            );
+        }
+        let mut working = order("limit-1", OrderRole::Working, live - 2.0 * tick);
+        working.position_id = None;
+        working.bracket_id = None;
+        working.oco_group_id = None;
+        chart
+            .set_trading_snapshot(TradingSnapshot {
+                orders: vec![working.clone()],
+                ..TradingSnapshot::default()
+            })
+            .unwrap();
+        chart.build_frame();
+        let axis = chart.build_axis_frame(100.0, axis_measure, countdown_measure);
+        let tag_height = chart.axis_metrics().price_tag_height();
+        let order_y = chart
+            .trading_price_coordinate(0, TradingPriceScale::Right, working.price)
+            .unwrap();
+        let live_y = chart
+            .trading_price_coordinate(0, TradingPriceScale::Right, live)
+            .unwrap();
+        assert!(
+            order_y - live_y >= tag_height,
+            "fixture needs room at the exact price"
+        );
+        let order_tags = tags_named(&axis, "31,439.50");
+        assert_eq!(order_tags.len(), 1);
+        assert!((order_tags[0].1 + tag_height / 2.0 - order_y).abs() <= 1e-9);
+        let tags = right_axis_tags(&axis);
+        for price in [
+            "31,439.25",
+            "31,439.00",
+            "31,438.75",
+            "31,438.00",
+            "31,437.00",
+        ] {
+            assert!(
+                tags.iter().any(|(text, _, _)| text == price),
+                "{price} in {tags:?}"
+            );
+        }
+        assert_no_tag_overlap(&axis);
+    }
+
+    #[test]
+    fn neighbouring_trading_tags_stack_in_priority_order() {
+        let mut chart = chart_with_market();
+        chart.fit_content();
+        let mut first = order("limit-1", OrderRole::Working, 100.0);
+        first.position_id = None;
+        first.bracket_id = None;
+        first.oco_group_id = None;
+        let mut second = first.clone();
+        second.id = id("limit-2", OrderId::new);
+        second.price = 100.25;
+        chart
+            .set_trading_snapshot(TradingSnapshot {
+                orders: vec![first.clone(), second],
+                ..TradingSnapshot::default()
+            })
+            .unwrap();
+        chart.build_frame();
+        let axis = chart.build_axis_frame(100.0, axis_measure, countdown_measure);
+        let tag_height = chart.axis_metrics().price_tag_height();
+        let exact = chart
+            .trading_price_coordinate(0, TradingPriceScale::Right, 100.0)
+            .unwrap();
+        let lower = tags_named(&axis, "100.00");
+        let upper = tags_named(&axis, "100.25");
+        assert_eq!((lower.len(), upper.len()), (1, 1));
+        assert!((lower[0].1 + tag_height / 2.0 - exact).abs() <= 1e-9);
+        assert!(
+            upper[0].1 + tag_height <= lower[0].1 + 1e-9,
+            "stacked above its neighbour"
+        );
+        assert_no_tag_overlap(&axis);
+
+        // A position and an order on one price: the position keeps the price and paints on top,
+        // the order stacks beside it.
+        let mut held = position(PositionSide::Long);
+        held.average_price = 100.0;
+        chart
+            .set_trading_snapshot(TradingSnapshot {
+                positions: vec![held],
+                orders: vec![order("tp-1", OrderRole::TakeProfit, 100.0)],
+                ..TradingSnapshot::default()
+            })
+            .unwrap();
+        let axis = chart.build_axis_frame(100.0, axis_measure, countdown_measure);
+        let position_color = chart.trading_position_color(PositionSide::Long);
+        let tags = tags_named(&axis, "100.00");
+        assert_eq!(tags.len(), 2, "both tags readable");
+        let held_tag = tags.iter().find(|tag| tag.2 == position_color).unwrap();
+        let order_tag = tags.iter().find(|tag| tag.2 != position_color).unwrap();
+        assert!((held_tag.1 + tag_height / 2.0 - exact).abs() <= 1e-9);
+        assert!(
+            order_tag.0 < held_tag.0,
+            "the position paints over the order"
+        );
+        assert_no_tag_overlap(&axis);
+    }
+
+    #[test]
+    fn a_kline_simple_tag_yields_its_price_to_an_order_and_stacks_beside_it() {
+        // The fork's KLineChart simple tag is a drawing tag: the lowest overlap priority. It
+        // takes the nearest free slot around a working order on its price, paints under it, and
+        // never covers it or a price tick.
+        let mut chart = chart_with_market();
+        chart.fit_content();
+        let mut working = order("limit-1", OrderRole::Working, 100.0);
+        working.position_id = None;
+        working.bracket_id = None;
+        working.oco_group_id = None;
+        chart
+            .set_trading_snapshot(TradingSnapshot {
+                orders: vec![working],
+                ..TradingSnapshot::default()
+            })
+            .unwrap();
+        chart
+            .add_drawing(
+                crate::DrawingKind::SimpleTag,
+                0,
+                vec![crate::DrawingPoint {
+                    logical: 1.0,
+                    price: 100.0,
+                }],
+                Some(r#"{"text":"Support"}"#),
+            )
+            .unwrap();
+        chart.build_frame();
+        let axis = chart.build_axis_frame(100.0, axis_measure, countdown_measure);
+        let tag_height = chart.axis_metrics().price_tag_height();
+        let exact = chart
+            .trading_price_coordinate(0, TradingPriceScale::Right, 100.0)
+            .unwrap();
+        let orders = tags_named(&axis, "100.00");
+        let support = tags_named(&axis, "Support");
+        assert_eq!((orders.len(), support.len()), (1, 1), "both tags readable");
+        assert!((orders[0].1 + tag_height / 2.0 - exact).abs() <= 1e-9);
+        assert!(
+            (support[0].1 + tag_height / 2.0 - exact).abs() >= tag_height - 1e-9,
+            "the simple tag moves off the order's price"
+        );
+        assert!(support[0].0 < orders[0].0, "the order paints over the tag");
+        assert_no_tag_overlap(&axis);
+    }
+
+    #[test]
+    fn trading_tags_keep_a_price_band_ladder_under_a_selected_scale_format() {
+        // A selected scale format keeps a series' price-band ladder (the fork's tick ladders),
+        // so the series prints each band at its own precision; trading tags on that scale read
+        // the same text as the series instead of the flat selected precision.
+        let mut chart = chart_with_market();
+        assert!(chart.series_apply_price_format_json(
+            0,
+            r#"{"type":"price","tick_ladder":[{"from":0,"min_move":0.01},{"from":101,"min_move":0.5}]}"#
+        ));
+        assert!(chart.set_price_format_for_scale(0, PriceScaleTarget::Right, 0, 1.0));
+        chart.fit_content();
+        let mut low = order("limit-1", OrderRole::Working, 98.25);
+        low.position_id = None;
+        low.bracket_id = None;
+        low.oco_group_id = None;
+        let mut high = low.clone();
+        high.id = id("limit-2", OrderId::new);
+        high.price = 101.5;
+        chart
+            .set_trading_snapshot(TradingSnapshot {
+                orders: vec![low, high],
+                ..TradingSnapshot::default()
+            })
+            .unwrap();
+        chart.build_frame();
+        let axis = chart.build_axis_frame(100.0, axis_measure, countdown_measure);
+        let texts: Vec<String> = right_axis_tags(&axis)
+            .into_iter()
+            .map(|(text, _, _)| text)
+            .collect();
+        for (price, expected) in [(98.25, "98.25"), (101.5, "101.5")] {
+            assert_eq!(
+                chart.series_format_price(0, price).as_deref(),
+                Some(expected)
+            );
+            assert!(
+                texts.iter().any(|text| text == expected),
+                "{expected} in {texts:?}"
+            );
+        }
+    }
+
     #[test]
     fn touch_profile_expands_order_line_hits_to_a_44px_target() {
         let mut chart = chart_with_market();
@@ -4205,13 +4543,15 @@ pub(crate) mod tests {
         let y = chart
             .trading_price_coordinate(0, TradingPriceScale::Right, 103.0)
             .unwrap();
-        assert!(chart
-            .trading_hit_at_with_profile(
-                chart.trading_marker_start() + 20.0,
-                y + 15.0,
-                HitProfile::PRECISION,
-            )
-            .is_none());
+        assert!(
+            chart
+                .trading_hit_at_with_profile(
+                    chart.trading_marker_start() + 20.0,
+                    y + 15.0,
+                    HitProfile::PRECISION,
+                )
+                .is_none()
+        );
         assert_eq!(
             chart
                 .trading_hit_at_with_profile(
@@ -4400,12 +4740,14 @@ pub(crate) mod tests {
     fn semantic_trading_style_updates_transactionally() {
         let mut chart = chart_with_market();
         let before = chart.trading_style();
-        assert!(chart
-            .apply_trading_style(TradingStyleOptions {
-                position: Some("not-a-color".to_string()),
-                ..TradingStyleOptions::default()
-            })
-            .is_err());
+        assert!(
+            chart
+                .apply_trading_style(TradingStyleOptions {
+                    position: Some("not-a-color".to_string()),
+                    ..TradingStyleOptions::default()
+                })
+                .is_err()
+        );
         assert_eq!(chart.trading_style(), before);
         chart
             .apply_trading_style(TradingStyleOptions {
@@ -4635,9 +4977,11 @@ pub(crate) mod tests {
         let dragging = chart.build_frame();
         let segments = chart.frame_pane_segments(0).unwrap();
         let trading = &dragging.panes[0].main[segments.drawings_end..segments.trading_end];
-        assert!(trading
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "TP")));
+        assert!(
+            trading
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "TP"))
+        );
         assert!(trading.iter().all(|primitive| !matches!(
             primitive,
             Prim::Text { text, .. } if matches!(text.as_str(), "Confirm" | "Discard")
@@ -4945,13 +5289,13 @@ pub(crate) mod tests {
             let mut regions = Vec::new();
             chart.build_trading_frame_for_test(0, vpr, vpr, &mut regions, &mut out);
             for primitive in &out {
-                if let Prim::RoundRect { border_width, .. } = primitive {
-                    if *border_width > 0.0 {
-                        assert_eq!(
-                            *border_width, hairline,
-                            "outline is not a hairline at dpr {vpr}"
-                        );
-                    }
+                if let Prim::RoundRect { border_width, .. } = primitive
+                    && *border_width > 0.0
+                {
+                    assert_eq!(
+                        *border_width, hairline,
+                        "outline is not a hairline at dpr {vpr}"
+                    );
                 }
             }
         }
@@ -5337,14 +5681,18 @@ pub(crate) mod tests {
             4
         );
         for expected in ["Buy Limit", "+24.00 USD", "-24.00 USD"] {
-            assert!(trading
-                .iter()
-                .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == expected)));
+            assert!(
+                trading.iter().any(
+                    |primitive| matches!(primitive, Prim::Text { text, .. } if text == expected)
+                )
+            );
         }
         for expected in ["TP", "SL"] {
-            assert!(trading
-                .iter()
-                .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == expected)));
+            assert!(
+                trading.iter().any(
+                    |primitive| matches!(primitive, Prim::Text { text, .. } if text == expected)
+                )
+            );
         }
         assert!(trading
             .iter()
@@ -5496,13 +5844,17 @@ pub(crate) mod tests {
         let frame = chart.build_frame();
         let segments = chart.frame_pane_segments(0).unwrap();
         let trading = &frame.panes[0].main[segments.drawings_end..segments.trading_end];
-        assert!(!trading
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::VLine { x, .. } if *x == connector_x)));
-        for expected in ["+24.00", "-36.00"] {
-            assert!(trading
+        assert!(
+            !trading
                 .iter()
-                .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == expected)));
+                .any(|primitive| matches!(primitive, Prim::VLine { x, .. } if *x == connector_x))
+        );
+        for expected in ["+24.00", "-36.00"] {
+            assert!(
+                trading.iter().any(
+                    |primitive| matches!(primitive, Prim::Text { text, .. } if text == expected)
+                )
+            );
         }
     }
 
@@ -5563,9 +5915,11 @@ pub(crate) mod tests {
         assert!(trading.iter().any(
             |primitive| matches!(primitive, Prim::Text { text, .. } if text == "Close position")
         ));
-        assert!(trading
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "-12")));
+        assert!(
+            trading
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "-12"))
+        );
         let hovered_bounds = trading
             .iter()
             .find_map(|primitive| match primitive {
@@ -5646,9 +6000,11 @@ pub(crate) mod tests {
         assert_eq!(intent.kind, Some(OrderKind::Limit));
         chart.resolve_trading_intent(intent.sequence, true);
 
-        assert!(!(0..=(chart.pane_w * 2.0) as usize).any(|step| chart
-            .trading_hit_at(step as f64 / 2.0, line_y)
-            .is_some_and(|hit| hit.kind == TradingHitKind::StopLossButton)));
+        assert!(!(0..=(chart.pane_w * 2.0) as usize).any(|step| {
+            chart
+                .trading_hit_at(step as f64 / 2.0, line_y)
+                .is_some_and(|hit| hit.kind == TradingHitKind::StopLossButton)
+        }));
 
         // With both protections attached, the position line has nothing left to create.
         let mut target = order("position-target", OrderRole::TakeProfit, 103.0);
@@ -5679,9 +6035,11 @@ pub(crate) mod tests {
                 ..
             })
         ));
-        assert!(chart
-            .trading_hit_at_with_profile(cancel_x, cancel_y + 18.0, HitProfile::PRECISION)
-            .is_none());
+        assert!(
+            chart
+                .trading_hit_at_with_profile(cancel_x, cancel_y + 18.0, HitProfile::PRECISION)
+                .is_none()
+        );
         assert!(matches!(
             chart.trading_hit_at_with_profile(cancel_x, cancel_y + 18.0, HitProfile::TOUCH),
             Some(TradingHit {
@@ -5768,9 +6126,11 @@ pub(crate) mod tests {
         )));
 
         for expected in ["TP", "SL"] {
-            assert!(trading
-                .iter()
-                .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == expected)));
+            assert!(
+                trading.iter().any(
+                    |primitive| matches!(primitive, Prim::Text { text, .. } if text == expected)
+                )
+            );
         }
         // The close icon is stroked geometry — never a font glyph the host's `font_family`
         // might not carry.
@@ -5781,9 +6141,11 @@ pub(crate) mod tests {
         // The close icon is two anti-aliased strokes in the marker's semantic color. Separate
         // triangles and cap discs rendered unevenly across executors.
         let line_color = chart.trading_position_color(PositionSide::Long);
-        assert!(!trading
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::Triangle { .. } | Prim::Circle { .. })));
+        assert!(
+            !trading
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::Triangle { .. } | Prim::Circle { .. }))
+        );
         let frame = chart.build_frame();
         let icon_strokes = trading
             .iter()
@@ -5948,13 +6310,17 @@ pub(crate) mod tests {
         let y = chart
             .trading_price_coordinate(0, TradingPriceScale::Right, 101.0)
             .unwrap();
-        assert!(chart
-            .trading_hit_at(chart.trading_marker_start() + 10.0, y)
-            .is_some());
+        assert!(
+            chart
+                .trading_hit_at(chart.trading_marker_start() + 10.0, y)
+                .is_some()
+        );
         chart.set_trading_visible_account(Some(AccountId::new("account-b").unwrap()));
-        assert!(chart
-            .trading_hit_at(chart.trading_marker_start() + 10.0, y)
-            .is_none());
+        assert!(
+            chart
+                .trading_hit_at(chart.trading_marker_start() + 10.0, y)
+                .is_none()
+        );
         assert_eq!(chart.trading_snapshot().positions.len(), 2);
     }
 
@@ -6122,9 +6488,11 @@ pub(crate) mod tests {
                 ..
             }
         )));
-        assert!(chart
-            .host_event_hit_at(chart.time_scale.index_to_coordinate(2), 20.0)
-            .is_some());
+        assert!(
+            chart
+                .host_event_hit_at(chart.time_scale.index_to_coordinate(2), 20.0)
+                .is_some()
+        );
         assert!(!chart.export_state_json().unwrap().contains("release"));
 
         chart.set_replay_clock_micros(Some(20_000_000)).unwrap();
@@ -6153,9 +6521,11 @@ pub(crate) mod tests {
             0,
             "future release markers stay hidden behind the replay clock"
         );
-        assert!(chart
-            .host_event_hit_at(chart.time_scale.index_to_coordinate(2), 20.0)
-            .is_none());
+        assert!(
+            chart
+                .host_event_hit_at(chart.time_scale.index_to_coordinate(2), 20.0)
+                .is_none()
+        );
         assert_eq!(
             chart
                 .host_event_hit_at(chart.time_scale.index_to_coordinate(0), 20.0)
@@ -6180,6 +6550,70 @@ pub(crate) mod tests {
             pane_index: 0,
         })));
         assert!(chart.take_sync_events().is_empty());
+    }
+
+    #[test]
+    fn linked_charts_on_different_timeframes_converge_without_oscillation() {
+        let mut fast = ChartEngine::new(400.0, 240.0, 1.0);
+        let times = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let opens = [99.0, 100.0, 101.0, 100.0, 99.0, 100.0];
+        let highs = opens.map(|open| open + 3.0);
+        let lows = opens.map(|open| open - 1.0);
+        let closes = opens.map(|open| open + 2.0);
+        fast.set_series_data(0, &times, &opens, &highs, &lows, &closes)
+            .unwrap();
+        let mut slow = ChartEngine::new(400.0, 240.0, 1.0);
+        slow.set_series_data(
+            0,
+            &[10.0, 30.0, 50.0],
+            &[99.0, 101.0, 99.0],
+            &[103.0, 104.0, 103.0],
+            &[98.0, 99.0, 97.0],
+            &[102.0, 103.0, 101.0],
+        )
+        .unwrap();
+        slow.set_sync_mismatch_policy(crate::SyncMismatchPolicy::Nearest);
+        for chart in [&mut fast, &mut slow] {
+            chart.time_scale.set_width(400.0);
+            chart.fit_content();
+            chart.build_frame();
+            let _ = chart.take_sync_events();
+        }
+
+        assert!(fast.set_crosshair_position(102.0, 40.0, 0));
+        fast.set_visible_time_range(20.0, 50.0);
+        let mut last_revision = 0;
+        let mut rounds = 0;
+        loop {
+            let from_fast = fast.take_sync_events();
+            let from_slow = slow.take_sync_events();
+            if from_fast.is_empty() && from_slow.is_empty() {
+                break;
+            }
+            rounds += 1;
+            assert_eq!(rounds, 1, "applied events must never be re-published");
+            assert!(from_slow.is_empty());
+            for event in &from_fast {
+                assert!(event.revision > last_revision);
+                last_revision = event.revision;
+                slow.apply_external_sync_event(&event.kind);
+            }
+        }
+        assert_eq!(rounds, 1);
+        assert!(
+            slow.crosshair.is_some(),
+            "40 resolves to the nearest slow bar"
+        );
+        let (from, to) = slow.visible_time_range().unwrap();
+        assert!(from <= 30.0 && to >= 50.0, "{from}..{to}");
+
+        // The reverse direction uses the same queue discipline.
+        assert!(slow.set_crosshair_position(101.0, 30.0, 0));
+        let from_slow = slow.take_sync_events();
+        assert_eq!(from_slow.len(), 1);
+        fast.apply_external_sync_event(&from_slow[0].kind);
+        assert!(fast.take_sync_events().is_empty());
+        assert!(slow.take_sync_events().is_empty());
     }
 
     #[test]

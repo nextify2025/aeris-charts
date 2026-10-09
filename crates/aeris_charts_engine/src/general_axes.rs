@@ -3,7 +3,7 @@ use std::num::NonZeroU32;
 
 use aeris_charts_core::format::time_formatter::MonthNames;
 use aeris_charts_core::scale::general_scale::{
-    BandScale, LinearScale, LogScale, PointScale, SymLogScale, DEFAULT_SYMLOG_CONSTANT,
+    BandScale, DEFAULT_SYMLOG_CONSTANT, LinearScale, LogScale, PointScale, SymLogScale,
 };
 use aeris_charts_core::scale::time_tick_marks::{civil_from_timestamp, days_from_civil};
 use aeris_charts_core::style::DEFAULT_BORDER_RGB;
@@ -12,10 +12,10 @@ use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, Prim};
 
 use crate::{
-    axis_metrics::{AxisMetrics, AXIS_FONT_SCALE},
     AxisBand, AxisFrame, AxisLabel, AxisLabelCorners, AxisRotatedLabel, AxisTextAlign,
     AxisTextMidpoint, CategoryScaleType, ChartEngine, ChartError, ContinuousScaleType, ErrorCode,
     HorizontalDomain, PaneId, PriceScaleSide,
+    axis_metrics::{AXIS_FONT_SCALE, AxisMetrics},
 };
 
 pub const MAX_GENERAL_AXES: usize = 128;
@@ -878,20 +878,12 @@ impl ChartEngine {
                     AxisDimension::X => {
                         let from = plot.x;
                         let to = plot.x + plot.width;
-                        if axis.reverse {
-                            (to, from)
-                        } else {
-                            (from, to)
-                        }
+                        if axis.reverse { (to, from) } else { (from, to) }
                     }
                     AxisDimension::Y => {
                         let from = plot.y + plot.height;
                         let to = plot.y;
-                        if axis.reverse {
-                            (to, from)
-                        } else {
-                            (from, to)
-                        }
+                        if axis.reverse { (to, from) } else { (from, to) }
                     }
                     AxisDimension::Angle | AxisDimension::Radius => continue,
                 };
@@ -1046,10 +1038,10 @@ impl ChartEngine {
                         .into_iter()
                         .flatten()
                     {
-                        if let crate::GeneralReferenceValue::Category(value) = value {
-                            if seen.insert(value.clone()) {
-                                categories.push(value.clone());
-                            }
+                        if let crate::GeneralReferenceValue::Category(value) = value
+                            && seen.insert(value.clone())
+                        {
+                            categories.push(value.clone());
                         }
                     }
                 }
@@ -1092,10 +1084,10 @@ impl ChartEngine {
                         .into_iter()
                         .flatten()
                     {
-                        if let crate::GeneralReferenceValue::Category(value) = value {
-                            if seen.insert(value.clone()) {
-                                categories.push(value.clone());
-                            }
+                        if let crate::GeneralReferenceValue::Category(value) = value
+                            && seen.insert(value.clone())
+                        {
+                            categories.push(value.clone());
                         }
                     }
                 }
@@ -1122,23 +1114,23 @@ impl ChartEngine {
                         if series.kind() == crate::GeneralSeriesKind::ErrorBar
                             && dataset.y_is_valid(index)
                         {
-                            if let Some(low_values) = dataset.x_low() {
-                                if dataset.x_low_is_valid(index) {
-                                    let low = low_values[index] as i64;
-                                    bounds = Some(match bounds {
-                                        Some((from, to)) => (from.min(low), to.max(low)),
-                                        None => (low, low),
-                                    });
-                                }
+                            if let Some(low_values) = dataset.x_low()
+                                && dataset.x_low_is_valid(index)
+                            {
+                                let low = low_values[index] as i64;
+                                bounds = Some(match bounds {
+                                    Some((from, to)) => (from.min(low), to.max(low)),
+                                    None => (low, low),
+                                });
                             }
-                            if let Some(high_values) = dataset.x_high() {
-                                if dataset.x_high_is_valid(index) {
-                                    let high = high_values[index] as i64;
-                                    bounds = Some(match bounds {
-                                        Some((from, to)) => (from.min(high), to.max(high)),
-                                        None => (high, high),
-                                    });
-                                }
+                            if let Some(high_values) = dataset.x_high()
+                                && dataset.x_high_is_valid(index)
+                            {
+                                let high = high_values[index] as i64;
+                                bounds = Some(match bounds {
+                                    Some((from, to)) => (from.min(high), to.max(high)),
+                                    None => (high, high),
+                                });
                             }
                         }
                     }
@@ -1345,64 +1337,65 @@ impl ChartEngine {
                 .ok_or_else(|| invalid("general axis has no domain to zoom"))?;
             (axis.scale, domain)
         };
-        let view =
-            match domain {
-                GeneralAxisDomain::Numeric(domain) => {
-                    let scale = NumericAxisScale::new(scale_type, domain, 0.0, 1.0)
-                        .ok_or_else(|| invalid("general axis numeric transform is invalid"))?;
-                    let anchor = scale
-                        .coordinate(anchor_value)
-                        .filter(|value| (0.0..=1.0).contains(value))
-                        .ok_or_else(|| {
-                            invalid("general axis zoom anchor must be inside the visible domain")
-                        })?;
-                    let from_unit = anchor + (0.0 - anchor) / factor;
-                    let to_unit = anchor + (1.0 - anchor) / factor;
-                    let from = scale.invert(from_unit).ok_or_else(|| {
-                        invalid("general axis zoom exceeds the numeric transform")
+        let view = match domain {
+            GeneralAxisDomain::Numeric(domain) => {
+                let scale = NumericAxisScale::new(scale_type, domain, 0.0, 1.0)
+                    .ok_or_else(|| invalid("general axis numeric transform is invalid"))?;
+                let anchor = scale
+                    .coordinate(anchor_value)
+                    .filter(|value| (0.0..=1.0).contains(value))
+                    .ok_or_else(|| {
+                        invalid("general axis zoom anchor must be inside the visible domain")
                     })?;
-                    let to = scale.invert(to_unit).ok_or_else(|| {
-                        invalid("general axis zoom exceeds the numeric transform")
-                    })?;
-                    GeneralAxisView::Numeric([from.min(to), from.max(to)])
-                }
-                GeneralAxisDomain::Temporal(domain) => {
-                    if anchor_value.fract() != 0.0
-                        || anchor_value.abs() > MAX_GENERAL_TEMPORAL_MILLISECONDS as f64
-                    {
-                        return Err(invalid(
+                let from_unit = anchor + (0.0 - anchor) / factor;
+                let to_unit = anchor + (1.0 - anchor) / factor;
+                let from = scale
+                    .invert(from_unit)
+                    .ok_or_else(|| invalid("general axis zoom exceeds the numeric transform"))?;
+                let to = scale
+                    .invert(to_unit)
+                    .ok_or_else(|| invalid("general axis zoom exceeds the numeric transform"))?;
+                GeneralAxisView::Numeric([from.min(to), from.max(to)])
+            }
+            GeneralAxisDomain::Temporal(domain) => {
+                if anchor_value.fract() != 0.0
+                    || anchor_value.abs() > MAX_GENERAL_TEMPORAL_MILLISECONDS as f64
+                {
+                    return Err(invalid(
                         "general temporal axis zoom anchor must be a safe whole epoch millisecond",
                     ));
-                    }
-                    let scale = temporal_linear_scale(domain, 0.0, 1.0)
-                        .ok_or_else(|| invalid("general axis temporal transform is invalid"))?;
-                    let anchor = scale
-                        .coordinate(anchor_value)
-                        .filter(|value| (0.0..=1.0).contains(value))
-                        .ok_or_else(|| {
-                            invalid("general axis zoom anchor must be inside the visible domain")
-                        })?;
-                    let from_unit = anchor + (0.0 - anchor) / factor;
-                    let to_unit = anchor + (1.0 - anchor) / factor;
-                    let from = scale.invert(from_unit).ok_or_else(|| {
-                        invalid("general axis zoom exceeds the temporal transform")
+                }
+                let scale = temporal_linear_scale(domain, 0.0, 1.0)
+                    .ok_or_else(|| invalid("general axis temporal transform is invalid"))?;
+                let anchor = scale
+                    .coordinate(anchor_value)
+                    .filter(|value| (0.0..=1.0).contains(value))
+                    .ok_or_else(|| {
+                        invalid("general axis zoom anchor must be inside the visible domain")
                     })?;
-                    let to = scale.invert(to_unit).ok_or_else(|| {
-                        invalid("general axis zoom exceeds the temporal transform")
-                    })?;
-                    GeneralAxisView::Temporal(temporal_domain_from_f64(from, to).ok_or_else(
-                        || invalid("general axis zoom exceeds safe epoch milliseconds"),
-                    )?)
-                }
-                GeneralAxisDomain::Category(_) => {
-                    return Err(invalid(
-                        "category axes require a category identity zoom anchor",
-                    ));
-                }
-                GeneralAxisDomain::Auto => {
-                    return Err(invalid("general axis has no domain to zoom"));
-                }
-            };
+                let from_unit = anchor + (0.0 - anchor) / factor;
+                let to_unit = anchor + (1.0 - anchor) / factor;
+                let from = scale
+                    .invert(from_unit)
+                    .ok_or_else(|| invalid("general axis zoom exceeds the temporal transform"))?;
+                let to = scale
+                    .invert(to_unit)
+                    .ok_or_else(|| invalid("general axis zoom exceeds the temporal transform"))?;
+                GeneralAxisView::Temporal(
+                    temporal_domain_from_f64(from, to).ok_or_else(|| {
+                        invalid("general axis zoom exceeds safe epoch milliseconds")
+                    })?,
+                )
+            }
+            GeneralAxisDomain::Category(_) => {
+                return Err(invalid(
+                    "category axes require a category identity zoom anchor",
+                ));
+            }
+            GeneralAxisDomain::Auto => {
+                return Err(invalid("general axis has no domain to zoom"));
+            }
+        };
         let axis = self
             .general_axes
             .get_mut(id)
@@ -2087,16 +2080,16 @@ fn scan_general_series_numeric_bounds(
     let mut bounds: Option<(f64, f64)> = None;
     let mut include_zero = false;
     if axis.dimension == AxisDimension::Y {
-        if series.kind() == crate::GeneralSeriesKind::HeatmapGrid {
-            if let Some(values) = dataset.heatmap_y_numeric() {
-                for &value in values {
-                    if axis.scale == GeneralScaleType::Logarithmic && value <= 0.0 {
-                        continue;
-                    }
-                    extend_numeric_bounds(&mut bounds, value);
+        if series.kind() == crate::GeneralSeriesKind::HeatmapGrid
+            && let Some(values) = dataset.heatmap_y_numeric()
+        {
+            for &value in values {
+                if axis.scale == GeneralScaleType::Logarithmic && value <= 0.0 {
+                    continue;
                 }
-                return (bounds, include_zero);
+                extend_numeric_bounds(&mut bounds, value);
             }
+            return (bounds, include_zero);
         }
         if series.kind() == crate::GeneralSeriesKind::Column {
             include_zero = true;
@@ -2212,20 +2205,20 @@ fn scan_general_series_numeric_bounds(
             }
             extend_numeric_bounds(&mut bounds, value);
             if series.kind() == crate::GeneralSeriesKind::ErrorBar && dataset.y_is_valid(index) {
-                if let Some(low_values) = dataset.x_low() {
-                    if dataset.x_low_is_valid(index) {
-                        let low = low_values[index];
-                        if axis.scale != GeneralScaleType::Logarithmic || low > 0.0 {
-                            extend_numeric_bounds(&mut bounds, low);
-                        }
+                if let Some(low_values) = dataset.x_low()
+                    && dataset.x_low_is_valid(index)
+                {
+                    let low = low_values[index];
+                    if axis.scale != GeneralScaleType::Logarithmic || low > 0.0 {
+                        extend_numeric_bounds(&mut bounds, low);
                     }
                 }
-                if let Some(high_values) = dataset.x_high() {
-                    if dataset.x_high_is_valid(index) {
-                        let high = high_values[index];
-                        if axis.scale != GeneralScaleType::Logarithmic || high > 0.0 {
-                            extend_numeric_bounds(&mut bounds, high);
-                        }
+                if let Some(high_values) = dataset.x_high()
+                    && dataset.x_high_is_valid(index)
+                {
+                    let high = high_values[index];
+                    if axis.scale != GeneralScaleType::Logarithmic || high > 0.0 {
+                        extend_numeric_bounds(&mut bounds, high);
                     }
                 }
             }
@@ -3051,9 +3044,11 @@ mod tests {
             format_numeric_ticks(&[-0.5, 0.0, 0.5]),
             ["-0.5", "0", "0.5"]
         );
-        assert!(format_numeric_ticks(&[1.0e9, 2.0e9])
-            .iter()
-            .all(|label| label.contains('e')));
+        assert!(
+            format_numeric_ticks(&[1.0e9, 2.0e9])
+                .iter()
+                .all(|label| label.contains('e'))
+        );
     }
 
     #[test]
@@ -3214,9 +3209,11 @@ mod tests {
             ]))
         );
         let before_rejection = chart.general_axis_effective_domain("category-x");
-        assert!(chart
-            .zoom_general_category_axis("category-x", 2.0, "A")
-            .is_err());
+        assert!(
+            chart
+                .zoom_general_category_axis("category-x", 2.0, "A")
+                .is_err()
+        );
         assert_eq!(
             chart.general_axis_effective_domain("category-x"),
             before_rejection

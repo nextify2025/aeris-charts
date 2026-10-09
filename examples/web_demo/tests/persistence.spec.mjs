@@ -1,8 +1,5 @@
-import { test, expect } from "@playwright/test";
-
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-}
+import { expect } from "@playwright/test";
+import { test, wait_for_chart } from "./page-ready.mjs";
 
 test("persistence V1 round-trips all drawing kinds across stable multi-pane references", async ({ page }) => {
   page.on("console", (message) => console.log(`[browser:${message.type()}] ${message.text()}`));
@@ -96,4 +93,53 @@ test("persistence failures are structured, bounded, and atomic", async ({ page }
     { name: "AerisChartsError", code: "resource_limit" },
   ]);
   expect(result.after).toEqual(result.before);
+});
+
+test("V3 session studies persist the exchange calendar and a missing calendar reads as exchange", async ({ page }) => {
+  await page.goto("/?backend=canvas2d");
+  await wait_for_chart(page);
+  const result = await page.evaluate(async () => {
+    const { create_chart } = await import("/dist/aeris_charts_financial.js");
+    const start = Date.UTC(2024, 0, 1) / 1000;
+    const bars = [0, 600, 86_400, 7 * 86_400].map((offset, index) => ({
+      time: start + offset, open: 10 + index, high: 12 + index, low: 8 + index, close: 11 + index,
+    }));
+    const build = async () => {
+      const host = document.createElement("div");
+      host.style.cssText = "position:absolute;left:-10000px;width:600px;height:400px";
+      document.body.append(host);
+      const chart = await create_chart(host, { backend: "canvas2d", autoSize: false });
+      const source = chart.add_series("candlestick");
+      source.set_data(bars);
+      return { chart, host, source };
+    };
+    const studies = (chart) => chart.panes()
+      .flatMap((pane) => pane.get_series())
+      .filter((series) => series.indicator_info() !== null)
+      .map((series) => ({
+        kind: series.indicator_info().kind,
+        calendar: series.indicator_info().parameters.calendar,
+        values: series.data().map(({ value }) => value ?? null),
+      }));
+    const first = await build();
+    first.chart.add_session_levels(first.source);
+    first.chart.add_previous_period_levels(first.source, "week", "utc");
+    const state = first.chart.export_state();
+    const before = studies(first.chart);
+    // A document written without the calendar field (a host-built or older document).
+    const legacy = structuredClone(state);
+    for (const study of legacy.indicators) delete study.kind.calendar;
+    const second = await build();
+    second.chart.import_state(legacy);
+    const after = studies(second.chart);
+    for (const built of [first, second]) {
+      built.chart.remove();
+      built.host.remove();
+    }
+    return { calendars: state.indicators.map((study) => study.kind.calendar), before, after };
+  });
+  expect(result.calendars).toEqual(["exchange", "utc"]);
+  // Both studies read back as the exchange calendar, which equals UTC on this UTC chart.
+  expect(result.after.map(({ calendar }) => calendar)).toEqual(Array(result.after.length).fill("exchange"));
+  expect(result.after.map(({ values }) => values)).toEqual(result.before.map(({ values }) => values));
 });

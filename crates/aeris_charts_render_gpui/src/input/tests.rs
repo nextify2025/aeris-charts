@@ -9,11 +9,11 @@ use std::time::Duration;
 use aeris_charts_engine::{
     ChartInputEvent, ChartRegion, DrawingId, DrawingKind, DrawingPoint, InstrumentMetadata,
     InteractionOptions, OrderId, OrderKind, OrderRole, OrderSide, OrderStatus, PriceScaleTarget,
-    SeriesKind, TradingHitKind, TradingIntentAction, TradingPriceScale, TradingSnapshot,
-    WorkingOrder, TRADING_TOOLTIP_DWELL_MS,
+    SeriesKind, TRADING_TOOLTIP_DWELL_MS, TradingHitKind, TradingIntentAction, TradingPriceScale,
+    TradingSnapshot, WorkingOrder,
 };
 use aeris_charts_render::draw_list::Prim;
-use gpui::{bounds, px, size, AppContext, Entity, Keystroke, MouseButton, TestAppContext};
+use gpui::{AppContext, Entity, Keystroke, MouseButton, TestAppContext, bounds, px, size};
 
 use super::*;
 

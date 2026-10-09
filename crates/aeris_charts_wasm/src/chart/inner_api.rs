@@ -6,8 +6,9 @@ use super::*;
 use aeris_charts_engine::{
     ChartEngine, ChartError, DeviationEstimator, DrawingAnchor, DrawingMagnetMode,
     DrawingPriceSegment, ErrorCode, IndicatorConvention, IndicatorInputSource, IndicatorKind,
-    IndicatorOutputStyle, IndicatorSeed, PivotKind, SyntheticBarOptions, SyntheticSourceBar,
-    VwapReset,
+    IndicatorOutputStyle, IndicatorSeed, OrderBlockZone, PivotKind, PreviousPeriod,
+    StructureBreakOn, StructureMitigation, StructureMitigationPrice, StudyCalendarPolicy,
+    SyntheticBarOptions, SyntheticSourceBar, VwapReset,
 };
 
 fn drawing_invalid_data(message: impl Into<String>) -> ChartError {
@@ -247,108 +248,24 @@ impl ChartInner {
     }
 
     pub fn indicator_schema_json(&self, kind: &str, period: u32, deviation: f64) -> String {
-        let period = period as usize;
-        let definition = match kind {
-            "sma" => IndicatorKind::Sma { period },
-            "ema" => IndicatorKind::Ema {
-                period,
-                seed: IndicatorSeed::Sma,
-            },
-            "dema" => IndicatorKind::Dema {
-                period,
-                seed: IndicatorSeed::Sma,
-            },
-            "tema" => IndicatorKind::Tema {
-                period,
-                seed: IndicatorSeed::Sma,
-            },
-            "smma" | "rma" => IndicatorKind::Smma { period },
-            "hma" => IndicatorKind::Hma { period },
-            "vwma" => IndicatorKind::Vwma { period },
-            "standard_deviation" => IndicatorKind::StandardDeviation { period },
-            "cci" => IndicatorKind::Cci { period },
-            "williams_r" => IndicatorKind::WilliamsR { period },
-            "stochastic_rsi" => IndicatorKind::StochasticRsi {
-                rsi_period: period,
-                stochastic_period: period,
-            },
-            "momentum" => IndicatorKind::Momentum { period },
-            "roc" => IndicatorKind::RateOfChange { period },
-            "donchian" => IndicatorKind::Donchian { period },
-            "pivot_points" => {
-                let variant = match period {
-                    1 => PivotKind::Standard,
-                    2 => PivotKind::Fibonacci,
-                    3 => PivotKind::Camarilla,
-                    4 => PivotKind::Woodie,
-                    5 => PivotKind::DeMark,
-                    _ => return "null".into(),
-                };
-                IndicatorKind::PivotPoints { variant }
-            }
-            "zigzag" => IndicatorKind::ZigZag {
-                deviation_percent: deviation,
-            },
-            "keltner" => IndicatorKind::Keltner {
-                period,
-                multiplier: deviation,
-            },
-            "adx_dmi" => IndicatorKind::AdxDmi { period },
-            "parabolic_sar" => IndicatorKind::ParabolicSar,
-            "supertrend" => IndicatorKind::SuperTrend {
-                period,
-                multiplier: deviation,
-            },
-            "ichimoku" => IndicatorKind::Ichimoku,
-            "ema_ribbon" => IndicatorKind::EmaRibbon {
-                periods: [period; 5],
-            },
-            "bollinger" => IndicatorKind::Bollinger {
-                period,
-                deviation,
-                estimator: DeviationEstimator::Population,
-            },
-            "rsi" => IndicatorKind::Rsi {
-                period,
-                seed: IndicatorSeed::Sma,
-            },
-            "macd" => IndicatorKind::Macd {
-                fast: period,
-                slow: period.saturating_mul(2),
-                signal: period,
-                seed: IndicatorSeed::Sma,
-                histogram_multiplier: 1.0,
-            },
-            "kdj" => IndicatorKind::Kdj {
-                period,
-                k_smoothing: 3,
-                d_smoothing: 3,
-                seed: aeris_charts_engine::KdjSeed::Fifty,
-            },
-            "stochastic" => IndicatorKind::Stochastic {
-                k_period: period,
-                d_period: period,
-            },
-            "atr" => IndicatorKind::Atr { period },
-            "vwap" => IndicatorKind::Vwap,
-            "obv" => IndicatorKind::Obv,
-            "cmf" => IndicatorKind::Cmf { period },
-            "mfi" => IndicatorKind::Mfi { period },
-            "volume" => IndicatorKind::Volume { period },
-            "vwap_bands" => IndicatorKind::VwapBands {
-                reset: VwapReset::Session,
-                standard_deviation: deviation,
-                percent: 10.0,
-            },
-            "wma" => IndicatorKind::Wma { period },
-            // KLineChart templates (`klinechart_macd`, ...) describe their default parameters.
-            other => match aeris_charts_engine::klinechart_indicator_for_kind_name(other) {
-                Some(indicator) => IndicatorKind::KLineChart(indicator),
-                None => return "null".into(),
-            },
+        let Some(definition) = IndicatorKind::schema_definition(kind, period as usize, deviation)
+        else {
+            return "null".into();
         };
         serde_json::to_string(&ChartEngine::indicator_schema(&definition))
             .unwrap_or_else(|_| "null".into())
+    }
+
+    pub fn study_annotations_json(&self, binding: u32) -> String {
+        match self.engine.study_annotations(binding) {
+            Ok(annotations) => {
+                serde_json::to_string(&annotations).expect("finite study annotations")
+            }
+            Err(error) => {
+                serde_json::json!({ "error": error.message(), "code": error.code().name() })
+                    .to_string()
+            }
+        }
     }
 
     fn indicator_input_source(value: &str) -> Option<IndicatorInputSource> {
@@ -379,6 +296,207 @@ impl ChartInner {
     pub fn add_sma(&mut self, source_id: u32, period: u32) -> u32 {
         self.engine
             .add_sma(source_id as SeriesId, period as usize)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_aroon(&mut self, source_id: u32, period: u32) -> Vec<u32> {
+        self.engine
+            .add_aroon(source_id as SeriesId, period as usize)
+    }
+
+    pub fn add_swing_points(&mut self, source_id: u32, left: u32, right: u32) -> Vec<u32> {
+        self.engine
+            .add_swing_points(source_id as SeriesId, left as usize, right as usize)
+    }
+
+    pub fn add_session_levels(&mut self, source_id: u32, calendar: &str) -> Vec<u32> {
+        let Some(calendar) = StudyCalendarPolicy::from_name(calendar) else {
+            return Vec::new();
+        };
+        self.engine
+            .add_session_levels(source_id as SeriesId, calendar)
+    }
+
+    pub fn add_previous_period_levels(
+        &mut self,
+        source_id: u32,
+        period: &str,
+        calendar: &str,
+    ) -> Vec<u32> {
+        let (Some(period), Some(calendar)) = (
+            match period {
+                "day" => Some(PreviousPeriod::Day),
+                "week" => Some(PreviousPeriod::Week),
+                "month" => Some(PreviousPeriod::Month),
+                _ => None,
+            },
+            StudyCalendarPolicy::from_name(calendar),
+        ) else {
+            return Vec::new();
+        };
+        self.engine
+            .add_previous_period_levels(source_id as SeriesId, period, calendar)
+    }
+
+    pub fn add_opening_range(
+        &mut self,
+        source_id: u32,
+        duration_seconds: u32,
+        calendar: &str,
+    ) -> Vec<u32> {
+        let Some(calendar) = StudyCalendarPolicy::from_name(calendar) else {
+            return Vec::new();
+        };
+        self.engine
+            .add_opening_range(source_id as SeriesId, duration_seconds, calendar)
+    }
+
+    pub fn add_market_structure(
+        &mut self,
+        source_id: u32,
+        left: u32,
+        right: u32,
+        break_on: &str,
+    ) -> Vec<u32> {
+        let break_on = match break_on {
+            "close" => StructureBreakOn::Close,
+            "wick" => StructureBreakOn::Wick,
+            _ => return Vec::new(),
+        };
+        self.engine.add_market_structure(
+            source_id as SeriesId,
+            left as usize,
+            right as usize,
+            break_on,
+        )
+    }
+
+    pub fn add_fair_value_gaps(
+        &mut self,
+        source_id: u32,
+        min_size: f64,
+        mitigation: &str,
+        mitigation_price: &str,
+        max_active: u32,
+        show_mitigated: bool,
+    ) -> Vec<u32> {
+        let (Some(mitigation), Some(mitigation_price)) = (
+            Self::structure_mitigation(mitigation),
+            Self::structure_mitigation_price(mitigation_price),
+        ) else {
+            return Vec::new();
+        };
+        self.engine.add_fair_value_gaps(
+            source_id as SeriesId,
+            min_size,
+            mitigation,
+            mitigation_price,
+            max_active as usize,
+            show_mitigated,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_order_blocks(
+        &mut self,
+        source_id: u32,
+        left: u32,
+        right: u32,
+        break_on: &str,
+        zone: &str,
+        mitigation: &str,
+        mitigation_price: &str,
+        max_active: u32,
+        show_mitigated: bool,
+    ) -> Vec<u32> {
+        let break_on = match break_on {
+            "close" => StructureBreakOn::Close,
+            "wick" => StructureBreakOn::Wick,
+            _ => return Vec::new(),
+        };
+        let zone = match zone {
+            "wick" => OrderBlockZone::Wick,
+            "body" => OrderBlockZone::Body,
+            _ => return Vec::new(),
+        };
+        let (Some(mitigation), Some(mitigation_price)) = (
+            Self::structure_mitigation(mitigation),
+            Self::structure_mitigation_price(mitigation_price),
+        ) else {
+            return Vec::new();
+        };
+        self.engine.add_order_blocks(
+            source_id as SeriesId,
+            left as usize,
+            right as usize,
+            break_on,
+            zone,
+            mitigation,
+            mitigation_price,
+            max_active as usize,
+            show_mitigated,
+        )
+    }
+
+    fn structure_mitigation(value: &str) -> Option<StructureMitigation> {
+        match value {
+            "touch" => Some(StructureMitigation::Touch),
+            "half" => Some(StructureMitigation::Half),
+            "full" => Some(StructureMitigation::Full),
+            _ => None,
+        }
+    }
+
+    fn structure_mitigation_price(value: &str) -> Option<StructureMitigationPrice> {
+        match value {
+            "wick" => Some(StructureMitigationPrice::Wick),
+            "close" => Some(StructureMitigationPrice::Close),
+            _ => None,
+        }
+    }
+
+    pub fn add_awesome_oscillator(&mut self, source_id: u32) -> u32 {
+        self.engine
+            .add_awesome_oscillator(source_id as SeriesId)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_dpo(&mut self, source_id: u32, period: u32) -> u32 {
+        self.engine
+            .add_dpo(source_id as SeriesId, period as usize)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_chande_momentum(&mut self, source_id: u32, period: u32) -> u32 {
+        self.engine
+            .add_chande_momentum(source_id as SeriesId, period as usize)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_bollinger_metrics(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        deviation: f64,
+    ) -> Vec<u32> {
+        self.engine
+            .add_bollinger_metrics(source_id as SeriesId, period as usize, deviation)
+    }
+
+    pub fn add_envelopes(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        percent: f64,
+        exponential: bool,
+    ) -> Vec<u32> {
+        self.engine
+            .add_envelopes(source_id as SeriesId, period as usize, percent, exponential)
+    }
+
+    pub fn add_alma(&mut self, source_id: u32, period: u32, offset: f64, sigma: f64) -> u32 {
+        self.engine
+            .add_alma(source_id as SeriesId, period as usize, offset, sigma)
             .unwrap_or(u32::MAX)
     }
 
@@ -632,6 +750,294 @@ impl ChartInner {
         }
         self.engine
             .add_obv(source_id as SeriesId, volume_source as SeriesId)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_accumulation_distribution(&mut self, source_id: u32, volume_source: i32) -> u32 {
+        if volume_source < 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_accumulation_distribution(source_id as SeriesId, volume_source as SeriesId)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_price_volume_trend(&mut self, source_id: u32, volume_source: i32) -> u32 {
+        if volume_source < 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_price_volume_trend(source_id as SeriesId, volume_source as SeriesId)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_chaikin_oscillator(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        fast: u32,
+        slow: u32,
+    ) -> u32 {
+        if volume_source < 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_chaikin_oscillator(
+                source_id as SeriesId,
+                volume_source as SeriesId,
+                fast as usize,
+                slow as usize,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_klinger(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        fast: u32,
+        slow: u32,
+        signal: u32,
+    ) -> Vec<u32> {
+        if volume_source < 0 || fast == 0 || fast >= slow || signal == 0 {
+            return Vec::new();
+        }
+        self.engine.add_klinger(
+            source_id as SeriesId,
+            volume_source as SeriesId,
+            fast as usize,
+            slow as usize,
+            signal as usize,
+        )
+    }
+
+    pub fn add_kama(&mut self, source_id: u32, period: u32, fast: u32, slow: u32) -> u32 {
+        if period == 0 || fast == 0 || fast >= slow {
+            return u32::MAX;
+        }
+        self.engine
+            .add_kama(
+                source_id as SeriesId,
+                period as usize,
+                fast as usize,
+                slow as usize,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_mcginley(&mut self, source_id: u32, period: u32) -> u32 {
+        if period == 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_mcginley(source_id as SeriesId, period as usize)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_linear_regression(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        deviation: f64,
+    ) -> Vec<u32> {
+        if period == 0 || !deviation.is_finite() || deviation < 0.0 {
+            return Vec::new();
+        }
+        self.engine
+            .add_linear_regression(source_id as SeriesId, period as usize, deviation)
+    }
+
+    pub fn add_choppiness(&mut self, source_id: u32, period: u32) -> u32 {
+        if period < 2 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_choppiness(source_id as SeriesId, period as usize)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_atr_bands(&mut self, source_id: u32, period: u32, multiplier: f64) -> Vec<u32> {
+        if period == 0 || !multiplier.is_finite() || multiplier < 0.0 {
+            return Vec::new();
+        }
+        self.engine
+            .add_atr_bands(source_id as SeriesId, period as usize, multiplier)
+    }
+
+    pub fn add_relative_volume(&mut self, source_id: u32, volume_source: i32, period: u32) -> u32 {
+        if volume_source < 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_relative_volume(
+                source_id as SeriesId,
+                volume_source as SeriesId,
+                period as usize,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_volume_oscillator(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        fast: u32,
+        slow: u32,
+        signal: u32,
+    ) -> Vec<u32> {
+        if volume_source < 0 {
+            return Vec::new();
+        }
+        self.engine.add_volume_oscillator(
+            source_id as SeriesId,
+            volume_source as SeriesId,
+            fast as usize,
+            slow as usize,
+            signal as usize,
+        )
+    }
+
+    pub fn add_elder_force(&mut self, source_id: u32, volume_source: i32, period: u32) -> u32 {
+        if volume_source < 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_elder_force(
+                source_id as SeriesId,
+                volume_source as SeriesId,
+                period as usize,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_ease_of_movement(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        period: u32,
+        divisor: f64,
+    ) -> u32 {
+        if volume_source < 0 {
+            return u32::MAX;
+        }
+        self.engine
+            .add_ease_of_movement(
+                source_id as SeriesId,
+                volume_source as SeriesId,
+                period as usize,
+                divisor,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_historical_volatility(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        annualization: f64,
+    ) -> u32 {
+        self.engine
+            .add_historical_volatility(source_id as SeriesId, period as usize, annualization)
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_trix(&mut self, source_id: u32, period: u32, signal: u32) -> Vec<u32> {
+        self.engine
+            .add_trix(source_id as SeriesId, period as usize, signal as usize)
+    }
+
+    pub fn add_kst(
+        &mut self,
+        source_id: u32,
+        roc: [u32; 4],
+        smoothing: [u32; 4],
+        signal: u32,
+    ) -> Vec<u32> {
+        if roc
+            .iter()
+            .chain(smoothing.iter())
+            .chain([&signal])
+            .any(|&p| p == 0)
+        {
+            return Vec::new();
+        }
+        self.engine.add_kst(
+            source_id as SeriesId,
+            roc.map(|p| p as usize),
+            smoothing.map(|p| p as usize),
+            signal as usize,
+        )
+    }
+
+    pub fn add_tsi(&mut self, source_id: u32, long: u32, short: u32, signal: u32) -> Vec<u32> {
+        if [long, short, signal].contains(&0) {
+            return Vec::new();
+        }
+        self.engine.add_tsi(
+            source_id as SeriesId,
+            long as usize,
+            short as usize,
+            signal as usize,
+        )
+    }
+
+    pub fn add_mass_index(&mut self, source_id: u32, ema_period: u32, sum_period: u32) -> u32 {
+        if [ema_period, sum_period].contains(&0) {
+            return u32::MAX;
+        }
+        self.engine
+            .add_mass_index(
+                source_id as SeriesId,
+                ema_period as usize,
+                sum_period as usize,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_vortex(&mut self, source_id: u32, period: u32) -> Vec<u32> {
+        if period == 0 {
+            return Vec::new();
+        }
+        self.engine
+            .add_vortex(source_id as SeriesId, period as usize)
+    }
+
+    pub fn add_coppock_curve(
+        &mut self,
+        source_id: u32,
+        long: u32,
+        short: u32,
+        smoothing: u32,
+    ) -> u32 {
+        self.engine
+            .add_coppock_curve(
+                source_id as SeriesId,
+                long as usize,
+                short as usize,
+                smoothing as usize,
+            )
+            .unwrap_or(u32::MAX)
+    }
+
+    pub fn add_fisher_transform(&mut self, source_id: u32, period: u32) -> Vec<u32> {
+        self.engine
+            .add_fisher_transform(source_id as SeriesId, period as usize)
+    }
+
+    pub fn add_ultimate_oscillator(
+        &mut self,
+        source_id: u32,
+        short: u32,
+        medium: u32,
+        long: u32,
+    ) -> u32 {
+        self.engine
+            .add_ultimate_oscillator(
+                source_id as SeriesId,
+                short as usize,
+                medium as usize,
+                long as usize,
+            )
             .unwrap_or(u32::MAX)
     }
 
@@ -1015,10 +1421,8 @@ impl ChartInner {
             // frame-rate console flood.
             telemetry.count_ring_dropped_rows(dropped);
         }
-        if had_work {
-            if let (Some(clock), Some(start)) = (clock.as_ref(), started) {
-                telemetry.add_pending_ingest_ms(clock.now() - start);
-            }
+        if had_work && let (Some(clock), Some(start)) = (clock.as_ref(), started) {
+            telemetry.add_pending_ingest_ms(clock.now() - start);
         }
         total
     }
@@ -1297,10 +1701,10 @@ impl ChartInner {
 
     /// Set a line/area series' stroke width (css px; non-positive ignored).
     pub fn set_series_line_width(&mut self, id: u32, width: f64) {
-        if width > 0.0 {
-            if let Some(s) = self.series.iter_mut().find(|s| s.id == id as SeriesId) {
-                s.line_width = Some(width);
-            }
+        if width > 0.0
+            && let Some(s) = self.series.iter_mut().find(|s| s.id == id as SeriesId)
+        {
+            s.line_width = Some(width);
         }
     }
 
@@ -1645,16 +2049,19 @@ impl ChartInner {
 
     pub fn import_state_result_json(&mut self, document: &str) -> String {
         match self.engine.import_state_json(document) {
-            Ok(result) => serde_json::json!({
-                "ok": true,
-                "result": {
+            Ok(result) => {
+                let mut summary = serde_json::json!({
                     "schema_version": result.schema_version,
                     "panes": result.panes,
                     "drawings": result.drawings,
                     "points": result.points,
+                });
+                if result.schema_version == 3 {
+                    summary["unresolved_custom_studies"] =
+                        serde_json::json!(result.unresolved_custom_studies);
                 }
-            })
-            .to_string(),
+                serde_json::json!({ "ok": true, "result": summary }).to_string()
+            }
             Err(error) => serde_json::json!({
                 "ok": false,
                 "error": { "code": error.code().name(), "message": error.message() }
@@ -1721,16 +2128,16 @@ impl ChartInner {
         });
         self.engine.invalidate_axis_frame();
         self.axis_dirty = true;
-        if let Ok(hook) = js_sys::Reflect::get(&primitive, &"attached".into()) {
-            if let Ok(hook) = hook.dyn_into::<js_sys::Function>() {
-                let params = js_sys::Object::new();
-                let _ = js_sys::Reflect::set(&params, &"pane_index".into(), &pane.into());
-                if let Err(error) = hook.call1(&primitive, &params) {
-                    web_sys::console::warn_1(
-                        &format!("aeris_charts: pane primitive `attached` hook threw — {error:?}")
-                            .into(),
-                    );
-                }
+        if let Ok(hook) = js_sys::Reflect::get(&primitive, &"attached".into())
+            && let Ok(hook) = hook.dyn_into::<js_sys::Function>()
+        {
+            let params = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&params, &"pane_index".into(), &pane.into());
+            if let Err(error) = hook.call1(&primitive, &params) {
+                web_sys::console::warn_1(
+                    &format!("aeris_charts: pane primitive `attached` hook threw — {error:?}")
+                        .into(),
+                );
             }
         }
         id
@@ -1746,15 +2153,13 @@ impl ChartInner {
         let entry = self.primitives.remove(position);
         self.engine.invalidate_axis_frame();
         self.axis_dirty = true;
-        if let Ok(hook) = js_sys::Reflect::get(&entry.obj, &"detached".into()) {
-            if let Ok(hook) = hook.dyn_into::<js_sys::Function>() {
-                if let Err(error) = hook.call0(&entry.obj) {
-                    web_sys::console::warn_1(
-                        &format!("aeris_charts: pane primitive `detached` hook threw — {error:?}")
-                            .into(),
-                    );
-                }
-            }
+        if let Ok(hook) = js_sys::Reflect::get(&entry.obj, &"detached".into())
+            && let Ok(hook) = hook.dyn_into::<js_sys::Function>()
+            && let Err(error) = hook.call0(&entry.obj)
+        {
+            web_sys::console::warn_1(
+                &format!("aeris_charts: pane primitive `detached` hook threw — {error:?}").into(),
+            );
         }
         true
     }
@@ -1788,25 +2193,23 @@ impl ChartInner {
         });
         self.engine.invalidate_axis_frame();
         self.axis_dirty = true;
-        if let Ok(hook) = js_sys::Reflect::get(&primitive, &"attached".into()) {
-            if let Ok(hook) = hook.dyn_into::<js_sys::Function>() {
-                let params = js_sys::Object::new();
-                let _ = js_sys::Reflect::set(&params, &"series_id".into(), &series_id.into());
-                if pane_index < self.panes.len() {
-                    let _ = js_sys::Reflect::set(
-                        &params,
-                        &"pane_index".into(),
-                        &(pane_index as u32).into(),
-                    );
-                }
-                if let Err(error) = hook.call1(&primitive, &params) {
-                    web_sys::console::warn_1(
-                        &format!(
-                            "aeris_charts: series primitive `attached` hook threw — {error:?}"
-                        )
+        if let Ok(hook) = js_sys::Reflect::get(&primitive, &"attached".into())
+            && let Ok(hook) = hook.dyn_into::<js_sys::Function>()
+        {
+            let params = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&params, &"series_id".into(), &series_id.into());
+            if pane_index < self.panes.len() {
+                let _ = js_sys::Reflect::set(
+                    &params,
+                    &"pane_index".into(),
+                    &(pane_index as u32).into(),
+                );
+            }
+            if let Err(error) = hook.call1(&primitive, &params) {
+                web_sys::console::warn_1(
+                    &format!("aeris_charts: series primitive `attached` hook threw — {error:?}")
                         .into(),
-                    );
-                }
+                );
             }
         }
         id
@@ -2345,14 +2748,13 @@ impl ChartInner {
         // `localization.locale` needs the host's `Intl` (the engine is headless), so it is
         // intercepted here; the engine routes `localization.dateFormat` itself and the store
         // keeps both keys for the options round-trip.
-        if let Ok(patch) = serde_json::from_str::<serde_json::Value>(patch_json) {
-            if let Some(locale) = patch
+        if let Ok(patch) = serde_json::from_str::<serde_json::Value>(patch_json)
+            && let Some(locale) = patch
                 .get("localization")
                 .and_then(|l| l.get("locale"))
                 .and_then(serde_json::Value::as_str)
-            {
-                self.set_locale(locale);
-            }
+        {
+            self.set_locale(locale);
         }
         if let Err(e) = self.engine.apply_options(patch_json) {
             web_sys::console::warn_1(
@@ -2880,10 +3282,6 @@ impl ChartInner {
     }
     pub fn drawing_magnet_mode(&self) -> u8 {
         drawing_magnet_to_u8(self.engine.drawing_magnet_mode())
-    }
-    /// Effective magnet for the armed tool's next placement with the Ctrl/Cmd toggle state.
-    pub fn armed_drawing_magnet(&self, toggle: bool) -> u8 {
-        drawing_magnet_to_u8(self.engine.armed_drawing_magnet(toggle))
     }
     /// Keyboard handle count of a drawing, or -1 for an unknown/unplaceable drawing.
     pub fn drawing_handle_count(&self, id: u32) -> i32 {
@@ -3561,14 +3959,12 @@ fn locale_month_names(locale: &str) -> Option<([String; 12], [String; 12])> {
 /// Fire a detached primitive's `detached` hook (shared by the series-primitive detach paths);
 /// a throwing hook is only reported.
 fn fire_primitive_detached(obj: &js_sys::Object) {
-    if let Ok(hook) = js_sys::Reflect::get(obj, &"detached".into()) {
-        if let Ok(hook) = hook.dyn_into::<js_sys::Function>() {
-            if let Err(error) = hook.call0(obj) {
-                web_sys::console::warn_1(
-                    &format!("aeris_charts: series primitive `detached` hook threw — {error:?}")
-                        .into(),
-                );
-            }
-        }
+    if let Ok(hook) = js_sys::Reflect::get(obj, &"detached".into())
+        && let Ok(hook) = hook.dyn_into::<js_sys::Function>()
+        && let Err(error) = hook.call0(obj)
+    {
+        web_sys::console::warn_1(
+            &format!("aeris_charts: series primitive `detached` hook threw — {error:?}").into(),
+        );
     }
 }

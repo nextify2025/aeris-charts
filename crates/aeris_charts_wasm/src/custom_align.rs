@@ -7,7 +7,7 @@
 //! the row ↔ item mapping never drifts; this module is that mapping's single source of truth.
 
 use aeris_charts_core::model::data_validation::{
-    validate_timestamp, ValidationError, ValidationReport,
+    ValidationError, ValidationReport, validate_timestamp,
 };
 
 /// Sanitize `(time, item)` pairs into ascending, unique rows, carrying each item through its

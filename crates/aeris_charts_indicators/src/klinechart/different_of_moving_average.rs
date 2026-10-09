@@ -1,8 +1,8 @@
 //! `DMA` (平行线差). Ported from KLineChart
 //! `src/extension/indicator/differentOfMovingAverage.ts`.
 
-use super::stepper::{fold, rolling_mean_step, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold, rolling_mean_step};
 
 /// DMA outputs in KLineChart figure order.
 #[derive(Clone, Debug, PartialEq)]

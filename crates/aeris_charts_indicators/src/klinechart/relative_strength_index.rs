@@ -1,8 +1,8 @@
 //! `RSI` (相对强弱指标). Ported from KLineChart
 //! `src/extension/indicator/relativeStrengthIndex.ts`.
 
-use super::stepper::{fold, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold};
 use crate::MAX_OUTPUTS;
 
 /// The Wilder state of one period: the running sums that seed the averages on row `N`, then the

@@ -13,13 +13,13 @@
 //! unobservable. The adapter therefore must *not* wrap the chart in `Window::paint_layer`: a layer
 //! forces every primitive inside it to share one order, which would flatten the chart's z-order.
 
-use aeris_charts_render::draw_list::{positive_finite_extent, LineStyle, Prim};
+use aeris_charts_render::draw_list::{LineStyle, Prim, positive_finite_extent};
 use aeris_charts_render::line::{normalized_round_rect_radii, round_rect_border};
 
 use crate::geometry::{
-    area_fill_mesh, area_fringe_gradient, band_fill_mesh, dash_spans, dashed_polyline_meshes,
-    disc_mesh, fill_polygon, irect, line_span_start, polyline_mesh, rect_frame_edges, ring_mesh,
-    round_rect_polygon, round_rect_ring_mesh, segments_mesh, Scratch,
+    Scratch, area_fill_mesh, area_fringe_gradient, band_fill_mesh, dash_spans,
+    dashed_polyline_meshes, disc_mesh, fill_polygon, irect, line_span_start, polyline_mesh,
+    rect_frame_edges, ring_mesh, round_rect_polygon, round_rect_ring_mesh, segments_mesh,
 };
 use crate::metrics::GpuiFrameMetrics;
 use crate::scene::{DeviceRect, Paint, SceneOp, ScenePlan, TextRun};
@@ -396,6 +396,10 @@ fn lower_prim(
             rect,
             opacity,
         } => {
+            let opacity = aeris_charts_render::draw_list::quantize_image_opacity(*opacity);
+            if opacity == 0.0 {
+                return;
+            }
             let Some(rect) = aeris_charts_render::draw_list::snap_image_rect(*rect) else {
                 return;
             };
@@ -403,7 +407,6 @@ fn lower_prim(
             if rect.is_empty()
                 || image.width == 0
                 || image.height == 0
-                || *opacity <= 0.0
                 || image.pixels.len() != (image.width * image.height * 4) as usize
             {
                 return;
@@ -411,7 +414,7 @@ fn lower_prim(
             plan.ops.push(SceneOp::Image {
                 image: image.clone(),
                 rect,
-                opacity: opacity.clamp(0.0, 1.0),
+                opacity,
             });
             metrics.image_runs += 1;
             metrics.ops += 1;
@@ -1052,11 +1055,7 @@ mod tests {
                 };
                 distance = distance.min((p[0] - a[0] - d[0] * t).hypot(p[1] - a[1] - d[1] * t));
             }
-            if inside {
-                -distance
-            } else {
-                distance
-            }
+            if inside { -distance } else { distance }
         };
         // GPUI's path shader: `alpha = saturate(0.5 - (s² - t))` for a unit distance gradient.
         let coverage = |st: [f32; 2]| (0.5 - (st[0] * st[0] - st[1])).clamp(0.0, 1.0);
@@ -1249,7 +1248,39 @@ mod tests {
         };
         assert_eq!(image.key, 9);
         assert_eq!(*rect, DeviceRect::new(10.0, 20.0, 30.0, 40.0));
-        assert_eq!(*opacity, 0.25);
+        assert_eq!(*opacity, 64.0 / 255.0);
+    }
+
+    #[test]
+    fn image_with_zero_quantized_opacity_never_enters_the_gpui_scene() {
+        let image = RasterImage {
+            key: 10,
+            width: 1,
+            height: 1,
+            pixels: Arc::<[u8]>::from([1, 2, 3, 255]),
+        };
+        for opacity in [-1.0, 0.0, 0.001] {
+            let (plan, metrics) = run(
+                &[Prim::Image {
+                    image: image.clone(),
+                    rect: [10.0, 20.0, 30.0, 40.0],
+                    opacity,
+                }],
+                &[],
+            );
+            assert!(plan.ops.is_empty(), "{opacity}");
+            assert_eq!(metrics.image_runs, 0);
+        }
+        let (plan, metrics) = run(
+            &[Prim::Image {
+                image,
+                rect: [10.0, 20.0, 30.0, 40.0],
+                opacity: 1.0 / 255.0,
+            }],
+            &[],
+        );
+        assert_eq!(plan.ops.len(), 1);
+        assert_eq!(metrics.image_runs, 1);
     }
 
     #[test]

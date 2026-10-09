@@ -63,6 +63,10 @@ impl ChartEngine {
             return false;
         }
         let options = self.price_scale_options_json(pane, from);
+        let entry = &mut self.panes[pane];
+        if let Some(format) = entry.explicit_price_format(from) {
+            entry.set_explicit_price_format(to, Some(format));
+        }
         for id in ids {
             self.set_series_price_scale(id, to);
         }
@@ -259,6 +263,7 @@ impl ChartEngine {
         };
         let side = pane.named_scales[index].side;
         pane.named_scales.remove(index);
+        pane.set_explicit_price_format(target, None);
         let targets = pane.ordered_side_targets(side);
         for (order, candidate) in targets.into_iter().enumerate() {
             pane.set_scale_order(candidate, order);
@@ -270,9 +275,9 @@ impl ChartEngine {
     pub fn price_scales(&self, pane_index: usize) -> Option<Vec<PriceScaleInfo>> {
         let pane = self.panes.get(pane_index)?;
         let mut targets: Vec<_> = pane.scale_targets().collect();
-        targets.sort_by_key(|target| match pane.scale_side(*target) {
-            Some(PriceScaleSide::Left) => (0, pane.scale_order(*target).unwrap_or(0)),
-            Some(PriceScaleSide::Right) => (1, pane.scale_order(*target).unwrap_or(0)),
+        crate::sort_scale_targets(&mut targets, &|target| match pane.scale_side(target) {
+            Some(PriceScaleSide::Left) => (0, pane.scale_order(target).unwrap_or(0)),
+            Some(PriceScaleSide::Right) => (1, pane.scale_order(target).unwrap_or(0)),
             None => (2, 0),
         });
         Some(
@@ -645,6 +650,7 @@ impl ChartEngine {
             return;
         };
         if previous != target {
+            self.adopt_scale_price_format(id);
             // Both the scale the series left and the one it joined refit exactly.
             self.reset_scale_stabilization_at(pane_index, previous);
             self.reset_scale_stabilization_at(pane_index, target);
@@ -677,10 +683,10 @@ impl ChartEngine {
                 .and_then(serde_json::Value::as_f64)
                 .filter(|v| v.is_finite())
         };
-        if let Some(visible) = flag("visible") {
-            if !self.set_price_scale_visible_for(pane, target, visible) {
-                return false;
-            }
+        if let Some(visible) = flag("visible")
+            && !self.set_price_scale_visible_for(pane, target, visible)
+        {
+            return false;
         }
         let Some(scale) = self.price_scale_for_mut(pane, target) else {
             return false;

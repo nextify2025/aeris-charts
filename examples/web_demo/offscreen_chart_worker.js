@@ -363,6 +363,13 @@ self.onmessage = async (event) => {
       chart = null;
       postMessage({ type: "as_of_overlay_update", results });
       return;
+    } else if (message.type === "custom_study_unsupported") {
+      const errors = [];
+      for (const method of ["register_custom_study", "add_custom_study"]) {
+        try { chart[method](); } catch (error) { errors.push({ name: error.name, code: error.code }); }
+      }
+      postMessage({ type: "custom_study_unsupported", errors, series_ids: JSON.parse(chart.wasm.series_order_json()) });
+      return;
     } else if (message.type === "remove") {
       if (timer !== null) clearInterval(timer);
       timer = null;

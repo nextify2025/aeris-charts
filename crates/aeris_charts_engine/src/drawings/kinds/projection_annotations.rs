@@ -27,7 +27,7 @@ use aeris_charts_render::shape::Point;
 
 use super::super::handles::{DrawingHandle, HandleDrag};
 use super::super::parts::{
-    text_lines, DrawingParts, PartContext, PartLabel, PartStroke, STATS_ALPHA, STATS_PADDING,
+    DrawingParts, PartContext, PartLabel, PartStroke, STATS_ALPHA, STATS_PADDING, text_lines,
 };
 use super::super::tools::{
     DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
@@ -572,7 +572,7 @@ pub(crate) fn fork_text_box(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
         Body::SpeechTail { corners: [tip, ..] } => {
             let prefix = match (drawing.kind, drawing.points.first()) {
                 (DrawingKind::PriceLabel, Some(point)) => {
-                    vec![ctx.engine.drawing_price_text(drawing, point.price)]
+                    vec![ctx.engine.format_drawing_price(drawing, point.price)]
                 }
                 _ => Vec::new(),
             };
@@ -608,7 +608,7 @@ pub(crate) fn fork_text_box(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
                 ),
                 DrawingTextVAlign::Bottom => (reference.bottom + pad, DrawingTextVAlign::Top),
             };
-            let price = ctx.engine.drawing_price_text(drawing, point.price);
+            let price = ctx.engine.format_drawing_price(drawing, point.price);
             let (lines, first_line) = with_text(ctx, vec![price]);
             parts.text_label(
                 text_box(
@@ -696,7 +696,7 @@ pub(crate) fn forecast_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
     parts.label(ctx.stats_box(
         (if forward { a.0 - gap } else { a.0 + gap }, a.1),
         (side(!forward), DrawingTextVAlign::Middle),
-        vec![ctx.engine.drawing_price_text(drawing, source.price)],
+        vec![ctx.engine.format_drawing_price(drawing, source.price)],
         None,
         text,
     ));
@@ -737,7 +737,7 @@ fn forecast_target_lines(
     };
     let change = target.price - source.price;
     let sign = if change > 0.0 { "+" } else { "" };
-    let mut first = format!("{sign}{}", engine.drawing_price_text(drawing, change));
+    let mut first = format!("{sign}{}", engine.format_drawing_price(drawing, change));
     if source.price.abs() > f64::EPSILON {
         first.push_str(&format!(" ({:+.2}%)", change / source.price.abs() * 100.0));
     }
@@ -974,24 +974,23 @@ pub(crate) fn forecast_status(engine: &ChartEngine, drawing: &Drawing) -> Option
     }
     let plot = rows.plot;
     let data_last = plot.index_at(plot.last_non_whitespace_row_before(plot.size())?)?;
-    if first_index <= last_index.min(data_last) {
-        if let (Some(first_row), Some(last_row)) = (
+    if first_index <= last_index.min(data_last)
+        && let (Some(first_row), Some(last_row)) = (
             plot.first_non_whitespace_row(first_index),
             plot.last_non_whitespace_row(last_index.min(data_last)),
-        ) {
-            if first_row <= last_row {
-                let hit = match plot.lod() {
-                    Some(lod) => lod
-                        .rows_on_range(first_row..last_row + 1, usize::MAX)
-                        .0
-                        .iter()
-                        .any(reached),
-                    None => (first_row..=last_row).any(reached),
-                };
-                if hit {
-                    return Some(true);
-                }
-            }
+        )
+        && first_row <= last_row
+    {
+        let hit = match plot.lod() {
+            Some(lod) => lod
+                .rows_on_range(first_row..last_row + 1, usize::MAX)
+                .0
+                .iter()
+                .any(reached),
+            None => (first_row..=last_row).any(reached),
+        };
+        if hit {
+            return Some(true);
         }
     }
     (data_last > last_index).then_some(false)
@@ -1305,10 +1304,12 @@ pub(crate) fn follow_anchor_drag(
     points: &mut [crate::DrawingPoint],
 ) {
     let coincident = matches!(start_points, [foot, top] if foot == top);
-    if index == 0 && drawing.kind == DrawingKind::Signpost && coincident {
-        if let [foot, top, ..] = points {
-            *top = *foot;
-        }
+    if index == 0
+        && drawing.kind == DrawingKind::Signpost
+        && coincident
+        && let [foot, top, ..] = points
+    {
+        *top = *foot;
     }
 }
 
@@ -1329,7 +1330,7 @@ pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing
         drawing
             .points
             .first()
-            .map(|point| engine.drawing_price_text(drawing, point.price))
+            .map(|point| engine.format_drawing_price(drawing, point.price))
     };
     match drawing.kind {
         DrawingKind::Projection if drawing.labels.iter().any(|label| label.visible) => {

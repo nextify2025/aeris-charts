@@ -4,10 +4,10 @@
 //! shared `lane_layout`, and snapping to device pixels happens only here.
 
 use super::*;
+use crate::TimelineGlyphShape;
 use crate::timeline_marks::{
     TIMELINE_GLYPH_TEXT_CSS, TIMELINE_LANE_BOTTOM_GAP_CSS, TIMELINE_LANE_HEIGHT_CSS,
 };
-use crate::TimelineGlyphShape;
 
 /// Hover ring radius beyond the token box (CSS px).
 const RING_INSET_CSS: f64 = 2.0;

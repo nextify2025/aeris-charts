@@ -25,12 +25,12 @@ use aeris_charts_engine::{
     IndicatorOutputStyle, OrderId, OrderKind, OrderRole, OrderSide, OrderStatus, PositionId,
     PositionSide, SeriesKind, TradingPosition, TradingPriceScale, WorkingOrder,
 };
-use aeris_charts_render::canvas2d::{execute as canvas_execute, Canvas2d, Viewport};
+use aeris_charts_render::canvas2d::{Canvas2d, Viewport, execute as canvas_execute};
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{Gradient, IRect, LineStyle, LineType, Prim, TextAlign};
 use aeris_charts_render_gpui::{
-    fixtures, ExecutorOptions, GpuiChartRenderer, GpuiFrameMetrics, Paint, PreparedAerisFrame,
-    SceneOp, ScenePlan,
+    ExecutorOptions, GpuiChartRenderer, GpuiFrameMetrics, Paint, PreparedAerisFrame, SceneOp,
+    ScenePlan, fixtures,
 };
 
 /// A Canvas2D target that records only what the crisp-rect subset does: the current fill style and
@@ -591,6 +591,33 @@ fn tessellated_prims_take_the_path_route_on_both_backends() {
                 border_color: Color::rgb(220, 30, 20),
             },
         ),
+        // The footprint point-of-control outline: square corners, a transparent fill, and only
+        // the inside border painted, so the row's numbers stay readable.
+        (
+            "Outlined RoundRect",
+            Prim::RoundRect {
+                x: 1.0,
+                y: 1.0,
+                w: 20.0,
+                h: 10.0,
+                radii: [0.0; 4],
+                fill: Color::rgba(0, 0, 0, 0),
+                border_width: 2.0,
+                border_color: Color::rgb(220, 30, 20),
+            },
+        ),
+        // A big-trades bubble: translucent fill under a translucent stroke.
+        (
+            "Alpha stroked Circle",
+            Prim::Circle {
+                cx: 10.0,
+                cy: 10.0,
+                radius: 6.0,
+                fill: Color::rgba(30, 90, 150, 0x60),
+                stroke_width: 1.0,
+                stroke: Color::rgba(30, 90, 150, 0xd0),
+            },
+        ),
     ];
     for (name, prim) in cases {
         let prims = [prim];
@@ -670,6 +697,19 @@ fn gpui_meshes_contain_the_webgpu_contract_vertices_for_each_shape() {
                 h: 20.0,
                 radii: [4.0; 4],
                 fill: c,
+                border_width: 2.0,
+                border_color: Color::rgb(80, 20, 20),
+            },
+        ),
+        (
+            "Outlined RoundRect",
+            Prim::RoundRect {
+                x: 4.0,
+                y: 5.0,
+                w: 30.0,
+                h: 20.0,
+                radii: [0.0; 4],
+                fill: Color::rgba(0, 0, 0, 0),
                 border_width: 2.0,
                 border_color: Color::rgb(80, 20, 20),
             },
@@ -902,10 +942,11 @@ fn native_golden_scene_reaches_canvas_and_gpui_with_no_dropped_primitives() {
     assert!(canvas.path_fills > 0 && canvas.path_strokes > 0);
     assert_eq!(canvas.images.len(), 1);
     assert_eq!(canvas.text_runs.len(), 1);
-    assert!(plan
-        .ops
-        .iter()
-        .any(|op| matches!(op, SceneOp::Image { .. })));
+    assert!(
+        plan.ops
+            .iter()
+            .any(|op| matches!(op, SceneOp::Image { .. }))
+    );
     assert!(plan.ops.iter().any(|op| matches!(op, SceneOp::Text(_))));
     assert!(plan.ops.iter().any(|op| matches!(op, SceneOp::Mesh { .. })));
 }
@@ -947,6 +988,66 @@ fn text_runs_reach_both_backends_with_the_same_font_and_anchor() {
         ),
         *font
     );
+}
+
+/// A big-trades bubble with its volume centred on it: the translucent circle tessellates on both
+/// backends, and the label follows it with the same anchor, alignment and color.
+#[test]
+fn centred_text_over_an_alpha_circle_reaches_both_backends_in_order() {
+    let prims = [
+        Prim::Circle {
+            cx: 40.0,
+            cy: 30.0,
+            radius: 12.0,
+            fill: Color::rgba(0x26, 0xa6, 0x9a, 0x60),
+            stroke_width: 1.0,
+            stroke: Color::rgba(0x26, 0xa6, 0x9a, 0xd0),
+        },
+        Prim::Text {
+            x: 40.0,
+            y: 30.0,
+            text: "1.2K".into(),
+            color: Color::rgb(0xff, 0xff, 0xff),
+            size: 11.0,
+            family: "sans-serif".into(),
+            align: TextAlign::Center,
+            weight: 600,
+            italic: false,
+        },
+    ];
+    let canvas = canvas_rects(&prims, &[]);
+    let (plan, metrics) = gpui_plan(&prims, &[]);
+    assert_eq!(metrics.dropped_prims, 0);
+    assert!(canvas.path_fills > 0 && canvas.path_strokes > 0);
+    assert!(canvas.rects.is_empty() && metrics.quads == 0);
+    assert_eq!(canvas.text_runs.len(), 1);
+    assert_eq!(metrics.text_runs, 1);
+    let text_op = plan
+        .ops
+        .iter()
+        .position(|op| matches!(op, SceneOp::Text(_)))
+        .expect("the label reaches GPUI");
+    assert!(
+        plan.ops[..text_op]
+            .iter()
+            .any(|op| matches!(op, SceneOp::Mesh { .. })),
+        "the bubble is drawn before its label"
+    );
+    assert!(
+        !plan.ops[text_op..]
+            .iter()
+            .any(|op| matches!(op, SceneOp::Mesh { .. })),
+        "nothing of the bubble covers its label"
+    );
+    let (text, x, y, _, color, align) = &canvas.text_runs[0];
+    let SceneOp::Text(run) = &plan.ops[text_op] else {
+        unreachable!();
+    };
+    assert_eq!(run.text, *text);
+    assert_eq!((run.x, run.y), (*x, *y));
+    assert_eq!(run.color, *color);
+    assert_eq!(run.align, *align);
+    assert_eq!(run.align, TextAlign::Center);
 }
 
 #[test]
@@ -1366,14 +1467,18 @@ fn error_bar_engine_frame_reaches_canvas_and_gpui_stroke_and_point_routes() {
             2,
             "DPR {dpr}: missing observation must not emit a mark"
         );
-        assert!(pane_frame
-            .main
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::HLine { .. })));
-        assert!(pane_frame
-            .main
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::VLine { .. })));
+        assert!(
+            pane_frame
+                .main
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::HLine { .. }))
+        );
+        assert!(
+            pane_frame
+                .main
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::VLine { .. }))
+        );
         let canvas = canvas_rects(&pane_frame.main, &pane_frame.points);
         let (_plan, metrics) = gpui_plan(&pane_frame.main, &pane_frame.points);
         assert_eq!(
@@ -1537,14 +1642,18 @@ fn category_box_plot_frame_reaches_canvas_and_gpui_without_dropped_primitives() 
             2,
             "DPR {dpr}: only complete rows emit IQR boxes"
         );
-        assert!(pane_frame
-            .main
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::HLine { .. })));
-        assert!(pane_frame
-            .main
-            .iter()
-            .any(|primitive| matches!(primitive, Prim::VLine { .. })));
+        assert!(
+            pane_frame
+                .main
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::HLine { .. }))
+        );
+        assert!(
+            pane_frame
+                .main
+                .iter()
+                .any(|primitive| matches!(primitive, Prim::VLine { .. }))
+        );
 
         let canvas = canvas_rects(&pane_frame.main, &pane_frame.points);
         let (_plan, metrics) = gpui_plan(&pane_frame.main, &pane_frame.points);
@@ -2450,5 +2559,227 @@ fn odd_even_and_fractional_viewport_geometry_stays_draw_call_identical() {
                 .unwrap_or_else(|e| panic!("{w}x{h} @ DPR {dpr}: {e}"));
             assert_eq!(m.dropped_prims, 0, "{w}x{h} @ DPR {dpr} dropped a prim");
         }
+    }
+}
+
+/// A candle chart carrying every B9 study and auction glyph the engine draws with existing prims:
+/// fair-value-gap fills and frames, dashed structure strokes with their BOS/CHoCH labels, swing
+/// arrows, custom Marker circles, and auction triangles, circles, ABS frames, and revisit rays.
+fn studies_and_auction_engine(dpr: f64) -> ChartEngine {
+    use aeris_charts_engine::{
+        AggressorSide, AuctionMarkerOptions, CustomStudyDefinition, CustomStudyFault,
+        CustomStudyInput, CustomStudyOutput, CustomStudyPane, CustomStudyPlot, CustomStudyRuntime,
+        FootprintAggregationOptions, FootprintTrade, StructureBreakOn, StructureMitigation,
+        StructureMitigationPrice,
+    };
+    struct EveryFifthClose;
+    impl CustomStudyRuntime for EveryFifthClose {
+        fn compute(
+            &mut self,
+            input: CustomStudyInput<'_>,
+            out: &mut [Vec<f64>],
+        ) -> Result<(), CustomStudyFault> {
+            for row in input.from..input.times.len() {
+                out[0].push(if row % 5 == 0 {
+                    input.close[row]
+                } else {
+                    f64::NAN
+                });
+            }
+            Ok(())
+        }
+    }
+    let mut engine = ChartEngine::new(900.0, 520.0, dpr);
+    let n = 120usize;
+    let times: Vec<f64> = (0..n).map(|i| 1_600_000_020.0 + i as f64 * 60.0).collect();
+    // Steps every twelve bars open gaps, break structure, and leave unrevisited auction edges.
+    let close: Vec<f64> = (0..n)
+        .map(|i| 100.0 + (i as f64 * 0.4).sin() * 3.0 + (i / 12) as f64 * 4.0)
+        .collect();
+    let open: Vec<f64> = (0..n)
+        .map(|i| if i == 0 { close[0] } else { close[i - 1] })
+        .collect();
+    let high: Vec<f64> = open
+        .iter()
+        .zip(&close)
+        .map(|(o, c)| o.max(*c) + 1.0)
+        .collect();
+    let low: Vec<f64> = open
+        .iter()
+        .zip(&close)
+        .map(|(o, c)| o.min(*c) - 1.0)
+        .collect();
+    engine
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .expect("candles load");
+    engine.series[0].kind = SeriesKind::Candlestick;
+    assert!(!engine.add_swing_points(0, 2, 2).is_empty());
+    assert!(
+        !engine
+            .add_market_structure(0, 2, 2, StructureBreakOn::Close)
+            .is_empty()
+    );
+    assert!(
+        !engine
+            .add_fair_value_gaps(
+                0,
+                0.0,
+                StructureMitigation::Touch,
+                StructureMitigationPrice::Wick,
+                20,
+                true,
+            )
+            .is_empty()
+    );
+    engine
+        .register_custom_study(
+            CustomStudyDefinition {
+                type_id: "every_fifth".into(),
+                version: 1,
+                title: "Every fifth".into(),
+                parameters: Vec::new(),
+                outputs: vec![CustomStudyOutput {
+                    name: "Close".into(),
+                    plot: CustomStudyPlot::Marker,
+                    pane: CustomStudyPane::Price,
+                    default_style: IndicatorOutputStyle {
+                        visible: true,
+                        line_color: Some("rgba(160, 80, 220, 0.6)".into()),
+                        ..IndicatorOutputStyle::default()
+                    },
+                }],
+                uses_volume: false,
+            },
+            Box::new(|_| Ok(Box::new(EveryFifthClose) as Box<dyn CustomStudyRuntime>)),
+        )
+        .expect("custom study registers");
+    engine
+        .add_custom_study(
+            "every_fifth",
+            0,
+            IndicatorInputSource::Close,
+            None,
+            Default::default(),
+        )
+        .expect("custom study binds");
+    let stream = engine
+        .add_trade_stream(
+            "PARITY:AUCTION",
+            FootprintAggregationOptions {
+                tick_size: 1.0,
+                ..FootprintAggregationOptions::default()
+            },
+        )
+        .expect("trade stream");
+    let print = |time: f64, price: f64, volume: f64, aggressor| FootprintTrade {
+        timestamp_micros: time as i64 * 1_000_000,
+        price,
+        volume,
+        aggressor,
+        bid: None,
+        ask: None,
+        sequence: None,
+        trade_id: None,
+        conditions: 0,
+        session_id: Some(1),
+    };
+    let tape = (0..n)
+        .flat_map(|i| {
+            let base = close[i].round();
+            [
+                print(times[i], base - 1.0, 150.0, AggressorSide::Sell),
+                print(times[i] + 1.0, base - 1.0, 20.0, AggressorSide::Buy),
+                print(times[i] + 2.0, base, 4.0, AggressorSide::Buy),
+                print(times[i] + 3.0, base + 1.0, 2.0, AggressorSide::Buy),
+                print(times[i] + 4.0, base + 1.0, 1.0, AggressorSide::Sell),
+            ]
+        })
+        .collect::<Vec<_>>();
+    engine
+        .set_trade_stream_trades(stream, tape)
+        .expect("tape loads");
+    engine
+        .add_auction_markers(
+            stream,
+            0,
+            AuctionMarkerOptions {
+                extend_until_revisited: true,
+                ..AuctionMarkerOptions::default()
+            },
+        )
+        .expect("auction markers bind");
+    engine.time_scale.set_width(900.0);
+    engine.set_bar_spacing(7.0);
+    engine.fit_content();
+    engine
+}
+
+#[test]
+fn studies_and_auction_scene_reaches_canvas_and_gpui_identically_and_replays_deterministically() {
+    for dpr in [1.0f64, 1.5, 2.0] {
+        let mut engine = studies_and_auction_engine(dpr);
+        let frame = engine.build_frame();
+        let pane = &frame.panes[0];
+        let has = |predicate: &dyn Fn(&Prim) -> bool| pane.main.iter().any(predicate);
+        assert!(has(
+            &|prim| matches!(prim, Prim::Rect { color, .. } if color.a() == 38)
+        ));
+        assert!(has(&|prim| matches!(prim, Prim::RectFrame { .. })));
+        assert!(has(&|prim| matches!(
+            prim,
+            Prim::HLine {
+                style: LineStyle::Dashed,
+                ..
+            }
+        )));
+        assert!(has(&|prim| matches!(prim, Prim::Triangle { .. })));
+        assert!(has(&|prim| matches!(prim, Prim::Circle { .. })));
+        assert!(has(
+            &|prim| matches!(prim, Prim::Text { text, .. } if text == "ABS")
+        ));
+        assert!(has(&|prim| matches!(
+            prim,
+            Prim::Text { text, .. } if text == "BOS" || text == "CHoCH"
+        )));
+        for (layer, prims) in [
+            ("under", &pane.under),
+            ("main", &pane.main),
+            ("top", &pane.top_prims),
+        ] {
+            let canvas = canvas_rects(prims, &pane.points);
+            let (plan, metrics) = gpui_plan(prims, &pane.points);
+            assert_eq!(
+                gpui_quads(&plan),
+                canvas.rects,
+                "DPR {dpr} {layer}: zone fills, frames and rules must be draw-call identical"
+            );
+            assert_eq!(metrics.dropped_prims, 0, "DPR {dpr} {layer}: {metrics:?}");
+            let gpui_text = plan
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    SceneOp::Text(run) => Some((run.text.clone(), run.x, run.y)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let canvas_text = canvas
+                .text_runs
+                .iter()
+                .map(|(text, x, y, ..)| (text.clone(), *x, *y))
+                .collect::<Vec<_>>();
+            assert_eq!(gpui_text, canvas_text, "DPR {dpr} {layer}: labels");
+        }
+        // Replay: a second engine fed the same state builds the same frame and the same plan.
+        let replayed = studies_and_auction_engine(dpr).build_frame();
+        assert_eq!(replayed, frame, "DPR {dpr}: the frame must be reproducible");
+        let mut first = GpuiChartRenderer::new();
+        first
+            .plan_frame(&PreparedAerisFrame::new(&frame), dpr as f32)
+            .expect("frame plans");
+        let mut second = GpuiChartRenderer::new();
+        second
+            .plan_frame(&PreparedAerisFrame::new(&replayed), dpr as f32)
+            .expect("replayed frame plans");
+        assert_eq!(first.plan().ops, second.plan().ops, "DPR {dpr}: op stream");
     }
 }

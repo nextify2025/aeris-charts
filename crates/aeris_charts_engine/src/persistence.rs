@@ -55,6 +55,8 @@ pub struct PersistenceRestoreResult {
     pub panes: usize,
     pub drawings: usize,
     pub points: usize,
+    /// Binding identities whose custom implementation was not registered at restore time.
+    pub unresolved_custom_studies: Vec<SeriesId>,
 }
 
 /// Release-benchmark evidence for the bounded restore stages. This is not a stable product API.
@@ -169,6 +171,9 @@ struct IndicatorV3 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     amount_source: Option<IndicatorSourceV3>,
     styles: Vec<IndicatorOutputStyle>,
+    /// Custom output placement survives an import without its runtime definition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    dedicated_outputs: Vec<bool>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -443,6 +448,16 @@ fn validate_positive_number(value: f64, field: &str) -> Result<(), ChartError> {
 
 fn incremental_output_count(kind: &IndicatorKind) -> usize {
     match kind {
+        IndicatorKind::Custom { output_count, .. } => *output_count,
+        IndicatorKind::SwingPoints { .. } | IndicatorKind::SessionLevels { .. } => 2,
+        IndicatorKind::PreviousPeriodLevels { .. } | IndicatorKind::OpeningRange { .. } => 3,
+        IndicatorKind::MarketStructure { .. }
+        | IndicatorKind::FairValueGaps { .. }
+        | IndicatorKind::OrderBlocks { .. } => 1,
+        IndicatorKind::Aroon { .. } => 2,
+        IndicatorKind::AwesomeOscillator => 1,
+        IndicatorKind::Dpo { .. } => 1,
+        IndicatorKind::ChandeMomentum { .. } => 1,
         IndicatorKind::Sma { .. }
         | IndicatorKind::Ema { .. }
         | IndicatorKind::Dema { .. }
@@ -460,9 +475,29 @@ fn incremental_output_count(kind: &IndicatorKind) -> usize {
         | IndicatorKind::Atr { .. }
         | IndicatorKind::Vwap
         | IndicatorKind::Obv
+        | IndicatorKind::AccumulationDistribution
+        | IndicatorKind::PriceVolumeTrend
+        | IndicatorKind::ChaikinOscillator { .. }
+        | IndicatorKind::Kama { .. }
+        | IndicatorKind::McGinley { .. }
+        | IndicatorKind::Choppiness { .. }
+        | IndicatorKind::RelativeVolume { .. }
+        | IndicatorKind::ElderForce { .. }
+        | IndicatorKind::EaseOfMovement { .. }
+        | IndicatorKind::HistoricalVolatility { .. }
+        | IndicatorKind::MassIndex { .. }
+        | IndicatorKind::CoppockCurve { .. }
+        | IndicatorKind::UltimateOscillator { .. }
         | IndicatorKind::Cmf { .. }
         | IndicatorKind::Mfi { .. }
         | IndicatorKind::Wma { .. } => 1,
+        IndicatorKind::VolumeOscillator { .. } => 3,
+        IndicatorKind::Trix { .. }
+        | IndicatorKind::Kst { .. }
+        | IndicatorKind::Klinger { .. }
+        | IndicatorKind::Tsi { .. }
+        | IndicatorKind::Vortex { .. }
+        | IndicatorKind::FisherTransform { .. } => 2,
         IndicatorKind::Volume { .. } => 2,
         IndicatorKind::Donchian { .. }
         | IndicatorKind::Keltner { .. }
@@ -474,6 +509,11 @@ fn incremental_output_count(kind: &IndicatorKind) -> usize {
         IndicatorKind::Ichimoku => 5,
         IndicatorKind::EmaRibbon { .. } => aeris_charts_indicators::MAX_OUTPUTS,
         IndicatorKind::Bollinger { .. } => 3,
+        IndicatorKind::LinearRegression { .. } => 3,
+        IndicatorKind::AtrBands { .. } => 3,
+        IndicatorKind::BollingerMetrics { .. } => 2,
+        IndicatorKind::Envelopes { .. } => 3,
+        IndicatorKind::Alma { .. } => 1,
         IndicatorKind::Macd { .. } => 3,
         IndicatorKind::Stochastic { .. } => 2,
         IndicatorKind::Kdj { .. } => 3,
@@ -499,10 +539,10 @@ fn validate_indicator_style(style: &IndicatorOutputStyle) -> Result<(), &'static
         ("area top color", style.area_top_color.as_deref()),
         ("area bottom color", style.area_bottom_color.as_deref()),
     ] {
-        if let Some(color) = color {
-            if color.len() > MAX_COLOR_BYTES || Color::parse_css(color).is_none() {
-                return Err(field);
-            }
+        if let Some(color) = color
+            && (color.len() > MAX_COLOR_BYTES || Color::parse_css(color).is_none())
+        {
+            return Err(field);
         }
     }
     Ok(())
@@ -510,6 +550,33 @@ fn validate_indicator_style(style: &IndicatorOutputStyle) -> Result<(), &'static
 
 fn indicator_kind_is_valid(kind: &IndicatorKind) -> bool {
     match kind {
+        IndicatorKind::Custom {
+            type_id,
+            version,
+            parameters,
+            output_count,
+        } => {
+            crate::custom_studies::valid_custom_type_id(type_id)
+                && *version > 0
+                && (1..=5).contains(output_count)
+                && parameters.len() <= 64
+                && parameters.keys().all(|key| {
+                    !key.is_empty() && key.len() <= 128 && !key.chars().any(char::is_control)
+                })
+                && serde_json::to_vec(parameters).is_ok_and(|bytes| bytes.len() <= 65_536)
+        }
+        IndicatorKind::SwingPoints { .. }
+        | IndicatorKind::MarketStructure { .. }
+        | IndicatorKind::FairValueGaps { .. }
+        | IndicatorKind::OrderBlocks { .. } => super::indicators::structure_kind_is_valid(kind),
+        IndicatorKind::SessionLevels { .. } | IndicatorKind::PreviousPeriodLevels { .. } => true,
+        IndicatorKind::OpeningRange {
+            duration_seconds, ..
+        } => *duration_seconds > 0,
+        IndicatorKind::Aroon { period } => *period > 0,
+        IndicatorKind::AwesomeOscillator => true,
+        IndicatorKind::Dpo { period } => *period > 0,
+        IndicatorKind::ChandeMomentum { period } => *period > 0,
         IndicatorKind::Sma { period }
         | IndicatorKind::Ema { period, .. }
         | IndicatorKind::Dema { period, .. }
@@ -545,7 +612,24 @@ fn indicator_kind_is_valid(kind: &IndicatorKind) -> bool {
         IndicatorKind::EmaRibbon { periods } => periods.iter().all(|period| *period > 0),
         IndicatorKind::Bollinger {
             period, deviation, ..
-        } => *period > 0 && deviation.is_finite(),
+        }
+        | IndicatorKind::BollingerMetrics { period, deviation } => {
+            *period > 0 && deviation.is_finite() && *deviation >= 0.0
+        }
+        IndicatorKind::Envelopes {
+            period, percent, ..
+        } => *period > 0 && percent.is_finite() && *percent >= 0.0,
+        IndicatorKind::Alma {
+            period,
+            offset,
+            sigma,
+        } => {
+            *period > 0
+                && offset.is_finite()
+                && (0.0..=1.0).contains(offset)
+                && sigma.is_finite()
+                && (0.01..=1_000_000.0).contains(sigma)
+        }
         IndicatorKind::Macd {
             fast,
             slow,
@@ -568,6 +652,61 @@ fn indicator_kind_is_valid(kind: &IndicatorKind) -> bool {
         IndicatorKind::Stochastic { k_period, d_period } => *k_period > 0 && *d_period > 0,
         IndicatorKind::Vwap => true,
         IndicatorKind::Obv => true,
+        IndicatorKind::AccumulationDistribution | IndicatorKind::PriceVolumeTrend => true,
+        IndicatorKind::ChaikinOscillator { fast, slow } => *fast > 0 && *slow > 0 && *fast < *slow,
+        IndicatorKind::Klinger { fast, slow, signal } => *fast > 0 && *fast < *slow && *signal > 0,
+        IndicatorKind::Kama { period, fast, slow } => *period > 0 && *fast > 0 && *fast < *slow,
+        IndicatorKind::McGinley { period } => *period > 0,
+        IndicatorKind::LinearRegression { period, deviation } => {
+            *period > 0 && deviation.is_finite() && *deviation >= 0.0
+        }
+        IndicatorKind::Choppiness { period } => *period >= 2,
+        IndicatorKind::AtrBands { period, multiplier } => {
+            *period > 0 && multiplier.is_finite() && *multiplier >= 0.0
+        }
+        IndicatorKind::RelativeVolume { period } => *period > 0,
+        IndicatorKind::ElderForce { period } => *period > 0,
+        IndicatorKind::EaseOfMovement { period, divisor } => {
+            *period > 0 && divisor.is_finite() && *divisor > 0.0
+        }
+        IndicatorKind::HistoricalVolatility {
+            period,
+            annualization,
+        } => *period >= 2 && annualization.is_finite() && *annualization > 0.0,
+        IndicatorKind::Trix { period, signal } => *period > 0 && *signal > 0,
+        IndicatorKind::Kst {
+            roc,
+            smoothing,
+            signal,
+        } => {
+            roc.iter().all(|&period| period > 0)
+                && smoothing.iter().all(|&period| period > 0)
+                && *signal > 0
+        }
+        IndicatorKind::Tsi {
+            long,
+            short,
+            signal,
+        } => *long > 0 && *short > 0 && *signal > 0,
+        IndicatorKind::MassIndex {
+            ema_period,
+            sum_period,
+        } => *ema_period > 0 && *sum_period > 0,
+        IndicatorKind::Vortex { period } => *period > 0,
+        IndicatorKind::CoppockCurve {
+            long,
+            short,
+            smoothing,
+        } => *long > 0 && *short > 0 && *smoothing > 0,
+        IndicatorKind::FisherTransform { period } => *period > 0,
+        IndicatorKind::UltimateOscillator {
+            short,
+            medium,
+            long,
+        } => *short > 0 && *medium > 0 && *long > 0,
+        IndicatorKind::VolumeOscillator { fast, slow, signal } => {
+            *fast > 0 && *fast < *slow && *signal > 0
+        }
         IndicatorKind::Cmf { period } => *period > 0,
         IndicatorKind::Mfi { period } => *period > 0,
         IndicatorKind::Volume { period } => *period > 0,
@@ -730,19 +869,18 @@ fn lacks_upstream_b8_fields(item: &DrawingV1) -> bool {
 /// becomes the disjoint channel whose second line is that level ([`fork_flat_crossing_anchors`]).
 /// A base on one bar keeps the flat top or bottom its third anchor is above or below.
 fn stored_drawing_kind(name: &str, anchors: &[DrawingAnchor]) -> Option<DrawingKind> {
-    if name == "flat_top_bottom" {
-        if let [a, b, c] = anchors {
-            if let (Some(a_logical), Some(b_logical), Some(_)) = (a.logical, b.logical, c.logical) {
-                let (low, high) = (a.price.min(b.price), a.price.max(b.price));
-                return Some(if c.price >= high {
-                    DrawingKind::FlatTopChannel
-                } else if c.price <= low || a_logical == b_logical {
-                    DrawingKind::FlatBottomChannel
-                } else {
-                    DrawingKind::DisjointChannel
-                });
-            }
-        }
+    if name == "flat_top_bottom"
+        && let [a, b, c] = anchors
+        && let (Some(a_logical), Some(b_logical), Some(_)) = (a.logical, b.logical, c.logical)
+    {
+        let (low, high) = (a.price.min(b.price), a.price.max(b.price));
+        return Some(if c.price >= high {
+            DrawingKind::FlatTopChannel
+        } else if c.price <= low || a_logical == b_logical {
+            DrawingKind::FlatBottomChannel
+        } else {
+            DrawingKind::DisjointChannel
+        });
     }
     DrawingKind::from_name(name)
 }
@@ -1059,13 +1197,12 @@ fn legacy_gann_reverse(tool_options: Option<&serde_json::Value>) -> bool {
 /// square's grows-downward corner, the reversed square's swapped prices), so it does not also
 /// reach `level_reverse` and pivot the fans and arcs on the far corner.
 fn drop_consumed_gann_reverse(kind: DrawingKind, tool_options: Option<&mut serde_json::Value>) {
-    if matches!(kind, DrawingKind::GannSquare | DrawingKind::GannSquareFixed) {
-        if let Some(gann) = tool_options
+    if matches!(kind, DrawingKind::GannSquare | DrawingKind::GannSquareFixed)
+        && let Some(gann) = tool_options
             .and_then(|options| options.get_mut("gann"))
             .and_then(serde_json::Value::as_object_mut)
-        {
-            gann.remove("reverse");
-        }
+    {
+        gann.remove("reverse");
     }
 }
 
@@ -1114,18 +1251,19 @@ pub(crate) fn migrate_fork_payload_item(item: &mut crate::DrawingClipboardItem) 
     let Some(options) = item.options.as_object_mut() else {
         return;
     };
-    if item.kind == DrawingKind::AnchoredText && !options.contains_key("screen_x") {
-        if let Some(anchor) = item.points.first_mut() {
-            anchor.time = None;
-            options.insert(
-                "screen_x".to_string(),
-                serde_json::json!(anchor.logical.unwrap_or(0.5).clamp(0.0, 1.0)),
-            );
-            options.insert(
-                "screen_y".to_string(),
-                serde_json::json!(anchor.price.clamp(0.0, 1.0)),
-            );
-        }
+    if item.kind == DrawingKind::AnchoredText
+        && !options.contains_key("screen_x")
+        && let Some(anchor) = item.points.first_mut()
+    {
+        anchor.time = None;
+        options.insert(
+            "screen_x".to_string(),
+            serde_json::json!(anchor.logical.unwrap_or(0.5).clamp(0.0, 1.0)),
+        );
+        options.insert(
+            "screen_y".to_string(),
+            serde_json::json!(anchor.price.clamp(0.0, 1.0)),
+        );
     }
     if converted || fork_info_line {
         let tool_options = options
@@ -1204,6 +1342,16 @@ impl ChartEngine {
                     volume_source,
                     amount_source,
                     styles,
+                    dedicated_outputs: if matches!(binding.kind, IndicatorKind::Custom { .. }) {
+                        let source_pane = self.series_entry(binding.source).unwrap().pane_index;
+                        binding
+                            .outputs
+                            .iter()
+                            .map(|&id| self.series_entry(id).unwrap().pane_index != source_pane)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
                 })
             })
             .collect::<Result<Vec<_>, ChartError>>()?;
@@ -1993,10 +2141,10 @@ impl ChartEngine {
             } else {
                 None
             };
-            if pane_position.is_some() {
-                if let Some(time) = anchor_times_micros.first_mut() {
-                    *time = None;
-                }
+            if pane_position.is_some()
+                && let Some(time) = anchor_times_micros.first_mut()
+            {
+                *time = None;
             }
             total_points = total_points
                 .checked_add(anchors.len())
@@ -2628,6 +2776,7 @@ impl ChartEngine {
             panes: self.panes.len(),
             drawings: drawing_count,
             points,
+            unresolved_custom_studies: Vec::new(),
         })
     }
 
@@ -2727,13 +2876,50 @@ impl ChartEngine {
         })?;
         let mut resolved = Vec::with_capacity(state.indicators.len());
         let mut expected_outputs = Vec::with_capacity(state.indicators.len());
+        if state
+            .indicators
+            .iter()
+            .filter(|indicator| matches!(indicator.kind, IndicatorKind::Custom { .. }))
+            .count()
+            > crate::MAX_CUSTOM_STUDY_BINDINGS
+        {
+            return Err(resource("custom study binding limit"));
+        }
         for (study, indicator) in state.indicators.iter().enumerate() {
-            if !indicator_kind_is_valid(&indicator.kind) {
+            if !indicator_kind_is_valid(&indicator.kind)
+                || matches!(
+                    indicator.kind,
+                    IndicatorKind::SwingPoints { .. }
+                        | IndicatorKind::MarketStructure { .. }
+                        | IndicatorKind::FairValueGaps { .. }
+                        | IndicatorKind::OrderBlocks { .. }
+                ) && indicator.source_input != IndicatorInputSource::Close
+            {
                 return Err(invalid(format!("indicator {study} has invalid parameters")));
             }
             if indicator.styles.len() > aeris_charts_indicators::MAX_OUTPUTS {
                 return Err(resource(format!(
                     "indicator {study} has too many output styles"
+                )));
+            }
+            if let IndicatorKind::Custom {
+                type_id,
+                version,
+                parameters,
+                output_count,
+            } = &indicator.kind
+                && let Some(definition) = self
+                    .custom_studies
+                    .get(type_id)
+                    .filter(|registered| registered.definition.version == *version)
+                    .map(|registered| &registered.definition)
+                && (definition.outputs.len() != *output_count
+                    || indicator.volume_source.is_some() && !definition.uses_volume
+                    || crate::custom_studies::normalize_params(definition, parameters)
+                        .map_or(true, |normalized| normalized != *parameters))
+            {
+                return Err(invalid(format!(
+                    "indicator {study} has invalid custom parameters"
                 )));
             }
             let source =
@@ -2766,25 +2952,31 @@ impl ChartEngine {
                 .transpose()?;
             if let (Some(amount_source), Some(amount_ref)) =
                 (amount_source, indicator.amount_source.as_ref())
-            {
-                if !matches!(indicator.kind, IndicatorKind::Vwap)
+                && (!matches!(indicator.kind, IndicatorKind::Vwap)
                     || source_refs_equal(&indicator.source, amount_ref)
                     || indicator
                         .volume_source
                         .as_ref()
                         .is_none_or(|volume| source_refs_equal(volume, amount_ref))
                     || (matches!(amount_ref, IndicatorSourceV3::Series { .. })
-                        && !source_is_scalar(self, amount_source))
-                {
-                    return Err(invalid(format!(
-                        "indicator {study} amount source must be a distinct scalar VWAP input"
-                    )));
-                }
+                        && !source_is_scalar(self, amount_source)))
+            {
+                return Err(invalid(format!(
+                    "indicator {study} amount source must be a distinct scalar VWAP input"
+                )));
             }
             let expected = incremental_output_count(&indicator.kind);
             if indicator.styles.len() != expected {
                 return Err(invalid(format!(
                     "indicator {study} style count does not match its output count"
+                )));
+            }
+            if !indicator.dedicated_outputs.is_empty()
+                && (!matches!(indicator.kind, IndicatorKind::Custom { .. })
+                    || indicator.dedicated_outputs.len() != expected)
+            {
+                return Err(invalid(format!(
+                    "indicator {study} has invalid output placement"
                 )));
             }
             for (output, style) in indicator.styles.iter().enumerate() {
@@ -2830,15 +3022,32 @@ impl ChartEngine {
                         amount_source.unwrap_or_default(),
                     )
                 });
-            let outputs = self.add_indicator_kind_with_sources(
-                source,
-                source_input,
-                kind,
-                volume_source,
-                amount_source,
-            );
+            // A custom study restores through its own binding path (pending until its type is
+            // registered); only VWAP carries an amount source, validated above.
+            let outputs = if matches!(kind, IndicatorKind::Custom { .. }) {
+                self.restore_custom_study_with_panes(
+                    source,
+                    source_input,
+                    kind,
+                    volume_source,
+                    &state.indicators[study].dedicated_outputs,
+                )?
+            } else {
+                self.add_indicator_kind_with_sources(
+                    source,
+                    source_input,
+                    kind,
+                    volume_source,
+                    amount_source,
+                )
+            };
             if outputs.len() != styles.len() {
                 return Err(invalid(format!("indicator {study} could not be restored")));
+            }
+            if matches!(state.indicators[study].kind, IndicatorKind::Custom { .. })
+                && !self.custom_study_is_resolved(outputs[0])
+            {
+                result.unresolved_custom_studies.push(outputs[0]);
             }
             for (&output, style) in outputs.iter().zip(styles) {
                 if !self.set_indicator_output_style(output, style) {
@@ -2874,7 +3083,7 @@ impl ChartEngine {
         }
         let chart_options =
             crate::exchange_time_api::importable_chart_options(&state.chart_options);
-        serde_json::from_value::<aeris_charts_core::options::ChartOptions>(chart_options.clone())
+        aeris_charts_core::options::ChartOptions::from_json_value(chart_options.clone())
             .map_err(|error| invalid(format!("invalid V2 chart_options: {error}")))?;
         let domains = state
             .panes
@@ -3071,6 +3280,626 @@ mod tests {
     }
 
     #[test]
+    fn chop_zone_follows_the_rsi_region_through_option_updates_and_restore() {
+        let rsi_region = crate::SeriesThresholdRegion {
+            lower: 30.0,
+            upper: 70.0,
+        };
+        let chop_zone = crate::SeriesThresholdRegion {
+            lower: 38.2,
+            upper: 61.8,
+        };
+        let regions = |chart: &ChartEngine| {
+            chart
+                .indicator_bindings()
+                .iter()
+                .map(|binding| {
+                    chart
+                        .series_entry(binding.outputs[0])
+                        .and_then(|series| series.threshold_region)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut chart = settled_chart();
+        let rsi = chart.add_rsi(0, 3).unwrap();
+        let chop = chart.add_choppiness(0, 3).unwrap();
+        assert_eq!(regions(&chart), vec![Some(rsi_region), Some(chop_zone)]);
+
+        // Every indicator option update leaves both engine-owned regions in place.
+        for output in [rsi, chop] {
+            let mut style =
+                chart.indicator_bindings()[usize::from(output == chop)].styles[0].clone();
+            style.line_color = Some("#123456".to_string());
+            style.line_width = Some(3.0);
+            style.line_style = 2;
+            assert!(chart.set_indicator_output_style(output, style));
+            assert!(chart.set_indicator_input_source(output, crate::IndicatorInputSource::Hlc3));
+            assert!(chart.set_indicator_binding_visible(output, false));
+        }
+        assert!(
+            chart.set_indicator_chrome_options(crate::IndicatorChromeOptions {
+                name_labels_visible: false,
+                value_labels_visible: false,
+                price_lines_visible: false,
+            })
+        );
+        chart.reset_style_to_defaults();
+        assert_eq!(regions(&chart), vec![Some(rsi_region), Some(chop_zone)]);
+
+        // The region is derived from the indicator kind, never stored: a restore re-derives it.
+        let document = chart.export_state_json().unwrap();
+        assert!(!document.contains("threshold"));
+        let mut restored = settled_chart();
+        restored.import_state_json(&document).unwrap();
+        assert_eq!(regions(&restored), vec![Some(rsi_region), Some(chop_zone)]);
+        assert_eq!(restored.export_state_json().unwrap(), document);
+
+        // Visibility round-trips with the region: both restored bindings stay hidden and draw no
+        // strip; re-showing them draws each region in its own pane, the Chop Zone at 38.2/61.8.
+        let fill = Color::rgba(0x78, 0x7B, 0x86, 0x33);
+        let strip_panes = |chart: &mut ChartEngine| {
+            let frame = chart.build_frame();
+            (0..frame.panes.len())
+                .filter(|&pane| {
+                    frame.panes[pane].main.iter().any(|prim| {
+                        matches!(prim, aeris_charts_render::draw_list::Prim::Rect { color, .. } if *color == fill)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip_panes(&mut restored), Vec::<usize>::new());
+        let outputs = restored
+            .indicator_bindings()
+            .iter()
+            .map(|binding| binding.outputs[0])
+            .collect::<Vec<_>>();
+        for &output in &outputs {
+            assert!(restored.set_indicator_binding_visible(output, true));
+        }
+        let chop_pane = restored.series_entry(outputs[1]).unwrap().pane_index;
+        let rsi_pane = restored.series_entry(outputs[0]).unwrap().pane_index;
+        assert_ne!(chop_pane, rsi_pane);
+        let mut expected_panes = vec![rsi_pane, chop_pane];
+        expected_panes.sort_unstable();
+        assert_eq!(strip_panes(&mut restored), expected_panes);
+        let frame = restored.build_frame();
+        let scale = &restored.panes[chop_pane].price_scale;
+        let mut expected_boundaries = [61.8, 38.2]
+            .map(|price| scale.price_to_coordinate(price, 0.0) as f32)
+            .map(|y| y.round() as i32);
+        expected_boundaries.sort_unstable();
+        let mut boundaries = frame.panes[chop_pane]
+            .main
+            .iter()
+            .filter_map(|prim| match prim {
+                aeris_charts_render::draw_list::Prim::HLine {
+                    y,
+                    style: LineStyle::Dotted,
+                    color,
+                    ..
+                } if *color == Color::rgb(0x78, 0x7B, 0x86) => Some(*y),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        boundaries.sort_unstable();
+        assert_eq!(boundaries, expected_boundaries);
+    }
+
+    #[test]
+    fn historical_volatility_persists_annualization_and_output_identity() {
+        let mut chart = settled_chart();
+        let output = chart.add_historical_volatility(0, 3, 365.0).unwrap();
+        let document = chart.export_state_json().unwrap();
+        let mut restored = settled_chart();
+        restored.import_state_json(&document).unwrap();
+        let binding = &restored.indicator_bindings()[0];
+        assert_eq!(
+            binding.kind,
+            crate::IndicatorKind::HistoricalVolatility {
+                period: 3,
+                annualization: 365.0,
+            }
+        );
+        assert_eq!(binding.outputs, vec![output]);
+    }
+
+    #[test]
+    fn trix_persists_two_ordered_outputs() {
+        let mut chart = settled_chart();
+        let outputs = chart.add_trix(0, 2, 3);
+        assert_eq!(outputs.len(), 2);
+        let document = chart.export_state_json().unwrap();
+        let mut restored = settled_chart();
+        restored.import_state_json(&document).unwrap();
+        let binding = &restored.indicator_bindings()[0];
+        assert_eq!(
+            binding.kind,
+            crate::IndicatorKind::Trix {
+                period: 2,
+                signal: 3
+            }
+        );
+        assert_eq!(binding.outputs, outputs);
+    }
+
+    #[test]
+    fn negative_bollinger_deviation_documents_are_rejected_atomically() {
+        for add in [
+            ChartEngine::add_bollinger,
+            ChartEngine::add_bollinger_metrics,
+        ] {
+            let mut chart = settled_chart();
+            assert!(!add(&mut chart, 0, 3, 2.0).is_empty());
+            let document = chart.export_state_json().unwrap();
+            assert_eq!(document.matches(r#""deviation":2.0"#).count(), 1);
+            let negative = document.replace(r#""deviation":2.0"#, r#""deviation":-1.0"#);
+            let mut target = settled_chart();
+            let before = target.export_state_json().unwrap();
+            assert_eq!(
+                target.import_state_json(&negative).unwrap_err().code(),
+                ErrorCode::InvalidData
+            );
+            assert_eq!(target.export_state_json().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn unknown_custom_study_restores_pending_with_ordered_output_references() {
+        let mut original = settled_chart();
+        let scalar = original.add_sma(0, 2).unwrap();
+        let custom_outputs = original.add_trix(scalar, 2, 3);
+        assert_eq!(custom_outputs.len(), 2);
+        assert!(original.add_sma(custom_outputs[0], 2).is_some());
+        let mut document: serde_json::Value =
+            serde_json::from_str(&original.export_state_json().unwrap()).unwrap();
+        document["indicators"][1]["kind"] = serde_json::json!({
+            "kind": "custom",
+            "type_id": "example.oscillator",
+            "version": 1,
+            "parameters": {"period": 3},
+            "output_count": 2
+        });
+        let json = serde_json::to_string(&document).unwrap();
+        let mut restored = settled_chart();
+        let result = restored.import_state_json(&json).unwrap();
+        let bindings = restored.indicator_bindings();
+        assert_eq!(result.schema_version, PERSISTENCE_SCHEMA_VERSION_STUDIES);
+        assert_eq!(
+            result.unresolved_custom_studies,
+            vec![bindings[1].outputs[0]]
+        );
+        assert!(!restored.custom_study_is_resolved(bindings[1].outputs[0]));
+        assert_eq!(bindings[1].outputs.len(), 2);
+        assert_eq!(bindings[1].source, bindings[0].outputs[0]);
+        assert_eq!(bindings[2].source, bindings[1].outputs[0]);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&restored.export_state_json().unwrap())
+                .unwrap()["indicators"][1]["kind"],
+            document["indicators"][1]["kind"]
+        );
+    }
+
+    #[test]
+    fn custom_study_persistence_rejects_invalid_contract_before_install() {
+        let mut original = settled_chart();
+        assert_eq!(original.add_trix(0, 2, 3).len(), 2);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&original.export_state_json().unwrap()).unwrap();
+        for kind in [
+            serde_json::json!({"kind": "custom", "type_id": "", "version": 1, "parameters": {}, "output_count": 2}),
+            serde_json::json!({"kind": "custom", "type_id": "valid", "version": 0, "parameters": {}, "output_count": 2}),
+            serde_json::json!({"kind": "custom", "type_id": "valid", "version": 1, "parameters": {}, "output_count": 0}),
+            serde_json::json!({"kind": "custom", "type_id": "valid", "version": 1, "parameters": {}, "output_count": 6}),
+            serde_json::json!({"kind": "custom", "type_id": "valid", "version": 1, "parameters": {"oversized": "x".repeat(65_536)}, "output_count": 2}),
+        ] {
+            document["indicators"][0]["kind"] = kind;
+            let mut target = settled_chart();
+            let before = target.export_state_json().unwrap();
+            assert!(
+                target
+                    .import_state_json(&serde_json::to_string(&document).unwrap())
+                    .is_err()
+            );
+            assert_eq!(target.export_state_json().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn structure_kinds_round_trip_without_annotations_and_reject_invalid_parameters() {
+        let mut chart = settled_chart();
+        let kinds = [
+            crate::IndicatorKind::SwingPoints { left: 2, right: 3 },
+            crate::IndicatorKind::MarketStructure {
+                left: 2,
+                right: 3,
+                break_on: crate::indicators::StructureBreakOn::Wick,
+            },
+            crate::IndicatorKind::FairValueGaps {
+                min_size: 0.5,
+                mitigation: crate::indicators::StructureMitigation::Full,
+                mitigation_price: crate::indicators::StructureMitigationPrice::Close,
+                max_active: 12,
+                show_mitigated: true,
+            },
+            crate::IndicatorKind::OrderBlocks {
+                left: 2,
+                right: 3,
+                break_on: crate::indicators::StructureBreakOn::Close,
+                zone: crate::indicators::OrderBlockZone::Body,
+                mitigation: crate::indicators::StructureMitigation::Touch,
+                mitigation_price: crate::indicators::StructureMitigationPrice::Wick,
+                max_active: 16,
+                show_mitigated: false,
+            },
+        ];
+        for kind in &kinds {
+            assert!(!chart.add_indicator_kind(0, kind.clone(), None).is_empty());
+        }
+        let document = chart.export_state_json().unwrap();
+        assert!(!document.contains("\"annotations\""));
+        let mut restored = settled_chart();
+        restored.import_state_json(&document).unwrap();
+        assert_eq!(
+            restored
+                .indicator_bindings()
+                .iter()
+                .map(|binding| &binding.kind)
+                .collect::<Vec<_>>(),
+            kinds.iter().collect::<Vec<_>>(),
+        );
+        for (index, field, value) in [
+            (0, "left", serde_json::json!(0)),
+            (1, "right", serde_json::json!(51)),
+            (2, "max_active", serde_json::json!(0)),
+            (3, "max_active", serde_json::json!(65)),
+        ] {
+            let mut invalid: serde_json::Value = serde_json::from_str(&document).unwrap();
+            invalid["indicators"][index]["kind"][field] = value;
+            assert!(
+                settled_chart()
+                    .import_state_json(&invalid.to_string())
+                    .is_err()
+            );
+        }
+        let mut invalid: serde_json::Value = serde_json::from_str(&document).unwrap();
+        invalid["indicators"][0]["source_input"] = serde_json::json!("hlc3");
+        assert!(
+            settled_chart()
+                .import_state_json(&invalid.to_string())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn choppiness_and_atr_bands_v3_round_trip_and_old_layout() {
+        let mut chart = settled_chart();
+        let chop = chart.add_choppiness(0, 3).unwrap();
+        let bands = chart.add_atr_bands(0, 4, 2.75);
+        assert_eq!(bands.len(), 3);
+        assert!(chart.set_indicator_output_style(
+            bands[1],
+            crate::IndicatorOutputStyle {
+                visible: false,
+                line_color: Some("#123456".into()),
+                ..Default::default()
+            },
+        ));
+        let document = chart.export_state_json().unwrap();
+        let mut restored = settled_chart();
+        restored.import_state_json(&document).unwrap();
+        let bindings = restored.indicator_bindings();
+        assert_eq!(
+            bindings[0].kind,
+            crate::IndicatorKind::Choppiness { period: 3 }
+        );
+        assert_eq!(bindings[0].outputs, [chop]);
+        assert_eq!(
+            bindings[1].kind,
+            crate::IndicatorKind::AtrBands {
+                period: 4,
+                multiplier: 2.75
+            }
+        );
+        assert_eq!(bindings[1].outputs, bands);
+        assert_eq!(bindings[1].styles[1].line_color.as_deref(), Some("#123456"));
+        for output in [chop].into_iter().chain(bands) {
+            let before = chart.data.series_data(output).unwrap();
+            let after = restored.data.series_data(output).unwrap();
+            assert_eq!(before.0, after.0);
+            for (left, right) in before.1.into_iter().zip(after.1) {
+                assert!(
+                    left.iter()
+                        .zip(right)
+                        .all(|(a, b)| a == b || a.is_nan() && b.is_nan())
+                );
+            }
+        }
+        for (index, field, value) in [
+            (0, "period", serde_json::json!(1)),
+            (1, "multiplier", serde_json::json!(-1.0)),
+            (1, "period", serde_json::json!(0)),
+        ] {
+            let mut invalid: serde_json::Value = serde_json::from_str(&document).unwrap();
+            invalid["indicators"][index]["kind"][field] = value;
+            assert!(
+                settled_chart()
+                    .import_state_json(&invalid.to_string())
+                    .is_err()
+            );
+        }
+
+        // An earlier V3 document with only legacy kind tags still imports unchanged.
+        let mut legacy = settled_chart();
+        let sma = legacy.add_sma(0, 3).unwrap();
+        let old_document = legacy.export_state_json().unwrap();
+        let mut target = settled_chart();
+        target.import_state_json(&old_document).unwrap();
+        assert_eq!(
+            target.indicator_bindings()[0].kind,
+            crate::IndicatorKind::Sma { period: 3 }
+        );
+        assert_eq!(target.indicator_bindings()[0].outputs, [sma]);
+    }
+
+    #[test]
+    fn adaptive_regression_and_klinger_round_trip_and_reject_invalid_parameters() {
+        let mut chart = settled_chart();
+        let volume = chart.add_series(crate::SeriesKind::Histogram);
+        let times = (0..40).map(|row| row as f64 * 3600.0).collect::<Vec<_>>();
+        let values = (0..40).map(|row| 10.0 + row as f64).collect::<Vec<_>>();
+        chart
+            .set_series_data(volume, &times, &values, &values, &values, &values)
+            .unwrap();
+        let cases = [
+            (
+                crate::IndicatorKind::Klinger {
+                    fast: 3,
+                    slow: 7,
+                    signal: 4,
+                },
+                chart.add_klinger(0, volume, 3, 7, 4),
+            ),
+            (
+                crate::IndicatorKind::Kama {
+                    period: 5,
+                    fast: 2,
+                    slow: 10,
+                },
+                vec![chart.add_kama(0, 5, 2, 10).unwrap()],
+            ),
+            (
+                crate::IndicatorKind::McGinley { period: 5 },
+                vec![chart.add_mcginley(0, 5).unwrap()],
+            ),
+            (
+                crate::IndicatorKind::LinearRegression {
+                    period: 5,
+                    deviation: 2.0,
+                },
+                chart.add_linear_regression(0, 5, 2.0),
+            ),
+        ];
+        for (kind, outputs) in &cases {
+            assert_eq!(outputs.len(), incremental_output_count(kind));
+        }
+        for (index, (_, outputs)) in cases.iter().enumerate() {
+            for (slot, &output) in outputs.iter().enumerate() {
+                assert!(chart.set_indicator_output_style(
+                    output,
+                    crate::IndicatorOutputStyle {
+                        visible: (index + slot) % 2 == 0,
+                        line_color: Some("#336699".to_string()),
+                        line_width: Some(1.5 + slot as f64),
+                        ..crate::IndicatorOutputStyle::default()
+                    }
+                ));
+            }
+        }
+        let original_bindings = chart.indicator_bindings();
+        let document = chart.export_state_json().unwrap();
+        let mut restored = settled_chart();
+        let restored_volume = restored.add_series(crate::SeriesKind::Histogram);
+        restored
+            .set_series_data(restored_volume, &times, &values, &values, &values, &values)
+            .unwrap();
+        restored.import_state_json(&document).unwrap();
+        for (((kind, outputs), before), binding) in cases
+            .iter()
+            .zip(&original_bindings)
+            .zip(restored.indicator_bindings())
+        {
+            assert_eq!(&binding.kind, kind);
+            assert_eq!(&binding.outputs, outputs);
+            assert_eq!(binding.styles, before.styles);
+            assert_eq!(
+                binding.volume_source,
+                matches!(kind, crate::IndicatorKind::Klinger { .. }).then_some(restored_volume)
+            );
+            for &output in outputs {
+                let original = chart.data.series_data(output).unwrap();
+                let round_trip = restored.data.series_data(output).unwrap();
+                assert_eq!(original.0, round_trip.0);
+                for (left, right) in original.1.into_iter().zip(round_trip.1) {
+                    assert_eq!(left.len(), right.len());
+                    for (&left, &right) in left.iter().zip(right) {
+                        assert!(left == right || left.is_nan() && right.is_nan());
+                    }
+                }
+            }
+        }
+        for (index, field, value) in [
+            (0, "signal", serde_json::json!(0)),
+            (0, "fast", serde_json::json!(7)),
+            (1, "period", serde_json::json!(0)),
+            (1, "slow", serde_json::json!(2)),
+            (2, "period", serde_json::json!(0)),
+            (3, "period", serde_json::json!(0)),
+            (3, "deviation", serde_json::json!(-1.0)),
+        ] {
+            let mut invalid: serde_json::Value = serde_json::from_str(&document).unwrap();
+            invalid["indicators"][index]["kind"][field] = value;
+            let mut target = settled_chart();
+            let baseline = target.export_state_json().unwrap();
+            assert!(target.import_state_json(&invalid.to_string()).is_err());
+            assert_eq!(target.export_state_json().unwrap(), baseline);
+        }
+    }
+
+    #[test]
+    fn momentum_studies_v3_round_trip_parameters_outputs_and_styles() {
+        let mut chart = settled_chart();
+        let cases = [
+            (
+                crate::IndicatorKind::Kst {
+                    roc: [2, 3, 4, 5],
+                    smoothing: [3, 2, 4, 2],
+                    signal: 3,
+                },
+                chart.add_kst(0, [2, 3, 4, 5], [3, 2, 4, 2], 3),
+            ),
+            (
+                crate::IndicatorKind::Tsi {
+                    long: 4,
+                    short: 2,
+                    signal: 3,
+                },
+                chart.add_tsi(0, 4, 2, 3),
+            ),
+            (
+                crate::IndicatorKind::MassIndex {
+                    ema_period: 2,
+                    sum_period: 3,
+                },
+                vec![chart.add_mass_index(0, 2, 3).unwrap()],
+            ),
+            (
+                crate::IndicatorKind::Vortex { period: 4 },
+                chart.add_vortex(0, 4),
+            ),
+        ];
+        for (index, (kind, outputs)) in cases.iter().enumerate() {
+            let expected = incremental_output_count(kind);
+            assert_eq!(outputs.len(), expected);
+            for (slot, &output) in outputs.iter().enumerate() {
+                let style = crate::IndicatorOutputStyle {
+                    visible: (index + slot) % 2 == 0,
+                    line_color: Some(format!("#{:06x}", 0x224466 + index * 0x1100 + slot)),
+                    line_width: Some(1.25 + index as f64 + slot as f64),
+                    line_style: (index + slot) as u8 % 5,
+                    point_markers: slot == 1,
+                    ..crate::IndicatorOutputStyle::default()
+                };
+                assert!(chart.set_indicator_output_style(output, style));
+            }
+        }
+        let expected = chart.indicator_bindings();
+        let document = chart.export_state_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(parsed["schema_version"], PERSISTENCE_SCHEMA_VERSION_STUDIES);
+        let mut restored = settled_chart();
+        restored.import_state_json(&document).unwrap();
+        let actual = restored.indicator_bindings();
+        assert_eq!(actual.len(), cases.len());
+        for (before, after) in expected.iter().zip(&actual) {
+            assert_eq!(after.kind, before.kind);
+            assert_eq!(after.outputs.len(), before.outputs.len());
+            assert_eq!(after.styles, before.styles);
+            for (&old, &new) in before.outputs.iter().zip(&after.outputs) {
+                let original = chart.data.series_data(old).unwrap();
+                let round_trip = restored.data.series_data(new).unwrap();
+                assert_eq!(original.0, round_trip.0);
+                for (left, right) in original.1.into_iter().zip(round_trip.1) {
+                    assert_eq!(left.len(), right.len());
+                    for (&left, &right) in left.iter().zip(right) {
+                        assert!(left == right || left.is_nan() && right.is_nan());
+                    }
+                }
+            }
+        }
+        for (study, field) in [
+            (0, "roc"),
+            (0, "smoothing"),
+            (0, "signal"),
+            (1, "long"),
+            (1, "short"),
+            (1, "signal"),
+            (2, "ema_period"),
+            (2, "sum_period"),
+            (3, "period"),
+        ] {
+            let mut invalid: serde_json::Value = serde_json::from_str(&document).unwrap();
+            if matches!(field, "roc" | "smoothing") {
+                invalid["indicators"][study]["kind"][field][2] = serde_json::json!(0);
+            } else {
+                invalid["indicators"][study]["kind"][field] = serde_json::json!(0);
+            }
+            let mut untouched = settled_chart();
+            let baseline = untouched.export_state_json().unwrap();
+            assert!(
+                untouched
+                    .import_state_json(&serde_json::to_string(&invalid).unwrap())
+                    .is_err(),
+                "study {study} {field}"
+            );
+            assert_eq!(untouched.export_state_json().unwrap(), baseline);
+        }
+    }
+
+    #[test]
+    fn coppock_curve_persists_all_three_periods() {
+        let mut chart = settled_chart();
+        let output = chart.add_coppock_curve(0, 4, 3, 2).unwrap();
+        let document = chart.export_state_json().unwrap();
+        let mut restored = settled_chart();
+        restored.import_state_json(&document).unwrap();
+        let binding = &restored.indicator_bindings()[0];
+        assert_eq!(
+            binding.kind,
+            crate::IndicatorKind::CoppockCurve {
+                long: 4,
+                short: 3,
+                smoothing: 2,
+            }
+        );
+        assert_eq!(binding.outputs, vec![output]);
+    }
+
+    #[test]
+    fn fisher_transform_persists_two_ordered_outputs() {
+        let mut chart = settled_chart();
+        let outputs = chart.add_fisher_transform(0, 5);
+        assert_eq!(outputs.len(), 2);
+        let document = chart.export_state_json().unwrap();
+        let mut restored = settled_chart();
+        restored.import_state_json(&document).unwrap();
+        let binding = &restored.indicator_bindings()[0];
+        assert_eq!(
+            binding.kind,
+            crate::IndicatorKind::FisherTransform { period: 5 }
+        );
+        assert_eq!(binding.outputs, outputs);
+    }
+
+    #[test]
+    fn ultimate_oscillator_persists_periods_and_output() {
+        let mut chart = settled_chart();
+        let output = chart.add_ultimate_oscillator(0, 3, 5, 7).unwrap();
+        let document = chart.export_state_json().unwrap();
+        let mut restored = settled_chart();
+        restored.import_state_json(&document).unwrap();
+        let binding = &restored.indicator_bindings()[0];
+        assert_eq!(
+            binding.kind,
+            crate::IndicatorKind::UltimateOscillator {
+                short: 3,
+                medium: 5,
+                long: 7
+            }
+        );
+        assert_eq!(binding.outputs, vec![output]);
+    }
+
+    #[test]
     fn study_persistence_round_trips_dependencies_inputs_volume_and_styles() {
         let mut chart = settled_chart();
         let volume = chart.add_series(crate::SeriesKind::Histogram);
@@ -3228,6 +4057,80 @@ mod tests {
         assert_eq!(binding.kind, crate::IndicatorKind::Obv);
         assert_eq!(binding.volume_source, Some(restored_volume));
         assert_eq!(binding.outputs, vec![output]);
+    }
+
+    #[test]
+    fn cumulative_volume_studies_persist_volume_binding_and_output_identity() {
+        let mut chart = settled_chart();
+        let volume = chart.add_series(crate::SeriesKind::Histogram);
+        let times = (0..10).map(|i| (i * 3600) as f64).collect::<Vec<_>>();
+        let values = [11.0, 12.0, 11.0, 10.0, 11.0, 12.0, 13.0, 12.0, 11.0, 10.0];
+        chart
+            .set_series_data(volume, &times, &values, &values, &values, &values)
+            .unwrap();
+        let adl = chart.add_accumulation_distribution(0, volume).unwrap();
+        let pvt = chart.add_price_volume_trend(0, volume).unwrap();
+        let chaikin = chart.add_chaikin_oscillator(0, volume, 3, 7).unwrap();
+        let relative = chart.add_relative_volume(0, volume, 3).unwrap();
+        let oscillator = chart.add_volume_oscillator(0, volume, 2, 4, 3);
+        assert_eq!(oscillator.len(), 3);
+        let elder = chart.add_elder_force(0, volume, 3).unwrap();
+        let ease = chart.add_ease_of_movement(0, volume, 3, 100.0).unwrap();
+        let document = chart.export_state_json().unwrap();
+
+        let mut restored = settled_chart();
+        let restored_volume = restored.add_series(crate::SeriesKind::Histogram);
+        restored
+            .set_series_data(restored_volume, &times, &values, &values, &values, &values)
+            .unwrap();
+        restored.import_state_json(&document).unwrap();
+        let bindings = restored.indicator_bindings();
+        assert_eq!(
+            bindings[0].kind,
+            crate::IndicatorKind::AccumulationDistribution
+        );
+        assert_eq!(bindings[1].kind, crate::IndicatorKind::PriceVolumeTrend);
+        assert_eq!(bindings[0].volume_source, Some(restored_volume));
+        assert_eq!(bindings[1].volume_source, Some(restored_volume));
+        assert_eq!(bindings[0].outputs, vec![adl]);
+        assert_eq!(bindings[1].outputs, vec![pvt]);
+        assert_eq!(
+            bindings[2].kind,
+            crate::IndicatorKind::ChaikinOscillator { fast: 3, slow: 7 }
+        );
+        assert_eq!(bindings[2].volume_source, Some(restored_volume));
+        assert_eq!(bindings[2].outputs, vec![chaikin]);
+        assert_eq!(
+            bindings[3].kind,
+            crate::IndicatorKind::RelativeVolume { period: 3 }
+        );
+        assert_eq!(bindings[3].volume_source, Some(restored_volume));
+        assert_eq!(bindings[3].outputs, vec![relative]);
+        assert_eq!(
+            bindings[4].kind,
+            crate::IndicatorKind::VolumeOscillator {
+                fast: 2,
+                slow: 4,
+                signal: 3
+            }
+        );
+        assert_eq!(bindings[4].volume_source, Some(restored_volume));
+        assert_eq!(bindings[4].outputs, oscillator);
+        assert_eq!(
+            bindings[5].kind,
+            crate::IndicatorKind::ElderForce { period: 3 }
+        );
+        assert_eq!(bindings[5].volume_source, Some(restored_volume));
+        assert_eq!(bindings[5].outputs, vec![elder]);
+        assert_eq!(
+            bindings[6].kind,
+            crate::IndicatorKind::EaseOfMovement {
+                period: 3,
+                divisor: 100.0
+            }
+        );
+        assert_eq!(bindings[6].volume_source, Some(restored_volume));
+        assert_eq!(bindings[6].outputs, vec![ease]);
     }
 
     #[test]
@@ -3451,6 +4354,73 @@ mod tests {
             assert_eq!(restored.indicator_bindings()[0].outputs, vec![id]);
             assert_eq!(restored.indicator_info(id).unwrap().kind, output);
         }
+    }
+
+    #[test]
+    fn breadth_indicators_persist_output_identity_and_style() {
+        let mut chart = settled_chart();
+        let aroon = chart.add_aroon(0, 3);
+        let awesome = chart.add_awesome_oscillator(0).unwrap();
+        let dpo = chart.add_dpo(0, 5).unwrap();
+        let cmo = chart.add_chande_momentum(0, 5).unwrap();
+        let metrics = chart.add_bollinger_metrics(0, 5, 2.0);
+        let envelopes = chart.add_envelopes(0, 5, 10.0, true);
+        let alma = chart.add_alma(0, 5, 0.85, 6.0).unwrap();
+        assert_eq!(aroon.len(), 2);
+        let document = chart.export_state_json().unwrap();
+        let mut restored = settled_chart();
+        restored.import_state_json(&document).unwrap();
+        let bindings = restored.indicator_bindings();
+        assert!(matches!(
+            bindings[0].kind,
+            crate::IndicatorKind::Aroon { period: 3 }
+        ));
+        assert_eq!(bindings[0].outputs, aroon);
+        assert!(matches!(
+            bindings[1].kind,
+            crate::IndicatorKind::AwesomeOscillator
+        ));
+        assert_eq!(bindings[1].outputs, vec![awesome]);
+        assert!(matches!(
+            bindings[2].kind,
+            crate::IndicatorKind::Dpo { period: 5 }
+        ));
+        assert_eq!(bindings[2].outputs, vec![dpo]);
+        assert!(matches!(
+            bindings[3].kind,
+            crate::IndicatorKind::ChandeMomentum { period: 5 }
+        ));
+        assert_eq!(bindings[3].outputs, vec![cmo]);
+        assert!(matches!(
+            bindings[4].kind,
+            crate::IndicatorKind::BollingerMetrics {
+                period: 5,
+                deviation: 2.0
+            }
+        ));
+        assert_eq!(bindings[4].outputs, metrics);
+        assert!(matches!(
+            bindings[5].kind,
+            crate::IndicatorKind::Envelopes {
+                period: 5,
+                percent: 10.0,
+                exponential: true
+            }
+        ));
+        assert_eq!(bindings[5].outputs, envelopes);
+        assert!(matches!(
+            bindings[6].kind,
+            crate::IndicatorKind::Alma {
+                period: 5,
+                offset: 0.85,
+                sigma: 6.0
+            }
+        ));
+        assert_eq!(bindings[6].outputs, vec![alma]);
+        assert_eq!(
+            restored.series_kind(awesome),
+            Some(crate::SeriesKind::Histogram)
+        );
     }
 
     #[test]
@@ -4642,12 +5612,16 @@ mod tests {
                 DrawingKind::ShortPosition,
             ]
         );
-        assert!(chart.drawings[..3]
-            .iter()
-            .all(|drawing| drawing.pane_index == 0));
-        assert!(chart.drawings[3..]
-            .iter()
-            .all(|drawing| drawing.pane_index == 1));
+        assert!(
+            chart.drawings[..3]
+                .iter()
+                .all(|drawing| drawing.pane_index == 0)
+        );
+        assert!(
+            chart.drawings[3..]
+                .iter()
+                .all(|drawing| drawing.pane_index == 1)
+        );
         assert_eq!(chart.panes[0].persistent_id(), Some(3));
         assert_eq!(chart.panes[1].persistent_id(), Some(9));
     }
@@ -5620,8 +6594,12 @@ mod tests {
             }})
         );
         // A side override is a patch of its own side: the flat band stays.
-        assert!(chart
-            .drawing_apply_options(3, r#"{"tool_options":{"channel":{"upper_deviation":1.0}}}"#));
+        assert!(
+            chart.drawing_apply_options(
+                3,
+                r#"{"tool_options":{"channel":{"upper_deviation":1.0}}}"#
+            )
+        );
         let regression = chart.drawing(3).unwrap();
         assert_eq!(regression.regression_deviations, 2.0);
         assert_eq!(
@@ -5854,9 +6832,11 @@ mod tests {
         );
         assert_eq!(andrews.levels.len(), 19);
         assert!(andrews.levels[5..].iter().all(|level| !level.visible));
-        assert!(andrews.levels[5..]
-            .windows(2)
-            .all(|pair| pair[0].value <= pair[1].value));
+        assert!(
+            andrews.levels[5..]
+                .windows(2)
+                .all(|pair| pair[0].value <= pair[1].value)
+        );
         // Stored levels convert the same way; the median takes the drawing's line style, a
         // zero level (never drawn) drops out, and a stored fill colour moves with its band.
         let fan = chart.drawing(2).unwrap();
@@ -5915,7 +6895,7 @@ mod tests {
     #[test]
     fn fork_annotations_restore_in_their_fork_form() {
         use crate::drawings::{
-            resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions,
+            DrawingBodyGeometry, DrawingGeometryOptions, resolve_drawing_geometry,
         };
         let document = fork_document(vec![
             // The fork's three-anchor projection (pivot, radius point, price point).
@@ -6340,10 +7320,12 @@ mod tests {
             serde_json::json!(["dividends", "news"])
         );
         // A chart without hidden groups writes no key (byte-stable default documents).
-        assert!(!ChartEngine::new(800.0, 500.0, 1.0)
-            .export_state_json()
-            .unwrap()
-            .contains("hidden_mark_groups"));
+        assert!(
+            !ChartEngine::new(800.0, 500.0, 1.0)
+                .export_state_json()
+                .unwrap()
+                .contains("hidden_mark_groups")
+        );
 
         // Hosts import first and set marks later: the hidden set is live before any mark.
         let mut restored = ChartEngine::new(800.0, 500.0, 1.0);

@@ -3,7 +3,7 @@ use crate::frame::{pane_scale, series_scale_target};
 use crate::native_primitives::NativeSeriesPrimitiveKind;
 use crate::{ChartEngine, NativePrimitiveId, SeriesId};
 use aeris_charts_indicators::volume_profile::{
-    volume_profile, ProfileBar, VolumeProfile, MAX_VOLUME_PROFILE_ROWS,
+    MAX_VOLUME_PROFILE_ROWS, ProfileBar, VolumeProfile, volume_profile,
 };
 use aeris_charts_render::color::Color;
 
@@ -489,28 +489,25 @@ impl ChartEngine {
                 }
                 _ => Err("volume-profile source is unavailable"),
             };
-            if let Some(series) = self.series_entry_mut(source) {
-                if let Some(primitive) = series
+            if let Some(series) = self.series_entry_mut(source)
+                && let Some(primitive) = series
                     .native_primitives
                     .iter_mut()
                     .find(|primitive| primitive.id == id)
-                {
-                    if let NativeSeriesPrimitiveKind::VolumeProfileIndicator(state) =
-                        &mut primitive.kind
-                    {
-                        state.key = Some(key);
-                        state.snapshot.calculation_revision =
-                            state.snapshot.calculation_revision.wrapping_add(1);
-                        match result {
-                            Ok(profile) => {
-                                state.snapshot.profile = profile;
-                                state.snapshot.error = None;
-                            }
-                            Err(error) => {
-                                state.snapshot.profile = VolumeProfile::default();
-                                state.snapshot.error = Some(error);
-                            }
-                        }
+                && let NativeSeriesPrimitiveKind::VolumeProfileIndicator(state) =
+                    &mut primitive.kind
+            {
+                state.key = Some(key);
+                state.snapshot.calculation_revision =
+                    state.snapshot.calculation_revision.wrapping_add(1);
+                match result {
+                    Ok(profile) => {
+                        state.snapshot.profile = profile;
+                        state.snapshot.error = None;
+                    }
+                    Err(error) => {
+                        state.snapshot.profile = VolumeProfile::default();
+                        state.snapshot.error = Some(error);
                     }
                 }
             }

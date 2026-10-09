@@ -696,9 +696,9 @@ mod tests {
     #[test]
     fn invalidate_caches_bumps_the_text_generation() {
         let mut r = GpuiChartRenderer::new();
-        let gen = r.text_cache().generation();
+        let before = r.text_cache().generation();
         r.invalidate_caches();
-        assert_eq!(r.text_cache().generation(), gen + 1);
+        assert_eq!(r.text_cache().generation(), before + 1);
     }
 
     #[test]

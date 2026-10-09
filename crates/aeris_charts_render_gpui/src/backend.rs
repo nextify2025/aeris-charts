@@ -24,9 +24,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use gpui::{
-    fill, linear_color_stop, linear_gradient, point, px, radians, size, App, Background, Bounds,
-    ContentMask, Font, FontStyle, FontWeight, Hsla, Path, Pixels, RenderImage, Rgba, ShapedLine,
-    SharedString, TransformationMatrix, Window,
+    App, Background, Bounds, ContentMask, Font, FontStyle, FontWeight, Hsla, Path, Pixels,
+    RenderImage, Rgba, ShapedLine, SharedString, TransformationMatrix, Window, fill,
+    linear_color_stop, linear_gradient, point, px, radians, size,
 };
 use image::{Frame, RgbaImage};
 use smallvec::SmallVec;
@@ -166,7 +166,9 @@ pub fn measure_text(
 /// prefixes, the trend `+ Add text` prompt, and device-scaled frame runs alike — the native
 /// counterpart of the browser host's canvas `measureText` hook. It holds only the shared text
 /// system, so it stays valid across frames without borrowing the window.
-pub fn text_measurer(window: &Window) -> impl Fn(&str, f64, &str, u16, bool) -> f64 + 'static {
+pub fn text_measurer(
+    window: &Window,
+) -> impl Fn(&str, f64, &str, u16, bool) -> f64 + 'static + use<> {
     let text_system = window.text_system().clone();
     move |text, size, family, weight, italic| {
         if text.is_empty() || !(size.is_finite() && size > 0.0) {
@@ -179,7 +181,9 @@ pub fn text_measurer(window: &Window) -> impl Fn(&str, f64, &str, u16, bool) -> 
 /// A live engine glyph metric (`ChartEngine::set_text_cap_center`) backed by the window's native
 /// font metrics, the counterpart of the browser host's `measureText` ink bounds. GPUI font
 /// metrics report `descent` negative below the baseline, the convention `paint_text` places with.
-pub fn text_cap_centerer(window: &Window) -> impl Fn(f64, &str, u16, bool) -> f64 + 'static {
+pub fn text_cap_centerer(
+    window: &Window,
+) -> impl Fn(f64, &str, u16, bool) -> f64 + 'static + use<> {
     let text_system = window.text_system().clone();
     move |size, family, weight, italic| {
         if !(size.is_finite() && size > 0.0) {
@@ -366,7 +370,7 @@ impl ShapedTextCache {
 /// resource once per immutable image/opacity pair.
 #[derive(Default)]
 pub(crate) struct RasterImageCache {
-    entries: HashMap<(u64, u32), (Arc<RenderImage>, u64)>,
+    entries: HashMap<(u64, u8), (Arc<RenderImage>, u64)>,
     tick: u64,
 }
 
@@ -376,6 +380,11 @@ impl RasterImageCache {
         source: &aeris_charts_render::draw_list::RasterImage,
         opacity: f32,
     ) -> Option<Arc<RenderImage>> {
+        let opacity = aeris_charts_render::draw_list::quantize_image_opacity(opacity);
+        let alpha = (opacity * 255.0).round() as u8;
+        if alpha == 0 {
+            return None;
+        }
         let expected_len = usize::try_from(source.width)
             .ok()?
             .checked_mul(usize::try_from(source.height).ok()?)?
@@ -384,7 +393,7 @@ impl RasterImageCache {
             return None;
         }
         self.tick = self.tick.wrapping_add(1);
-        let key = (source.key, opacity.to_bits());
+        let key = (source.key, alpha);
         if let Some((image, stamp)) = self.entries.get_mut(&key) {
             *stamp = self.tick;
             return Some(Arc::clone(image));
@@ -400,8 +409,7 @@ impl RasterImageCache {
                 pixels[dst] = source.pixels[src + 2];
                 pixels[dst + 1] = source.pixels[src + 1];
                 pixels[dst + 2] = source.pixels[src];
-                pixels[dst + 3] =
-                    (f32::from(source.pixels[src + 3]) * opacity.clamp(0.0, 1.0)).round() as u8;
+                pixels[dst + 3] = (f32::from(source.pixels[src + 3]) * opacity).round() as u8;
             }
             let row = (y + 1) * row_bytes;
             pixels.copy_within(row + 4..row + 8, row);
@@ -414,15 +422,14 @@ impl RasterImageCache {
         let buffer = RgbaImage::from_raw(padded_width, padded_height, pixels)?;
         let image = Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)));
         // A chart may show all 32 registered stamp images alongside depth and alert images.
-        if self.entries.len() == 64 {
-            if let Some(oldest) = self
+        if self.entries.len() == 64
+            && let Some(oldest) = self
                 .entries
                 .iter()
                 .min_by_key(|(_, (_, stamp))| *stamp)
                 .map(|(key, _)| *key)
-            {
-                self.entries.remove(&oldest);
-            }
+        {
+            self.entries.remove(&oldest);
         }
         self.entries.insert(key, (Arc::clone(&image), self.tick));
         Some(image)
@@ -560,7 +567,7 @@ impl GpuiChartRenderer {
 /// Clip ops are handled by recursing into the masked range rather than by mutating a stack:
 /// `Window::with_content_mask` is a scoped call, so the nesting has to be expressed as nesting.
 #[allow(clippy::too_many_arguments)] // one context bundle per GPUI paint call; a wrapper struct
-                                     // would only move these borrows behind another name
+// would only move these borrows behind another name
 fn paint_plan(
     plan: &ScenePlan,
     text_cache: &mut crate::text::TextCache,
@@ -588,7 +595,7 @@ fn paint_plan(
 }
 
 #[allow(clippy::too_many_arguments)] // one context bundle per GPUI paint call; splitting it would
-                                     // only move the arguments behind a struct with no gain
+// only move the arguments behind a struct with no gain
 fn paint_range(
     plan: &ScenePlan,
     start: usize,
@@ -643,14 +650,14 @@ fn paint_range(
                 // long homogeneous runs to keep submission work bounded; see `batchable_run` for
                 // why this cannot change the output.
                 let run = batchable_run(plan, i, end);
-                if run >= QUAD_BATCH_THRESHOLD {
-                    if let Some(path) = build_quad_run_path(plan, i, i + run, transform) {
-                        window.paint_path(path, to_background(*paint));
-                        metrics.batched_quads += run as u32;
-                        metrics.quad_batches += 1;
-                        i += run;
-                        continue;
-                    }
+                if run >= QUAD_BATCH_THRESHOLD
+                    && let Some(path) = build_quad_run_path(plan, i, i + run, transform)
+                {
+                    window.paint_path(path, to_background(*paint));
+                    metrics.batched_quads += run as u32;
+                    metrics.quad_batches += 1;
+                    i += run;
+                    continue;
                 }
                 let bounds = transform.bounds(*rect);
                 let mut quad = fill(bounds, to_background(*paint));
@@ -1184,10 +1191,35 @@ mod tests {
         ];
         let bytes = image.as_bytes(0).expect("GPUI image payload");
         assert_eq!(bytes.len(), expected_row.len() * 3);
-        assert!(bytes
-            .chunks_exact(expected_row.len())
-            .all(|row| row == expected_row));
+        assert!(
+            bytes
+                .chunks_exact(expected_row.len())
+                .all(|row| row == expected_row)
+        );
         assert_eq!(source.pixels.as_ref(), &[255, 0, 0, 255, 0, 0, 255, 128]);
+    }
+
+    #[test]
+    fn raster_image_cache_skips_zero_alpha_and_reuses_the_quantized_byte_key() {
+        let source = aeris_charts_render::draw_list::RasterImage {
+            key: 2,
+            width: 1,
+            height: 1,
+            pixels: Arc::from([255, 0, 0, 255]),
+        };
+        let mut cache = RasterImageCache::default();
+        for opacity in [-0.1, 0.0, 0.001] {
+            assert!(cache.resolve(&source, opacity).is_none());
+            assert!(cache.entries.is_empty());
+        }
+        let first = cache.resolve(&source, 0.72).unwrap();
+        let same_byte = cache.resolve(&source, 184.0 / 255.0).unwrap();
+        assert!(Arc::ptr_eq(&first, &same_byte));
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.contains_key(&(source.key, 184)));
+        assert_eq!(first.as_bytes(0).unwrap()[3], 184);
+        assert!(cache.resolve(&source, 1.0 / 255.0).is_some());
+        assert_eq!(cache.entries.len(), 2);
     }
 
     #[test]

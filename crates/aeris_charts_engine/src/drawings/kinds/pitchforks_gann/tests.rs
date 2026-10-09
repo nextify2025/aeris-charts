@@ -488,10 +488,12 @@ fn tools_tolerate_charts_without_data_and_degenerate_anchors() {
         ));
     }
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .points
-        .iter()
-        .all(|point| point[0].is_finite() && point[1].is_finite()));
+    assert!(
+        frame.panes[0]
+            .points
+            .iter()
+            .all(|point| point[0].is_finite() && point[1].is_finite())
+    );
 }
 
 #[test]
@@ -841,9 +843,11 @@ fn gann_box_time_levels_split_the_axes() {
     );
     let label_x = at_x(&chart, 4.0);
     assert!(at_x(&chart, -4.0) < -25.0 && label_x > 25.0);
-    assert!(texts(&mut chart)
-        .iter()
-        .any(|(text, x, _)| text.starts_with("1.5 ") && (f64::from(*x) - label_x).abs() < 1e-3));
+    assert!(
+        texts(&mut chart)
+            .iter()
+            .any(|(text, x, _)| text.starts_with("1.5 ") && (f64::from(*x) - label_x).abs() < 1e-3)
+    );
     assert!(chart.take_drawing_candidates(0, None).contains(&beyond));
     chart.remove_drawing(beyond);
     // Hits: the time line at 0.5 and every price line; no vertical line at 0.25 any more.
@@ -892,9 +896,11 @@ fn gann_box_angles_follow_show_angles() {
     assert!(chart.drawing_apply_options(id, r#"{"tool_options":{"gann":{"show_angles":true}}}"#));
     assert!(diagonal(&mut chart, a, b));
     let steep_end = (a.0 + (b.0 - a.0) / 2.0, b.1);
-    assert!(polylines(&mut chart, "#2962ff")
-        .iter()
-        .any(|(points, ..)| close(points[0], a, 1e-3) && close(points[1], steep_end, 1e-3)));
+    assert!(
+        polylines(&mut chart, "#2962ff")
+            .iter()
+            .any(|(points, ..)| close(points[0], a, 1e-3) && close(points[1], steep_end, 1e-3))
+    );
     // Unfilled, and a body target along the line.
     let on_steep = mid(a, steep_end);
     assert_eq!(part_at(&chart, on_steep), Some((id, DrawingDragPart::Body)));
@@ -1103,10 +1109,12 @@ fn gann_fan_scale_ratio_sets_the_one_by_one_slope() {
     assert!(chart.drawing_apply_options(id, r#"{"tool_options":{"gann":{"scale_ratio":50}}}"#));
     chart.set_price_scale_mode(0, false, crate::PriceScaleMode::Logarithmic);
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .points
-        .iter()
-        .all(|point| point[0].is_finite() && point[1].is_finite()));
+    assert!(
+        frame.panes[0]
+            .points
+            .iter()
+            .all(|point| point[0].is_finite() && point[1].is_finite())
+    );
     for gy in 0..25 {
         for gx in 0..40 {
             part_at(
@@ -1686,7 +1694,9 @@ fn a_price_basis_rescale_scales_gann_price_per_bar_ratios_with_the_anchors() {
     let geometry = |chart: &mut ChartEngine| (polylines(chart, INK), polylines(chart, "#787b86"));
     let before = geometry(&mut chart);
     // A committed edit whose undo snapshot must follow the basis too.
-    assert!(chart.drawing_apply_options(square, r#"{"tool_options":{"gann":{"scale_ratio":0.3}}}"#));
+    assert!(
+        chart.drawing_apply_options(square, r#"{"tool_options":{"gann":{"scale_ratio":0.3}}}"#)
+    );
     assert!(chart.undo_drawing());
 
     // A 2:1 split: the host swaps in halved data and rescales the drawings by 0.5.
@@ -1834,10 +1844,12 @@ fn fork_documents_regain_the_fork_gann_look() {
     assert_eq!(rects(&mut chart, |color| color.a() == 35).len(), 12);
     let box_px = (anchor(&chart, 1, 0), anchor(&chart, 1, 1));
     let labels = texts(&mut chart);
-    let top = box_px.0 .1.min(box_px.1 .1);
-    assert!(labels
-        .iter()
-        .any(|(_, _, y)| (f64::from(*y) - (top - 8.0)).abs() < 1e-3));
+    let top = box_px.0.1.min(box_px.1.1);
+    assert!(
+        labels
+            .iter()
+            .any(|(_, _, y)| (f64::from(*y) - (top - 8.0)).abs() < 1e-3)
+    );
     only(&mut chart, 2);
     let stats = texts(&mut chart)
         .into_iter()

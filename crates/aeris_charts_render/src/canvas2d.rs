@@ -14,10 +14,10 @@
 
 use crate::color::Color;
 use crate::draw_list::{
-    positive_finite_extent, segment_points, text_font_spec, IRect, LineStyle, LineType, Prim,
-    RasterImage, TextAlign,
+    IRect, LineStyle, LineType, Prim, RasterImage, TextAlign, positive_finite_extent,
+    segment_points, text_font_spec,
 };
-use crate::line::{expand_band, expand_line, LinePoint};
+use crate::line::{LinePoint, expand_band, expand_line};
 
 /// Abstract 2D drawing target: the subset of `CanvasRenderingContext2D` this executor needs.
 /// Coordinates are bitmap-space (device px), matching the IR. Concrete impls wrap web-sys or a
@@ -482,10 +482,13 @@ pub fn execute(
                 rect,
                 opacity,
             } => {
-                if image.width > 0 && image.height > 0 && *opacity > 0.0 {
-                    if let Some(rect) = crate::draw_list::snap_image_rect(*rect) {
-                        target.draw_raster_image(image, rect, opacity.clamp(0.0, 1.0));
-                    }
+                let opacity = crate::draw_list::quantize_image_opacity(*opacity);
+                if image.width > 0
+                    && image.height > 0
+                    && opacity > 0.0
+                    && let Some(rect) = crate::draw_list::snap_image_rect(*rect)
+                {
+                    target.draw_raster_image(image, rect, opacity);
                 }
             }
         }
@@ -643,6 +646,9 @@ mod tests {
                 align.canvas_keyword()
             ));
         }
+        fn draw_raster_image(&mut self, _image: &RasterImage, rect: [f32; 4], opacity: f32) {
+            self.ops.push(format!("image {rect:?} {opacity}"));
+        }
     }
 
     fn run(prims: &[Prim], points: &[[f32; 2]]) -> Vec<String> {
@@ -657,6 +663,32 @@ mod tests {
             },
         );
         r.ops
+    }
+
+    #[test]
+    fn images_skip_zero_byte_opacity_and_forward_the_shared_quantized_alpha() {
+        let image = RasterImage {
+            key: 1,
+            width: 1,
+            height: 1,
+            pixels: std::sync::Arc::from([255, 128, 32, 255]),
+        };
+        let prim = |opacity| Prim::Image {
+            image: image.clone(),
+            rect: [0.0, 0.0, 2.0, 2.0],
+            opacity,
+        };
+        for opacity in [-0.2, 0.0, 0.001] {
+            assert!(run(&[prim(opacity)], &[]).is_empty(), "{opacity}");
+        }
+        assert_eq!(
+            run(&[prim(1.0 / 255.0)], &[]),
+            ["image [0.0, 0.0, 2.0, 2.0] 0.003921569"]
+        );
+        assert_eq!(
+            run(&[prim(0.72)], &[]),
+            [format!("image [0.0, 0.0, 2.0, 2.0] {}", 184.0_f32 / 255.0)]
+        );
     }
 
     #[test]

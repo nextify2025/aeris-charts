@@ -1,4 +1,5 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test, wait_for_chart } from "./page-ready.mjs";
 import { PNG } from "pngjs";
 
 // industry-standard series selection: hovering a series shows the pointer (click affordance)
@@ -10,13 +11,6 @@ const BLUE = [0, 145, 255]; // semantic primary #0091ff — the anchor border
 test.beforeEach(async ({ page }) => {
   page.on("pageerror", (error) => console.log(`[browser:pageerror] ${error.message}`));
 });
-
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
-}
 
 async function goto_fixture(page) {
   await page.goto("/?runtimeTest=presentedFrame&backend=canvas2d&forceFallbackAdapter=1");

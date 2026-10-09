@@ -516,6 +516,15 @@ impl Default for ChartOptions {
     }
 }
 
+impl ChartOptions {
+    /// Deserialize a complete options object. Every crate that needs typed options from JSON calls
+    /// this one non-generic function, so the WASM module carries a single copy of the `Value`-based
+    /// deserializer instead of one per calling crate (about 50 KB).
+    pub fn from_json_value(value: Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value)
+    }
+}
+
 /// Recursively deep-merge `patch` into `dst`, matching reference `helpers/merge.ts`: when both sides of
 /// a key are JSON objects, merge them key-by-key; otherwise `patch` replaces `dst` wholesale
 /// (scalars, arrays, and null all overwrite). A `null` in `patch` explicitly sets the key to null.
@@ -570,7 +579,7 @@ impl ChartOptionsStore {
                 layout.remove("attributionLogo");
             }
             deep_merge(&mut self.value, &patch);
-            self.typed = serde_json::from_value(self.value.clone()).unwrap_or_default();
+            self.typed = ChartOptions::from_json_value(self.value.clone()).unwrap_or_default();
             self.generation = self.generation.wrapping_add(1);
         }
     }
@@ -609,10 +618,10 @@ impl ChartOptionsStore {
 
         // A theme patch supplies effective colors for creation/theme switching. A style reset must
         // restore the canonical follow semantics instead of pinning those effective values.
-        if let Some(layout) = defaults.get_mut("layout").and_then(Value::as_object_mut) {
-            if let Some(panes) = layout.get_mut("panes").and_then(Value::as_object_mut) {
-                panes.insert("separatorColor".into(), Value::String(String::new()));
-            }
+        if let Some(layout) = defaults.get_mut("layout").and_then(Value::as_object_mut)
+            && let Some(panes) = layout.get_mut("panes").and_then(Value::as_object_mut)
+        {
+            panes.insert("separatorColor".into(), Value::String(String::new()));
         }
         for key in ["leftPriceScale", "rightPriceScale"] {
             if let Some(scale) = defaults.get_mut(key).and_then(Value::as_object_mut) {
@@ -713,7 +722,7 @@ impl ChartOptionsStore {
             }
         }
 
-        self.typed = serde_json::from_value(self.value.clone()).unwrap_or_default();
+        self.typed = ChartOptions::from_json_value(self.value.clone()).unwrap_or_default();
         self.generation = self.generation.wrapping_add(1);
     }
 }

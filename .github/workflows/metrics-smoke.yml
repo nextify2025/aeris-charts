@@ -6,7 +6,7 @@ on:
     branches: [main]
 
 env:
-  RUSTUP_TOOLCHAIN: stable
+  RUSTUP_TOOLCHAIN: 1.99.0
   AERIS_CHARTS_BENCH_ENV_CLASS: shared-ci
   AERIS_CHARTS_BENCH_ENV_ID: github-ubuntu-shared
 

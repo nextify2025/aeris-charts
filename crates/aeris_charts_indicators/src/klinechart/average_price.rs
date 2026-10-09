@@ -1,7 +1,7 @@
 //! `AVP` (均价). Ported from KLineChart `src/extension/indicator/averagePrice.ts`.
 
-use super::stepper::{fold, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold};
 
 /// The cumulative turnover and volume.
 #[derive(Clone, Copy, Debug, Default)]

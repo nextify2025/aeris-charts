@@ -34,9 +34,9 @@ chart.update_trade_stream_trades_typed(stream, live_columns); // "tip" for in-or
 
 Rust 宿主通过常规写入入口得到相同的拒绝（`false`、`0`、`None`、`Err(UnsupportedSeriesData)` 或 `Rejected(UnsupportedSeries)`），这些结果同样可能表示未知 id 或无效数据，因此可用 `ChartEngine::series_is_source_owned(id)` 区分引擎持有的系列，而 `ChartEngine::apply_momentum_histogram_colors` 对 delta 与成交量研究返回 `false`。`FootprintError::SeriesOwned` 是 `bind_trade_bar_series_to_stream` 在 K 线或柱已被重采样器、合成柱或研究（已转换为 K 线）写入时返回的错误，也是 `configure_footprint_series` 在任何系列由成交流、研究、重采样器或合成柱写入时返回的错误。`bind_trade_bar_series_to_stream` 先检查系列种类和 `max_points`，因此足迹图或标量研究会得到 `UnsupportedTradeBarSeries` 或 `InvalidAggregation`。
 
-**实时、更正与回放。** 按序到达的成交就地更新正在形成的柱，位于柱边界或其之后的第一笔成交开启下一根柱（`"tip"`）；迟到或被更正的成交会使成交流重建一次（`"historical"`）。同一成交流上的成交量直方图、CVD/delta 研究和足迹图跟随每一次变化。`chart.set_replay_clock_micros(clock)` 恰好显示成交带中截至该时钟的柱；一根由被并入的开盘前成交开启、且领先于时钟的柱，会在时钟到达其开盘时间时出现。成交量柱取图表主（第一个）价格系列的涨跌色调（`histogram_updown`）；可像任何直方图一样重设其样式。
+**实时、更正与回放。** 按序到达的成交就地更新正在形成的柱，位于柱边界或其之后的第一笔成交开启下一根柱（`"tip"`）；迟到或被更正的成交就地合并，成交流从其之前最近的回放检查点重建一次（`"historical"`），代价随它距尾部的距离而不是随整段成交带增长。同一成交流上的成交量直方图、CVD/delta 研究和足迹图跟随每一次变化。`chart.set_replay_clock_micros(clock)` 恰好显示成交带中截至该时钟的柱；一根由被并入的开盘前成交开启、且领先于时钟的柱，会在时钟到达其开盘时间时出现。成交量柱取图表主（第一个）价格系列的涨跌色调（`histogram_updown`）；主系列该行为空白数据时（订单流呈现把主系列安装为空白数据），改从同一窗格中可见的足迹图读取方向，并沿用成交量系列自己的 `histogram_updown_rule`，没有足迹柱覆盖的槽位保持纯色；可像任何直方图一样重设其样式。
 
-Rust 宿主调用 `ChartEngine::set_trade_stream_sessions(stream, Some(TradeSessionOptions { windows, outside: OutOfSessionPolicy::Fold }))` 和 `add_trade_volume_series(stream, pane)`；`SessionBarGrid` 为其他 Tick 消费方提供相同的放置方式。
+Rust 宿主调用 `ChartEngine::set_trade_stream_sessions(stream, Some(TradeSessionOptions { windows, outside: OutOfSessionPolicy::Fold }))` 和 `add_trade_volume_series(stream, pane)`；`SessionBarGrid` 为其他 Tick 消费方提供相同的放置方式。订单流呈现的成交流在原始成交带超过上限后会封存最旧的柱；交易时段、交易所时间或周期在此之后改变时，引擎丢弃无法重新放置的封存柱、在新网格上重新聚合原始成交带，宿主再经 `prepend_order_flow_history` 补回更早的历史（见[足迹图领域契约](../features/footprint.md#5-存储失效与恢复)）。
 
 ### 重采样
 

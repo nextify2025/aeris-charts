@@ -18,9 +18,9 @@ use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::LineStyle;
 use aeris_charts_render::shape::{self, Point};
 
-use super::super::geometry::{gann_fixed_end, GannGridGeometry};
+use super::super::geometry::{GannGridGeometry, gann_fixed_end};
 use super::super::handles::{DrawingHandle, HandleDrag, HandleShape};
-use super::super::parts::{text_on, DrawingParts, PartContext, STATS_GAP, STATS_PADDING};
+use super::super::parts::{DrawingParts, PartContext, STATS_GAP, STATS_PADDING, text_on};
 use super::super::{Drawing, DrawingTextHAlign, DrawingTextVAlign};
 use crate::{
     ChartEngine, DrawingDragPart, DrawingKind, DrawingLevel, DrawingPoint,
@@ -597,7 +597,7 @@ pub(crate) fn square_stats(
         return;
     }
     let mut lines = vec![
-        ctx.engine.drawing_price_text(drawing, range),
+        ctx.engine.format_drawing_price(drawing, range),
         format!("{} bars", bars.round() as i64),
     ];
     if bars > f64::EPSILON {

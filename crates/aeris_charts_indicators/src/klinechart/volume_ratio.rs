@@ -1,7 +1,7 @@
 //! `VR` (成交量变异率). Ported from KLineChart `src/extension/indicator/volumeRatio.ts`.
 
-use super::stepper::{fold, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold};
 
 /// VR outputs in KLineChart figure order.
 #[derive(Clone, Debug, PartialEq)]

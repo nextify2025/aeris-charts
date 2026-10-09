@@ -968,12 +968,10 @@ impl ChartEngine {
                 index,
                 grab_offset_y,
             }) => {
-                if dragging {
-                    if let Some(pane_below) = self.panes.get(index + 1) {
-                        let delta = y - grab_offset_y - pane_below.top;
-                        self.drag_pane_separator(index, delta);
-                        self.input.layout_dirty = true;
-                    }
+                if dragging && let Some(pane_below) = self.panes.get(index + 1) {
+                    let delta = y - grab_offset_y - pane_below.top;
+                    self.drag_pane_separator(index, delta);
+                    self.input.layout_dirty = true;
                 }
                 // The separator is chrome: the crosshair hides during the resize drag.
                 self.clear_pointer_hover();
@@ -1234,13 +1232,12 @@ impl ChartEngine {
                 // must still be under the release and still act. A press the control could not
                 // act on stays absorbed, and an order the host moved or put under the pointer
                 // during the click (a twin at the same price) is never the one cancelled.
-                if let Some(pressed) = press_close.filter(|_| !moved) {
-                    if self
+                if let Some(pressed) = press_close.filter(|_| !moved)
+                    && self
                         .pointer_trading_hit_at(x, y)
                         .is_some_and(|end| end.same_target(&pressed))
-                    {
-                        self.trading_activate_hit(&pressed);
-                    }
+                {
+                    self.trading_activate_hit(&pressed);
                 }
             }
             PressMode::Alert => {
@@ -1935,16 +1932,17 @@ impl ChartEngine {
         }
     }
 
-    /// The temporary Ctrl/Cmd OHLC magnet mirrors the drawing magnet the engine will apply, and only
-    /// for drawing work: an armed tool whose effective magnet (chart mode, tool mode, Ctrl/Cmd as
-    /// the temporary toggle) is strong, or a drawing drag with Ctrl/Cmd held. Returns whether it
-    /// changed.
+    /// The controller is the one reader of the magnet modifier: Ctrl/Cmd held during drawing work
+    /// (an armed tool, a pending creation, or a drawing drag) is reported to the engine as the
+    /// held magnet modifier, which the crosshair resolves against the worked drawing's
+    /// effective magnet ([`ChartEngine::drawing_work_magnet`]). Free browsing never reports it.
+    /// Returns whether it changed.
     fn apply_input_magnet(&mut self) -> bool {
         let modifiers = self.input.modifiers;
-        let toggle = modifiers.control || modifiers.meta;
-        let armed = self.armed_drawing_magnet(toggle) == DrawingMagnetMode::Strong;
-        let dragging = toggle && self.drawing_drag_active();
-        self.set_crosshair_ohlc_magnet(armed || dragging)
+        let drawing = self.active_drawing_tool().is_some()
+            || self.drawing_create_active()
+            || self.drawing_drag_active();
+        self.set_crosshair_ohlc_magnet((modifiers.control || modifiers.meta) && drawing)
     }
 
     /// Whether a press lands on the text being edited: its label, a text tool's body, or the box
@@ -2034,18 +2032,18 @@ impl ChartEngine {
     /// start its tooltip dwell, since the engine has no clock of its own.
     pub(crate) fn refresh_resting_pointer_affordance(&mut self) {
         let resting = self.input.press.is_none() && self.input.touch_tracking.is_none();
-        if let Some((x, y)) = self.input.pointer.filter(|_| resting) {
-            if matches!(self.region_at(x, y), ChartRegion::Pane) {
-                let changed = self.set_trading_hover_hit(self.pointer_trading_hit_at(x, y));
-                // A control that appeared under the resting pointer waits for the next motion to
-                // start its dwell. Otherwise a lane token whose dwell is still running keeps it
-                // (`refresh_pointer_hover`), and nothing pending clears the deadline.
-                let trading_pending = self.trading_tooltip_pending();
-                if (changed && trading_pending)
-                    || (!trading_pending && !self.timeline_tooltip_pending())
-                {
-                    self.input.tooltip_deadline_ms = None;
-                }
+        if let Some((x, y)) = self.input.pointer.filter(|_| resting)
+            && matches!(self.region_at(x, y), ChartRegion::Pane)
+        {
+            let changed = self.set_trading_hover_hit(self.pointer_trading_hit_at(x, y));
+            // A control that appeared under the resting pointer waits for the next motion to
+            // start its dwell. Otherwise a lane token whose dwell is still running keeps it
+            // (`refresh_pointer_hover`), and nothing pending clears the deadline.
+            let trading_pending = self.trading_tooltip_pending();
+            if (changed && trading_pending)
+                || (!trading_pending && !self.timeline_tooltip_pending())
+            {
+                self.input.tooltip_deadline_ms = None;
             }
         }
         self.refresh_input_cursor();
@@ -3831,7 +3829,10 @@ mod tests {
         let axis_x = chart.pane_w + 10.0;
         chart.input_context_menu(axis_x, 100.0);
         let events = chart.take_input_events();
-        let [ChartInputEvent::ContextMenu(pane), ChartInputEvent::ContextMenu(axis)] = events[..]
+        let [
+            ChartInputEvent::ContextMenu(pane),
+            ChartInputEvent::ContextMenu(axis),
+        ] = events[..]
         else {
             panic!("two context menus: {events:?}");
         };
@@ -4359,10 +4360,12 @@ mod tests {
         chart.input_pointer_down(sample(200.0), 2);
         chart.input_pointer_up(sample(201.0));
         assert_eq!(chart.editing_drawing(), None);
-        assert!(!chart
-            .take_input_events()
-            .iter()
-            .any(|event| matches!(event, ChartInputEvent::TextEditorOpened(_))));
+        assert!(
+            !chart
+                .take_input_events()
+                .iter()
+                .any(|event| matches!(event, ChartInputEvent::TextEditorOpened(_)))
+        );
 
         // Once the pair is spent, a later double-click on the drawing edits it again.
         let (inside_x, inside_y) = (x - 60.0, y);
@@ -4558,28 +4561,106 @@ mod tests {
             },
             ..at(x, y)
         };
-        // No tool armed: Ctrl alone never turns the OHLC magnet on.
+        // No tool armed: Ctrl alone is never reported, and the crosshair magnet stays off.
         chart.input_pointer_move(ctrl(300.0, 200.0), false);
         assert!(!chart.crosshair_ohlc_magnet);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Off);
 
         // Chart magnet off: Ctrl is the temporary strong magnet while a tool is armed.
         assert!(chart.set_drawing_tool(Some(DrawingKind::TrendLine), None, None));
         chart.input_pointer_move(at(300.0, 200.0), false);
         assert!(!chart.crosshair_ohlc_magnet);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Off);
         chart.input_pointer_move(ctrl(300.0, 200.0), false);
         assert!(chart.crosshair_ohlc_magnet);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Strong);
 
         // Chart magnet strong: it snaps without Ctrl, and Ctrl turns it off for this placement.
         chart.set_drawing_magnet_mode(DrawingMagnetMode::Strong);
         chart.input_pointer_move(at(300.0, 200.0), false);
-        assert!(chart.crosshair_ohlc_magnet);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Strong);
         chart.input_pointer_move(ctrl(300.0, 200.0), false);
-        assert!(!chart.crosshair_ohlc_magnet);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Off);
 
-        // Chart magnet weak: Ctrl makes it off as well, and no Ctrl keeps the crosshair free.
+        // Chart magnet weak: the crosshair follows the weak magnet (it snaps only within the
+        // weak radius, like the anchor), and Ctrl turns it off as well.
         chart.set_drawing_magnet_mode(DrawingMagnetMode::Weak);
         chart.input_pointer_move(at(300.0, 200.0), false);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Weak);
+        chart.input_pointer_move(ctrl(300.0, 200.0), false);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Off);
+
+        // Releasing the tool ends drawing work: the held key is no longer reported.
+        assert!(chart.set_drawing_tool(None, None, None));
+        chart.input_pointer_move(ctrl(300.0, 200.0), false);
         assert!(!chart.crosshair_ohlc_magnet);
+        assert_eq!(chart.drawing_work_magnet(), DrawingMagnetMode::Off);
+    }
+
+    #[test]
+    fn ctrl_held_drags_snap_the_anchor_and_the_crosshair_together() {
+        // A trend-line anchor dragged through the controller with Ctrl held, to bar 20
+        // ({o 106, h 109, l 103, c 107}) at 107.4: the anchor and the crosshair agree in every
+        // case, whether the held key toggles the chart magnet or upgrades the drawing's own.
+        let ctrl = |x, y| PointerInput {
+            modifiers: InputModifiers {
+                control: true,
+                ..InputModifiers::default()
+            },
+            ..at(x, y)
+        };
+        for (chart_mode, own, snaps) in [
+            (DrawingMagnetMode::Strong, "off", false),
+            (DrawingMagnetMode::Off, "off", true),
+            (DrawingMagnetMode::Strong, "weak", true),
+        ] {
+            let label = format!("chart {chart_mode:?}, own {own}");
+            let mut chart = chart();
+            chart.set_drawing_magnet_mode(chart_mode);
+            let id = chart
+                .add_drawing(
+                    DrawingKind::TrendLine,
+                    0,
+                    vec![
+                        DrawingPoint {
+                            logical: 10.0,
+                            price: 102.0,
+                        },
+                        DrawingPoint {
+                            logical: 40.0,
+                            price: 104.0,
+                        },
+                    ],
+                    Some(&format!(r#"{{"magnet":"{own}"}}"#)),
+                )
+                .unwrap();
+            chart.build_frame();
+            chart.set_selected_drawing(Some(id));
+            let anchor = chart.drawing_point_to_coordinate(id, 1).unwrap();
+            let target = chart
+                .drawing_to_px(
+                    0,
+                    DrawingPoint {
+                        logical: 20.0,
+                        price: 107.4,
+                    },
+                )
+                .unwrap();
+            chart.input_pointer_down(ctrl(anchor.0, anchor.1), 1);
+            chart.input_pointer_move(ctrl(anchor.0 - 20.0, anchor.1), true);
+            chart.input_pointer_move(ctrl(target.0, target.1), true);
+            assert!(chart.drawing_drag_active(), "{label}");
+            let placed = chart.drawing(id).unwrap().points[1].price;
+            let expected = if snaps { 107.0 } else { 107.4 };
+            assert!((placed - expected).abs() < 1e-6, "{label}: anchor {placed}");
+            let (from, to) = chart.visible_range_for_frame().unwrap();
+            let crosshair = chart.crosshair_snap(0, target.0, target.1, from, to).0;
+            assert!(
+                (crosshair - placed).abs() < 1e-6,
+                "{label}: crosshair {crosshair} vs anchor {placed}"
+            );
+            chart.input_pointer_up(ctrl(target.0, target.1));
+        }
     }
 
     #[test]
@@ -4622,10 +4703,12 @@ mod tests {
 
         assert!(chart.set_drawing_tool(Some(DrawingKind::Callout), None, None));
         click(&mut chart, 300.0, 200.0);
-        assert!(!chart
-            .take_input_events()
-            .iter()
-            .any(|event| matches!(event, ChartInputEvent::DrawingCreated(_))));
+        assert!(
+            !chart
+                .take_input_events()
+                .iter()
+                .any(|event| matches!(event, ChartInputEvent::DrawingCreated(_)))
+        );
         click(&mut chart, 380.0, 170.0);
         let events = chart.take_input_events();
         let [ChartInputEvent::DrawingCreated(callout)] = events[..] else {

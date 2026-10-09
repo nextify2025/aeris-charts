@@ -1,7 +1,9 @@
 [toolchain]
 # An exact release, not the floating channel: a new stable must not change what CI or a local build
 # compiles with (it added a Clippy lint overnight once). Move it in a deliberate commit that also moves
-# `toolchain:` in every workflow; `bun run check:release-gates` fails when they disagree.
+# `toolchain:` in every workflow and the workflow-level `RUSTUP_TOOLCHAIN` where a workflow sets it
+# (publish and the benchmark workflows); `bun run check:release-gates` fails when a workflow's
+# `toolchain:` or `RUSTUP_TOOLCHAIN` disagrees.
 channel = "1.99.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]

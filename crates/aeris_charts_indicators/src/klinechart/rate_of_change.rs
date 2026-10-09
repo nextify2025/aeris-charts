@@ -1,7 +1,7 @@
 //! `ROC` (变动率). Ported from KLineChart `src/extension/indicator/rateOfChange.ts`.
 
-use super::stepper::{fold, rolling_mean_step, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold, rolling_mean_step};
 
 /// ROC outputs in KLineChart figure order.
 #[derive(Clone, Debug, PartialEq)]

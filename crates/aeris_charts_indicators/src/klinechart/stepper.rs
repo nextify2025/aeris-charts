@@ -18,17 +18,17 @@
 //! This file is Aeris code, not a KLineChart translation; the formula files keep the attribution.
 
 use super::{
-    average_price, awesome_oscillator, bias, bollinger_bands, brar, bull_and_bear_index,
-    commodity_channel_index, current_ratio, different_of_moving_average,
+    Column, Indicator, average_price, awesome_oscillator, bias, bollinger_bands, brar,
+    bull_and_bear_index, commodity_channel_index, current_ratio, different_of_moving_average,
     directional_movement_index, ease_of_movement_value, exponential_moving_average, momentum,
     moving_average, moving_average_convergence_divergence, on_balance_volume,
     price_and_volume_trend, psychological_line, rate_of_change, relative_strength_index,
     simple_moving_average, stoch, stop_and_reverse, triple_exponentially_smoothed_average, volume,
-    volume_ratio, williams_r, Column, Indicator,
+    volume_ratio, williams_r,
 };
 use crate::{
-    valid_lookback_start, whitespace_row, IndicatorInput, RecursiveHistory, MAX_OUTPUTS,
-    MAX_RETAINED_ROWS,
+    IndicatorInput, MAX_OUTPUTS, MAX_RETAINED_ROWS, RecursiveHistory, valid_lookback_start,
+    whitespace_row,
 };
 
 /// Source rows per replay chunk. A chunk is the unit of the compacted whitespace window, so the

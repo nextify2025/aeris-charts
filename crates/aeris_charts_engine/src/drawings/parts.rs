@@ -779,9 +779,11 @@ mod tests {
         let DrawingPart::Fill { lower, count, .. } = parts.items[1] else {
             panic!("arrowhead");
         };
-        assert!(parts.points[lower..lower + count]
-            .iter()
-            .all(|point| point.1 >= 0.0));
+        assert!(
+            parts.points[lower..lower + count]
+                .iter()
+                .all(|point| point.1 >= 0.0)
+        );
         assert_eq!(parts.items.len(), 2, "the end cap is switched off");
     }
 }

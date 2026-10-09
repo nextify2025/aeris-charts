@@ -4,7 +4,7 @@ use super::*;
 use aeris_charts_engine::{
     AggressorSide, CumulativeDeltaReset, FootprintBarAggregation, FootprintCellMode,
     FootprintSeriesOptions, FootprintTrade, FootprintUpdateKind, TimeAndSalesOptions,
-    TradeBubbleOptions, TradeStudyOptions,
+    TradeStudyOptions,
 };
 
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
@@ -181,6 +181,9 @@ fn parse_options(json: &str) -> Result<FootprintSeriesOptions, String> {
     if let Some(show) = boolean(&value, "show_bar_summary")? {
         options.visual.show_bar_summary = show;
     }
+    if let Some(adaptive) = boolean(&value, "adaptive_rows")? {
+        options.visual.adaptive_rows = adaptive;
+    }
     Ok(options)
 }
 
@@ -210,6 +213,7 @@ pub(super) fn options_json(options: &FootprintSeriesOptions) -> String {
         "stacked_bid_color": options.visual.stacked_bid_color.to_css(),
         "stacked_ask_color": options.visual.stacked_ask_color.to_css(),
         "show_bar_summary": options.visual.show_bar_summary,
+        "adaptive_rows": options.visual.adaptive_rows,
     });
     let fields = match options.aggregation.bars {
         FootprintBarAggregation::Time {
@@ -506,33 +510,6 @@ impl ChartInner {
         self.engine
             .add_delta_series(stream_id as u64, pane_index)
             .unwrap_or(u32::MAX)
-    }
-
-    pub(super) fn add_trade_bubbles(
-        &mut self,
-        stream_id: u32,
-        series_id: u32,
-        minimum_volume: f64,
-        max_markers: usize,
-        aggregation_window_micros: f64,
-    ) -> bool {
-        if !aggregation_window_micros.is_finite()
-            || aggregation_window_micros < 0.0
-            || aggregation_window_micros.fract() != 0.0
-        {
-            return false;
-        }
-        self.engine
-            .add_trade_bubbles(
-                stream_id as u64,
-                series_id,
-                TradeBubbleOptions {
-                    minimum_volume,
-                    max_markers,
-                    aggregation_window_micros: aggregation_window_micros as i64,
-                },
-            )
-            .is_ok()
     }
 
     pub(super) fn add_footprint_series(&mut self, adopt_primary: bool, options_json: &str) -> u32 {

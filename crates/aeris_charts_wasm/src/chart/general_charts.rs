@@ -2,16 +2,16 @@
 
 use aeris_charts_engine::{
     AxisDimension, AxisPosition, CategoryScaleType, ChartError, ContinuousScaleType,
-    GeneralAxisDomain, GeneralAxisOptions, GeneralAxisTick, GeneralBrushRange,
-    GeneralBrushSnapshot, GeneralDatasetId, GeneralHitMode, GeneralInterpolation, GeneralLineStyle,
-    GeneralPointSymbol, GeneralReferenceId, GeneralReferenceOptions, GeneralRowId,
-    GeneralRowIdentity, GeneralScaleType, GeneralSeriesId, GeneralSeriesKind, GeneralSeriesOptions,
-    GeneralStackMode, GeneralTooltipSnapshot, GeneralXyInput, HorizontalDomain,
-    DEFAULT_GENERAL_FILL_OPACITY, MAX_GENERAL_TEMPORAL_MILLISECONDS,
+    DEFAULT_GENERAL_FILL_OPACITY, GeneralAxisDomain, GeneralAxisOptions, GeneralAxisTick,
+    GeneralBrushRange, GeneralBrushSnapshot, GeneralDatasetId, GeneralHitMode,
+    GeneralInterpolation, GeneralLineStyle, GeneralPointSymbol, GeneralReferenceId,
+    GeneralReferenceOptions, GeneralRowId, GeneralRowIdentity, GeneralScaleType, GeneralSeriesId,
+    GeneralSeriesKind, GeneralSeriesOptions, GeneralStackMode, GeneralTooltipSnapshot,
+    GeneralXyInput, HorizontalDomain, MAX_GENERAL_TEMPORAL_MILLISECONDS,
 };
-use js_sys::{Float64Array, Uint32Array, Uint8Array};
+use js_sys::{Float64Array, Uint8Array, Uint32Array};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::ChartInner;
 
@@ -289,7 +289,7 @@ fn series_options_from_input(
             return Err(ChartError::new(
                 aeris_charts_engine::ErrorCode::InvalidOptions,
                 "general series stack_mode must be normal or percent",
-            ))
+            ));
         }
     };
     Ok(options)
@@ -705,12 +705,13 @@ impl ChartInner {
 
     pub fn general_axis_ids_json(&self, pane: i32) -> String {
         let pane = (pane >= 0).then_some(pane as usize);
-        json!(self
-            .engine
-            .general_axes(pane)
-            .into_iter()
-            .map(|axis| axis.id())
-            .collect::<Vec<_>>())
+        json!(
+            self.engine
+                .general_axes(pane)
+                .into_iter()
+                .map(|axis| axis.id())
+                .collect::<Vec<_>>()
+        )
         .to_string()
     }
 
@@ -740,12 +741,13 @@ impl ChartInner {
     }
 
     pub fn general_reference_ids_json(&self, pane: i32) -> String {
-        json!(self
-            .engine
-            .general_reference_ids((pane >= 0).then_some(pane as usize))
-            .into_iter()
-            .map(GeneralReferenceId::get)
-            .collect::<Vec<_>>())
+        json!(
+            self.engine
+                .general_reference_ids((pane >= 0).then_some(pane as usize))
+                .into_iter()
+                .map(GeneralReferenceId::get)
+                .collect::<Vec<_>>()
+        )
         .to_string()
     }
 
@@ -1121,7 +1123,7 @@ impl ChartInner {
                     _ => {
                         return input_error(
                             "error_bar requires a continuous, temporal, or category pane",
-                        )
+                        );
                     }
                 };
                 (GeneralSeriesKind::ErrorBar, empty)

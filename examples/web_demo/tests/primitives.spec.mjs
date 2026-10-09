@@ -1,7 +1,9 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test, wait_for_chart } from "./page-ready.mjs";
 import { readFileSync } from "node:fs";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
+import { crop_png, count_different, max_channel_delta } from "./parity-pixels.mjs";
 
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
 
@@ -9,13 +11,6 @@ test.beforeEach(async ({ page }) => {
   page.on("console", (message) => console.log(`[browser:${message.type()}] ${message.text()}`));
   page.on("pageerror", (error) => console.log(`[browser:pageerror] ${error.message}`));
 });
-
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
-}
 
 async function settle_frames(page) {
   await page.evaluate(() => new Promise((resolve) => {
@@ -78,28 +73,6 @@ async function detach_reference_primitive(page) {
     window.__reference_primitive_handle = null;
   });
   await settle_frames(page);
-}
-
-function crop_png(source, x, y, width, height) {
-  const output = new PNG({ width, height });
-  PNG.bitblt(source, output, x, y, width, height, 0, 0);
-  return output;
-}
-
-function count_different(a, b) {
-  expect([a.width, a.height]).toEqual([b.width, b.height]);
-  return pixelmatch(a.data, b.data, new PNG({ width: a.width, height: a.height }).data, a.width, a.height, {
-    threshold: 0,
-    includeAA: true,
-  });
-}
-
-function max_channel_delta(a, b) {
-  let max_delta = 0;
-  for (let i = 0; i < a.data.length; i += 1) {
-    max_delta = Math.max(max_delta, Math.abs(a.data[i] - b.data[i]));
-  }
-  return max_delta;
 }
 
 test("pane primitive paints identically on both backends, changes its regions, and detaches cleanly", async ({ page }, test_info) => {

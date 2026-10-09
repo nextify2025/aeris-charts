@@ -4,10 +4,10 @@
 //! generation fencing, series/pane lifecycle, presentation, and group operations.
 
 use crate::{
-    ChartEngine, IndicatorChromeOptions, SeriesId, SeriesKind, SeriesThresholdRegion,
-    EMA_RIBBON_DEFAULT_COLORS, SEPARATE_INDICATOR_PANE_STRETCH,
+    ChartEngine, EMA_RIBBON_DEFAULT_COLORS, IndicatorChromeOptions,
+    SEPARATE_INDICATOR_PANE_STRETCH, SeriesId, SeriesKind, SeriesThresholdRegion,
 };
-use aeris_charts_core::model::data_validation::{validate_timestamp, MAX_SAFE_VALUE};
+use aeris_charts_core::model::data_validation::{MAX_SAFE_VALUE, validate_timestamp};
 use std::fmt;
 
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
@@ -242,6 +242,7 @@ impl ChartEngine {
                 series.price_format.min_move = min_move;
             }
         }
+        self.adopt_scale_price_format(series_id);
         let mut created_pane = None;
         let pane_index = match descriptor.pane {
             ExternalStudyPaneTarget::Price => 0,

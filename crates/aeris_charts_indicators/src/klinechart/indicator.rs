@@ -9,8 +9,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ao, avp, bbi, bias, boll, brar, cci, cr, current_ratio::forward_shift, dma, dmi, ema, emv, kdj,
-    ma, macd, mtm, obv, psy, pvt, roc, rsi, sar, sma, trix, vol, vr, wr, Column,
+    Column, ao, avp, bbi, bias, boll, brar, cci, cr, current_ratio::forward_shift, dma, dmi, ema,
+    emv, kdj, ma, macd, mtm, obv, psy, pvt, roc, rsi, sar, sma, trix, vol, vr, wr,
 };
 use crate::MAX_OUTPUTS;
 
@@ -848,11 +848,7 @@ impl Indicator {
 
     /// The volume KLineChart assumes for a bar without one: 1 for `PVT`, 0 everywhere else.
     pub fn missing_volume(&self) -> f64 {
-        if matches!(self, Self::Pvt) {
-            1.0
-        } else {
-            0.0
-        }
+        if matches!(self, Self::Pvt) { 1.0 } else { 0.0 }
     }
 
     /// The first row at which each output can hold a value, in output order. It depends only on

@@ -28,8 +28,8 @@ use aeris_charts_render::draw_list::LineType;
 use crate::feature_series::FeatureSeriesKind;
 use crate::frame::{pane_scale, series_scale_target};
 use crate::{
-    ChartEngine, SelectionAnchorMemberSnapshot, SelectionAnchorSnapshot, SeriesKind,
-    MAX_SELECTION_ANCHORS, MAX_SELECTION_MEMBERS, SELECTION_ANCHOR_SPACING_CSS,
+    ChartEngine, MAX_SELECTION_ANCHORS, MAX_SELECTION_MEMBERS, SELECTION_ANCHOR_SPACING_CSS,
+    SelectionAnchorMemberSnapshot, SelectionAnchorSnapshot, SeriesKind,
 };
 
 /// reference `SeriesOptionsCommon.hitTestTolerance` default (series-options-defaults.ts:15).
@@ -454,11 +454,7 @@ impl ChartEngine {
                             distance: best.0,
                             kind: best.1,
                         });
-                        if better {
-                            hit
-                        } else {
-                            best
-                        }
+                        if better { hit } else { best }
                     })
             }
             SeriesKind::Feature => {

@@ -86,11 +86,11 @@ impl ChartEngine {
 
 #[cfg(test)]
 mod tests {
+    use crate::ChartEngine;
     use crate::footprint::{
         AggressorSide, FootprintAggregationOptions, FootprintBarAggregation,
         FootprintSeriesOptions, FootprintTrade,
     };
-    use crate::ChartEngine;
 
     const EPS: f64 = 1e-9;
 

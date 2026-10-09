@@ -332,13 +332,15 @@ mod tests {
         let restored = chart.financial_appearance(0).unwrap();
         assert_eq!(restored.up_color, AppearanceColor::Theme);
         assert_eq!(restored.wick_up_color, AppearanceColor::Theme);
-        assert!(chart
-            .series
-            .iter()
-            .find(|series| series.id == 0)
-            .unwrap()
-            .up_color
-            .is_none());
+        assert!(
+            chart
+                .series
+                .iter()
+                .find(|series| series.id == 0)
+                .unwrap()
+                .up_color
+                .is_none()
+        );
     }
 
     #[test]

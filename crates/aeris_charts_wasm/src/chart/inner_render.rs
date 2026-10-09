@@ -123,12 +123,11 @@ impl ChartInner {
         // Arm GPU timestamp collection on the first frame after the host reads `frame_stats()`.
         // `GpuTimer::new` is a feature-flag check plus (once) a query set, so an unsupported
         // device just keeps answering `None` and `gpu_ms` stays null.
-        if self.telemetry.stats_requested() {
-            if let Some(gfx) = self.gfx.as_mut() {
-                if gfx.timer.is_none() {
-                    gfx.timer = GpuTimer::new(&gfx.shared.device, &gfx.shared.queue);
-                }
-            }
+        if self.telemetry.stats_requested()
+            && let Some(gfx) = self.gfx.as_mut()
+            && gfx.timer.is_none()
+        {
+            gfx.timer = GpuTimer::new(&gfx.shared.device, &gfx.shared.queue);
         }
 
         let pane_outcome = if self.gfx.is_some() {

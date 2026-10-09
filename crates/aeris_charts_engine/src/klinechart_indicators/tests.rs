@@ -198,7 +198,8 @@ fn bind(fixture: &mut Fixture, indicator: &Indicator) -> (SeriesId, Vec<SeriesId
     (source, outputs)
 }
 
-/// Every bar or dot output's per-row colors equal a fresh coloring of the current values.
+/// Every bar or dot output's per-row colors equal a fresh coloring of the current values. Each
+/// output row finds its source bar by time, independently of how the output was trimmed.
 fn assert_colors_match_full(chart: &ChartEngine, binding_index: usize) {
     let binding = &chart.indicators[binding_index];
     let IndicatorKind::KLineChart(indicator) = &binding.kind else {
@@ -208,12 +209,13 @@ fn assert_colors_match_full(chart: &ChartEngine, binding_index: usize) {
         let Some(rule) = klinechart_color_rule(indicator, output_index) else {
             continue;
         };
-        let (_, values) = chart.data.series_data(output).unwrap();
+        let (times, values) = chart.data.series_data(output).unwrap();
         let values = values[3];
-        let (_, bars) = chart.data.series_data(binding.source).unwrap();
-        let offset = bars[3].len() - values.len();
+        let (source_times, bars) = chart.data.series_data(binding.source).unwrap();
         for row in 0..values.len() {
-            let source_row = offset + row;
+            let source_row = source_times
+                .binary_search(&times[row])
+                .unwrap_or_else(|_| panic!("output row {row} has a source bar"));
             let expected = rule.color(
                 values[row],
                 row.checked_sub(1).map(|previous| values[previous]),
@@ -254,6 +256,57 @@ fn bar(source: SeriesId, fixture: &Fixture, values: [f64; 4]) -> [f64; 4] {
 }
 
 #[test]
+fn colored_outputs_start_after_leading_whitespace_and_follow_repairs_before_their_start() {
+    // Q-H trims every output to its first value, so a histogram or dot output over a source with
+    // leading whitespace starts later than the source; its colours start with it.
+    const COLOR_ROWS: usize = 60;
+    for indicator in short_indicators()
+        .into_iter()
+        .filter(|indicator| matches!(indicator.name(), "MACD" | "VOL" | "SAR" | "AO"))
+    {
+        let label = label_of(&indicator);
+        let mut data = Data::generate(COLOR_ROWS, &[0, 1, 2, 20]);
+        let mut fixture = install(&data, &(0..COLOR_ROWS).collect::<Vec<_>>());
+        let (_, outputs) = bind(&mut fixture, &indicator);
+        let binding = fixture.chart.indicators.len() - 1;
+        assert_matches_fresh_bind(&fixture, binding, &format!("{label}, leading whitespace"));
+        let first_time = |fixture: &Fixture| {
+            outputs
+                .iter()
+                .map(|&output| fixture.chart.data.series_data(output).unwrap().0[0])
+                .min()
+                .unwrap()
+        };
+        assert!(
+            first_time(&fixture) >= 3 * HOUR as i64,
+            "{label}: no output row before the first bar"
+        );
+
+        // Repairs before the first value move every output's start earlier, then later.
+        let real = Data::generate(COLOR_ROWS, &[]);
+        for (row, step) in [(2, "row 2 filled"), (0, "row 0 filled")] {
+            data.candles[row] = real.candles[row];
+            data.volumes[row] = real.volumes[row];
+            data.turnovers[row] = real.turnovers[row];
+            feed(&mut fixture, &data, row);
+            assert_matches_fresh_bind(&fixture, binding, &format!("{label}, {step}"));
+        }
+        data.blank(0);
+        feed(&mut fixture, &data, 0);
+        assert_matches_fresh_bind(&fixture, binding, &format!("{label}, row 0 blanked"));
+
+        // Live ticks after the repairs.
+        data.push_generated(COLOR_ROWS);
+        feed(&mut fixture, &data, COLOR_ROWS);
+        assert_matches_fresh_bind(&fixture, binding, &format!("{label}, append"));
+        data.candles[COLOR_ROWS] = [101.0, 103.0, 99.5, 102.5];
+        data.turnovers[COLOR_ROWS] = data.volumes[COLOR_ROWS] * 102.5;
+        feed(&mut fixture, &data, COLOR_ROWS);
+        assert_matches_fresh_bind(&fixture, binding, &format!("{label}, tick"));
+    }
+}
+
+#[test]
 fn every_klinechart_binding_matches_full_recomputation_through_every_update_path() {
     for indicator in short_indicators() {
         let mut fixture = fixture();
@@ -263,9 +316,11 @@ fn every_klinechart_binding_matches_full_recomputation_through_every_update_path
 
         // Append one bar.
         let appended = bar(source, &fixture, [104.0, 107.0, 103.0, 106.0]);
-        assert!(fixture
-            .chart
-            .update_series_bar(source, ROWS as f64 * HOUR, appended));
+        assert!(
+            fixture
+                .chart
+                .update_series_bar(source, ROWS as f64 * HOUR, appended)
+        );
         check(&fixture, binding);
 
         // Append a batch.
@@ -334,9 +389,11 @@ fn every_klinechart_binding_matches_full_recomputation_through_every_update_path
         check(&fixture, binding);
 
         assert!(fixture.chart.remove_series(source));
-        assert!(outputs
-            .iter()
-            .all(|&output| fixture.chart.series_kind(output).is_none()));
+        assert!(
+            outputs
+                .iter()
+                .all(|&output| fixture.chart.series_kind(output).is_none())
+        );
     }
 }
 
@@ -371,9 +428,10 @@ fn klinechart_bindings_use_klinechart_layout_and_style() {
     assert!(ma.iter().all(|&id| entry(id).pane_index == price_pane));
     assert_eq!(entry(sar[0]).pane_index, price_pane);
     assert_eq!(chart.panes.len(), panes + 2);
-    assert!(macd
-        .iter()
-        .all(|&id| entry(id).pane_index == entry(macd[0]).pane_index));
+    assert!(
+        macd.iter()
+            .all(|&id| entry(id).pane_index == entry(macd[0]).pane_index)
+    );
     assert_ne!(entry(macd[0]).pane_index, price_pane);
     assert_ne!(entry(vol[0]).pane_index, entry(macd[0]).pane_index);
 
@@ -439,39 +497,53 @@ fn invalid_klinechart_bindings_leave_the_chart_unchanged() {
     let chart = &mut fixture.chart;
     let vol = Indicator::from_name("VOL").unwrap();
     let macd = Indicator::from_name("MACD").unwrap();
-    assert!(chart
-        .add_klinechart_indicator(0, vol.clone(), None)
-        .is_empty());
-    assert!(chart
-        .add_klinechart_indicator(0, vol.clone(), Some(0))
-        .is_empty());
-    assert!(chart
-        .add_klinechart_indicator(0, macd, Some(volume))
-        .is_empty());
-    assert!(chart
-        .add_klinechart_indicator(0, Indicator::Avp, Some(volume))
-        .is_empty());
-    assert!(chart
-        .add_klinechart_indicator(0, Indicator::Ma { periods: vec![] }, None)
-        .is_empty());
-    assert!(chart
-        .add_klinechart_indicator(
-            0,
-            Indicator::Ma {
-                periods: vec![1, 2, 3, 4, 5, 6],
-            },
-            None,
-        )
-        .is_empty());
-    assert!(chart
-        .add_klinechart_indicator(
-            0,
-            Indicator::Vol {
-                periods: vec![1, 2, 3, 4, 5]
-            },
-            Some(volume)
-        )
-        .is_empty());
+    assert!(
+        chart
+            .add_klinechart_indicator(0, vol.clone(), None)
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_klinechart_indicator(0, vol.clone(), Some(0))
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_klinechart_indicator(0, macd, Some(volume))
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_klinechart_indicator(0, Indicator::Avp, Some(volume))
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_klinechart_indicator(0, Indicator::Ma { periods: vec![] }, None)
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_klinechart_indicator(
+                0,
+                Indicator::Ma {
+                    periods: vec![1, 2, 3, 4, 5, 6],
+                },
+                None,
+            )
+            .is_empty()
+    );
+    assert!(
+        chart
+            .add_klinechart_indicator(
+                0,
+                Indicator::Vol {
+                    periods: vec![1, 2, 3, 4, 5]
+                },
+                Some(volume)
+            )
+            .is_empty()
+    );
     assert_eq!(chart.series.len(), series_before);
     assert!(chart.indicators.is_empty());
 
@@ -786,12 +858,16 @@ fn feed(fixture: &mut Fixture, data: &Data, row: usize) {
     let volume = fixture.volume;
     let turnover = fixture.turnover;
     assert!(fixture.chart.update_series_bar(0, time, data.candles[row]));
-    assert!(fixture
-        .chart
-        .update_series_bar(volume, time, [data.volumes[row]; 4]));
-    assert!(fixture
-        .chart
-        .update_series_bar(turnover, time, [data.turnovers[row]; 4]));
+    assert!(
+        fixture
+            .chart
+            .update_series_bar(volume, time, [data.volumes[row]; 4])
+    );
+    assert!(
+        fixture
+            .chart
+            .update_series_bar(turnover, time, [data.turnovers[row]; 4])
+    );
 }
 
 fn label_of(indicator: &Indicator) -> String {
@@ -1183,10 +1259,12 @@ fn a_tick_over_pre_installed_session_slots_recolors_only_the_rows_it_rewrote() {
         |chart: &ChartEngine, output| chart.data.series_data(output).unwrap().1[3].len() - 1;
     for &(_, output) in &colored {
         let last = last_slot_row(&fixture.chart, output);
-        assert!(fixture
-            .chart
-            .data
-            .set_point_color(output, body, last, sentinel));
+        assert!(
+            fixture
+                .chart
+                .data
+                .set_point_color(output, body, last, sentinel)
+        );
     }
 
     // Fill the forming slot, revise it, and fill the next one.
@@ -1204,10 +1282,12 @@ fn a_tick_over_pre_installed_session_slots_recolors_only_the_rows_it_rewrote() {
             Some(sentinel),
             "a tick recolored a slot it did not rewrite"
         );
-        assert!(fixture
-            .chart
-            .data
-            .set_point_color(output, body, last, POINT_COLOR_ABSENT));
+        assert!(
+            fixture
+                .chart
+                .data
+                .set_point_color(output, body, last, POINT_COLOR_ABSENT)
+        );
     }
     for &(binding, _) in &colored {
         check(&fixture, binding);

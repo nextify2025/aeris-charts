@@ -5,8 +5,8 @@
 //! must equal the same formula evaluated with the whitespace rows removed.
 
 use aeris_charts_indicators::{
-    pivot_points_by_trading_day, stochastic_rsi, zigzag, DeviationEstimator, IncrementalState,
-    IndicatorInput, IndicatorSeed, KdjSeed, PivotKind, VwapReset,
+    DeviationEstimator, IncrementalState, IndicatorInput, IndicatorSeed, KdjSeed, PivotKind,
+    VwapReset, pivot_points_by_trading_day, stochastic_rsi, zigzag,
 };
 
 fn runtimes() -> Vec<(&'static str, IncrementalState)> {
@@ -84,6 +84,60 @@ fn runtimes() -> Vec<(&'static str, IncrementalState)> {
             "bollinger_sample",
             IncrementalState::bollinger_with(5, 2.0, DeviationEstimator::Sample),
         ),
+        ("aroon", IncrementalState::aroon(5)),
+        ("awesome_oscillator", IncrementalState::awesome_oscillator()),
+        ("dpo", IncrementalState::dpo(6)),
+        ("chande_momentum", IncrementalState::chande_momentum(5)),
+        (
+            "bollinger_metrics",
+            IncrementalState::bollinger_metrics(5, 2.0),
+        ),
+        ("envelopes", IncrementalState::envelopes(5, 2.5, false)),
+        ("envelopes_ema", IncrementalState::envelopes(5, 2.5, true)),
+        ("alma", IncrementalState::alma(6, 0.85, 6.0)),
+        (
+            "accumulation_distribution",
+            IncrementalState::accumulation_distribution(),
+        ),
+        ("price_volume_trend", IncrementalState::price_volume_trend()),
+        (
+            "chaikin_oscillator",
+            IncrementalState::chaikin_oscillator(3, 6),
+        ),
+        ("relative_volume", IncrementalState::relative_volume(5)),
+        (
+            "volume_oscillator",
+            IncrementalState::volume_oscillator(3, 6, 4),
+        ),
+        ("elder_force", IncrementalState::elder_force(4)),
+        (
+            "ease_of_movement",
+            IncrementalState::ease_of_movement(5, 1e4),
+        ),
+        (
+            "historical_volatility",
+            IncrementalState::historical_volatility(5, 252.0),
+        ),
+        ("trix", IncrementalState::trix(3, 4)),
+        ("coppock_curve", IncrementalState::coppock_curve(6, 4, 5)),
+        ("fisher_transform", IncrementalState::fisher_transform(5)),
+        (
+            "ultimate_oscillator",
+            IncrementalState::ultimate_oscillator(3, 5, 8),
+        ),
+        ("vortex", IncrementalState::vortex(5)),
+        ("kst", IncrementalState::kst([2, 3, 4, 5], [2, 2, 2, 3], 3)),
+        ("tsi", IncrementalState::tsi(5, 3, 3)),
+        ("mass_index", IncrementalState::mass_index(3, 5)),
+        ("klinger", IncrementalState::klinger(3, 7, 4)),
+        ("kama", IncrementalState::kama(5, 2, 10)),
+        ("mcginley", IncrementalState::mcginley(5)),
+        (
+            "linear_regression",
+            IncrementalState::linear_regression(5, 2.0),
+        ),
+        ("choppiness", IncrementalState::choppiness(5)),
+        ("atr_bands", IncrementalState::atr_bands(5, 2.0)),
     ]
 }
 
@@ -476,9 +530,11 @@ fn stochastic_tail_window_is_reused_only_where_the_tail_state_resumes() {
     columns.write(1024, &mut rng, false);
     columns.low[1024] -= 40.0;
     assert_stochastic_resumes_like_a_full_rebuild(&mut state, &columns, 1024);
+    // One replayed row plus the four earlier valid rows of its %K window, read from the recorded
+    // valid rows; a resume that replays the %D window from earlier rows reads more.
     assert_eq!(
         state.last_work_rows(),
-        1,
+        5,
         "the replacement resumed from the tail state"
     );
 }
@@ -486,9 +542,9 @@ fn stochastic_tail_window_is_reused_only_where_the_tail_state_resumes() {
 #[test]
 fn truncation_just_past_a_checkpoint_keeps_tail_windows_complete() {
     // A truncation resumes from the sparse checkpoint at row 1023 when the new length is just past
-    // it. Runtimes with a retained tail window (Stochastic %D, Stochastic RSI) must rebuild that
-    // window with every sample the next replacement of the new last row needs, not just the
-    // samples before the truncation point.
+    // it. Runtimes with a retained tail window (Stochastic %D; Stochastic RSI now carries its RSI
+    // window in its checkpointed state) must rebuild that window with every sample the next
+    // replacement of the new last row needs, not just the samples before the truncation point.
     let mut rng = Rng(0x7c0a);
     let mut base = Columns::default();
     for row in 0..1_060 {
@@ -533,11 +589,12 @@ fn truncation_just_past_a_checkpoint_keeps_tail_windows_complete() {
 #[test]
 fn path_dependent_runtimes_repair_across_checkpoints_like_a_full_rebuild() {
     // Stochastic RSI, pivots and ZigZag carry recursive state with sparse checkpoints every 1,024
-    // rows; long sequences make historical corrections resume from real checkpoints.
+    // rows, and Stochastic and Mass Index a retained tail window besides; long sequences make
+    // historical corrections resume from real checkpoints.
     let include = |label: &str| {
         matches!(
             label,
-            "stochastic_rsi" | "pivot_points" | "zigzag" | "stochastic"
+            "stochastic_rsi" | "pivot_points" | "zigzag" | "stochastic" | "mass_index"
         )
     };
     for seed in 1..=3_u64 {
@@ -738,11 +795,7 @@ fn zigzag_tail_work_is_bounded_by_the_rows_since_the_last_confirmed_turning_poin
                 columns.low[row] = bar[2];
                 columns.close[row] = bar[3];
             }
-            if whitespace {
-                base
-            } else {
-                next
-            }
+            if whitespace { base } else { next }
         };
         for row in 0..5_000 {
             close = write(&mut columns, row, &mut rng, close);

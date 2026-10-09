@@ -1,8 +1,8 @@
 //! `MACD`. Ported from KLineChart
 //! `src/extension/indicator/movingAverageConvergenceDivergence.ts`.
 
-use super::stepper::{fold, seeded_ema_step, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold, seeded_ema_step};
 
 /// MACD outputs in KLineChart figure order.
 #[derive(Clone, Debug, PartialEq)]

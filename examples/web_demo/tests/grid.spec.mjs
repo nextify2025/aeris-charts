@@ -1,14 +1,12 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
 import { PNG } from "pngjs";
+import { test, wait_for_chart } from "./page-ready.mjs";
 
 // Multi-chart split grid in the MAIN demo: the primary chart is the first cell, splits are
 // independent, dividers drag, the usage signal meters, the cap enforces, and closes collapse.
 
 async function wait_grid(page) {
-  await page.waitForFunction(() => window.__grid !== undefined && window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
+  await wait_for_chart(page, { grid: true });
 }
 
 test("header comparison controls add and clear independently scaled symbols", async ({ page }) => {

@@ -1,7 +1,7 @@
 //! `PVT` (价量趋势). Ported from KLineChart `src/extension/indicator/priceAndVolumeTrend.ts`.
 
-use super::stepper::{fold, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold};
 
 /// The running total.
 #[derive(Clone, Copy, Debug, Default)]

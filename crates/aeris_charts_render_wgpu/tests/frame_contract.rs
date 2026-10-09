@@ -5,20 +5,20 @@
 //! silent WebGPU hole.
 
 use aeris_charts_engine::{
-    marker_pos, marker_shape, AxisDimension, CategoryScaleType, ChartEngine, ContinuousScaleType,
-    GeneralAxisOptions, GeneralScaleType, GeneralSeriesOptions, GeneralXyInput, HorizontalDomain,
-    IndicatorInputSource, IndicatorKind, IndicatorOutputStyle, Marker, PivotKind, PriceLine,
-    SeriesKind, VwapReset,
+    AxisDimension, CategoryScaleType, ChartEngine, ContinuousScaleType, GeneralAxisOptions,
+    GeneralScaleType, GeneralSeriesOptions, GeneralXyInput, HorizontalDomain, IndicatorInputSource,
+    IndicatorKind, IndicatorOutputStyle, Marker, PivotKind, PriceLine, SeriesKind, VwapReset,
+    marker_pos, marker_shape,
 };
-use aeris_charts_render::canvas2d::{execute, Canvas2d, Viewport};
+use aeris_charts_render::canvas2d::{Canvas2d, Viewport, execute};
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{Gradient, LineStyle, LineType, Prim, RasterImage};
-use aeris_charts_render::line::{dash_split, expand_line, stroke_aa, LinePoint};
+use aeris_charts_render::line::{LinePoint, dash_split, expand_line, stroke_aa};
 use std::sync::Arc;
 
 use aeris_charts_render_wgpu::{
-    geom_prims_to_tris, prims_to_group, prims_to_instances, DrawGroup, DrawRun, RunPipeline,
-    TexQuadInstance,
+    DrawGroup, DrawRun, RunPipeline, TexQuadInstance, geom_prims_to_tris, prims_to_group,
+    prims_to_instances,
 };
 
 #[test]

@@ -16,6 +16,7 @@
 //! series maps its data onto merged indices; a series absent at an index is whitespace there.
 
 mod custom_series;
+mod custom_studies;
 mod depth;
 mod feature_series;
 mod footprint;
@@ -31,49 +32,50 @@ mod sessions;
 mod text_runs;
 
 use custom_series::CustomSeriesEntry;
+use custom_studies::register_custom_study;
 use ring::{BoundRing, RingLayoutInput};
 use text_runs::TextRunStore;
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use js_sys::Float64Array;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 use web_sys::CanvasRenderingContext2d;
 
 use crate::backend_policy::{
-    surface_error_action, BackendStartupFailure, BackendStatus, BackendWarningDeduplicator,
-    SurfaceErrorAction,
+    BackendStartupFailure, BackendStatus, BackendWarningDeduplicator, SurfaceErrorAction,
+    surface_error_action,
 };
-use crate::telemetry::{FrameTelemetry, FRAME_STATS_LEN};
+use crate::telemetry::{FRAME_STATS_LEN, FrameTelemetry};
 use aeris_charts_core::model::data_layer::SeriesId;
 use aeris_charts_core::model::data_validation::sanitize_ohlc;
 use aeris_charts_core::model::plot_list::MismatchDirection;
 use aeris_charts_core::options::{ChartOptions, ChartTheme};
 use aeris_charts_core::scale::price_scale_core::PriceScaleMode;
 use aeris_charts_engine::{
-    crosshair_mode_from_u8, line_style_from_u8, marker_pos, marker_shape, AccountId, AlertId,
-    AlertLine, AlertSnapshot, AxisFrame, AxisLabel, AxisLabelCorners, AxisTextAlign,
-    AxisTextMidpoint, BrushRange, BrushStyle, ChartEngine, DrawingId, DrawingKind,
+    AccountId, AlertId, AlertLine, AlertSnapshot, AxisFrame, AxisLabel, AxisLabelCorners,
+    AxisTextAlign, AxisTextMidpoint, BrushRange, BrushStyle, ChartEngine, DrawingId, DrawingKind,
     DrawingModifiers, ExecutionId, FeatureSeriesKind, InputDevice, InputModifiers,
     InstrumentMetadata, Marker, OrderId, PaneId, PositionId, PriceFormatterFn, PriceScaleId,
     PriceScaleSide, PriceScaleTarget, PrimitiveAutoscaleContribution, SeriesKind,
     TickMarkFormatterFn, TimeFormatterFn, TradingExecution, TradingPosition, TradingSnapshot,
-    TradingStyleOptions, WorkingOrder,
+    TradingStyleOptions, WorkingOrder, crosshair_mode_from_u8, line_style_from_u8, marker_pos,
+    marker_shape,
 };
 use aeris_charts_render::canvas2d::{
-    execute as execute_canvas2d, Canvas2d, Viewport as CanvasViewport,
+    Canvas2d, Viewport as CanvasViewport, execute as execute_canvas2d,
 };
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineType, Prim};
 use aeris_charts_render_wgpu::{
-    prims_to_group, render_frame, DrawGroup, FrameResources, GpuTimer, LabelAtlas, MsaaTarget,
-    QuadRenderer, TexQuadRenderer, TriRenderer, SAMPLE_COUNT,
+    DrawGroup, FrameResources, GpuTimer, LabelAtlas, MsaaTarget, QuadRenderer, SAMPLE_COUNT,
+    TexQuadRenderer, TriRenderer, prims_to_group, render_frame,
 };
 
 #[wasm_bindgen(inline_js = r#"
@@ -256,6 +258,61 @@ fn trading_result_json(result: Result<(), aeris_charts_engine::ChartError>) -> S
                 "code": error.code().name(),
                 "message": error.message(),
             }
+        })
+        .to_string(),
+    }
+}
+
+fn parse_big_trades_options(
+    json: &str,
+) -> Result<aeris_charts_engine::BigTradesOptions, aeris_charts_engine::ChartError> {
+    serde_json::from_str(json).map_err(|error| {
+        aeris_charts_engine::ChartError::new(
+            aeris_charts_engine::ErrorCode::InvalidOptions,
+            format!("invalid big-trades options: {error}"),
+        )
+    })
+}
+
+/// Parse auction-marker options JSON; a malformed document is `invalid_options`.
+fn parse_auction_marker_options(
+    json: &str,
+) -> Result<aeris_charts_engine::AuctionMarkerOptions, aeris_charts_engine::ChartError> {
+    serde_json::from_str(json).map_err(|error| {
+        aeris_charts_engine::ChartError::new(
+            aeris_charts_engine::ErrorCode::InvalidOptions,
+            format!("invalid auction-marker options: {error}"),
+        )
+    })
+}
+
+/// Typed browser error of a big-trades or auction-marker rejection.
+fn big_trades_error(error: aeris_charts_engine::FootprintError) -> aeris_charts_engine::ChartError {
+    use aeris_charts_engine::{ErrorCode, FootprintError};
+    let code = match error {
+        FootprintError::BigTradesCapacity | FootprintError::AuctionMarkerCapacity => {
+            ErrorCode::ResourceLimit
+        }
+        FootprintError::UnsupportedBigTradesSeries(_) => ErrorCode::UnsupportedOperation,
+        FootprintError::UnknownTradeStream(_) | FootprintError::UnknownSeries(_) => {
+            ErrorCode::InvalidHandle
+        }
+        FootprintError::UnknownBigTrades(_) | FootprintError::UnknownAuctionMarkers(_) => {
+            ErrorCode::StaleHandle
+        }
+        _ => ErrorCode::InvalidOptions,
+    };
+    aeris_charts_engine::ChartError::new(code, error.to_string())
+}
+
+fn big_trades_result_json<T: serde::Serialize>(
+    result: Result<T, aeris_charts_engine::ChartError>,
+) -> String {
+    match result {
+        Ok(result) => serde_json::json!({ "ok": true, "result": result }).to_string(),
+        Err(error) => serde_json::json!({
+            "ok": false,
+            "error": { "code": error.code().name(), "message": error.message() }
         })
         .to_string(),
     }
@@ -1025,7 +1082,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(self.inner.borrow_mut().engine.set_alert_snapshot(snapshot))
@@ -1043,7 +1100,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(self.inner.borrow_mut().engine.update_alert_line(line))
@@ -1084,7 +1141,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(
@@ -1123,7 +1180,7 @@ impl AerisChart {
                     return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                         aeris_charts_engine::ErrorCode::InvalidData,
                         error.to_string(),
-                    )))
+                    )));
                 }
             };
         trading_result_json(self.inner.borrow_mut().engine.set_host_overlay(overlay))
@@ -1150,7 +1207,7 @@ impl AerisChart {
                     return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                         aeris_charts_engine::ErrorCode::InvalidData,
                         error.to_string(),
-                    )))
+                    )));
                 }
             };
         trading_result_json(self.inner.borrow_mut().engine.set_timeline_marks(snapshot))
@@ -1222,7 +1279,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(
@@ -1245,7 +1302,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(self.inner.borrow_mut().engine.update_working_order(order))
@@ -1262,7 +1319,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(
@@ -1285,7 +1342,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(
@@ -1303,7 +1360,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidData,
                     error.to_string(),
-                )))
+                )));
             }
         };
         trading_result_json(self.inner.borrow_mut().engine.apply_trading_style(options))
@@ -1955,21 +2012,101 @@ impl AerisChart {
             .add_delta_series(stream_id, pane_index)
     }
 
-    pub fn add_trade_bubbles(
+    /// Draw a trade stream's large aggressive orders as volume bubbles over a price series.
+    /// Returns `{ok:true,result:id}` or a typed `{ok:false,error:{code,message}}`.
+    pub fn add_big_trades(&mut self, stream_id: u32, series_id: u32, options_json: &str) -> String {
+        big_trades_result_json(parse_big_trades_options(options_json).and_then(|options| {
+            self.inner
+                .borrow_mut()
+                .engine
+                .add_big_trades(u64::from(stream_id), series_id, options)
+                .map_err(big_trades_error)
+        }))
+    }
+
+    /// `{ok:true,result:null}` or a typed `{ok:false,error:{code,message}}`.
+    pub fn set_big_trades_options(&mut self, id: u32, options_json: &str) -> String {
+        big_trades_result_json(parse_big_trades_options(options_json).and_then(|options| {
+            self.inner
+                .borrow_mut()
+                .engine
+                .set_big_trades_options(id, options)
+                .map_err(big_trades_error)
+        }))
+    }
+
+    pub fn big_trades_options(&self, id: u32) -> String {
+        serde_json::to_string(&self.inner.borrow().engine.big_trades_options(id))
+            .expect("validated big-trades options serialize")
+    }
+
+    pub fn big_trades_snapshot(&self, id: u32) -> String {
+        serde_json::to_string(&self.inner.borrow().engine.big_trades_snapshot(id))
+            .expect("big-trades snapshot serializes")
+    }
+
+    pub fn remove_big_trades(&mut self, id: u32) -> bool {
+        self.inner.borrow_mut().engine.remove_big_trades(id)
+    }
+
+    /// Attach tape-derived auction markers to a price series: `{ok:true,result:id}` or a typed
+    /// `{ok:false,error:{code,message}}` (`resource_limit` past 16 marker sets,
+    /// `unsupported_operation` for the series type, `invalid_handle` for an unknown stream or
+    /// series, `invalid_options` for rejected options).
+    pub fn add_auction_markers(
         &mut self,
         stream_id: u32,
         series_id: u32,
-        minimum_volume: f64,
-        max_markers: usize,
-        aggregation_window_micros: f64,
-    ) -> bool {
-        self.inner.borrow_mut().add_trade_bubbles(
-            stream_id,
-            series_id,
-            minimum_volume,
-            max_markers,
-            aggregation_window_micros,
+        options_json: &str,
+    ) -> String {
+        big_trades_result_json(
+            parse_auction_marker_options(options_json).and_then(|options| {
+                self.inner
+                    .borrow_mut()
+                    .engine
+                    .add_auction_markers(u64::from(stream_id), series_id, options)
+                    .map_err(big_trades_error)
+            }),
         )
+    }
+
+    /// `{ok:true,result:null}` or a typed `{ok:false,error:{code,message}}` (`stale_handle` once
+    /// the markers are removed).
+    pub fn set_auction_marker_options(&mut self, id: u32, options_json: &str) -> String {
+        big_trades_result_json(
+            parse_auction_marker_options(options_json).and_then(|options| {
+                self.inner
+                    .borrow_mut()
+                    .engine
+                    .set_auction_marker_options(id, options)
+                    .map_err(big_trades_error)
+            }),
+        )
+    }
+
+    pub fn auction_marker_options(&self, id: u32) -> String {
+        serde_json::to_string(&self.inner.borrow().engine.auction_marker_options(id))
+            .expect("validated auction marker options serialize")
+    }
+
+    pub fn auction_markers_snapshot(&self, id: u32) -> String {
+        serde_json::to_string(
+            &self
+                .inner
+                .borrow_mut()
+                .engine
+                .auction_markers_snapshot(id)
+                .ok(),
+        )
+        .expect("auction markers snapshot serializes")
+    }
+
+    pub fn remove_auction_markers(&mut self, id: u32) -> bool {
+        self.inner
+            .borrow_mut()
+            .engine
+            .remove_auction_markers(id)
+            .is_ok()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2519,6 +2656,52 @@ impl AerisChart {
             .indicator_schema_json(kind, period, deviation)
     }
 
+    /// Register synchronous JavaScript callbacks for a chart-local study.
+    pub fn register_custom_study_result_json(
+        &mut self,
+        definition: &str,
+        init: js_sys::Function,
+        update: Option<js_sys::Function>,
+        rebuild: js_sys::Function,
+    ) -> String {
+        let mut inner = self.inner.borrow_mut();
+        register_custom_study(&mut inner.engine, definition, init, update, rebuild)
+    }
+
+    pub fn add_custom_study_result_json(
+        &mut self,
+        type_id: &str,
+        source: u32,
+        input: &str,
+        volume: i64,
+        parameters: &str,
+    ) -> String {
+        self.inner
+            .borrow_mut()
+            .add_custom_study_result_json(type_id, source, input, volume, parameters)
+    }
+
+    pub fn take_custom_study_faults_json(&mut self) -> String {
+        let faults = self.inner.borrow_mut().engine.take_custom_study_faults();
+        // Empty drains happen after ordinary wasm calls; skip JSON allocation on that path.
+        if faults.is_empty() {
+            return String::new();
+        }
+        serde_json::json!(
+            faults
+                .iter()
+                .map(|fault| serde_json::json!({
+                    "binding": fault.binding, "message": fault.message
+                }))
+                .collect::<Vec<_>>()
+        )
+        .to_string()
+    }
+
+    pub fn study_annotations_json(&self, binding: u32) -> String {
+        self.inner.borrow().study_annotations_json(binding)
+    }
+
     /// reference v5.2 `ISeriesApi.pop(count)`: remove the last `count` data points (count clamps
     /// to the data length; per-point colors shift along). Returns the new data length.
     pub fn series_pop(&mut self, id: u32, count: u32) -> u32 {
@@ -2553,6 +2736,138 @@ impl AerisChart {
     /// Add a Rust-native simple moving-average line derived from `source_id`.
     pub fn add_sma(&mut self, source_id: u32, period: u32) -> u32 {
         self.inner.borrow_mut().add_sma(source_id, period)
+    }
+
+    pub fn add_aroon(&mut self, source_id: u32, period: u32) -> Vec<u32> {
+        self.inner.borrow_mut().add_aroon(source_id, period)
+    }
+    pub fn add_swing_points(&mut self, source_id: u32, left: u32, right: u32) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_swing_points(source_id, left, right)
+    }
+    pub fn add_session_levels(&mut self, source_id: u32, calendar: &str) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_session_levels(source_id, calendar)
+    }
+    pub fn add_previous_period_levels(
+        &mut self,
+        source_id: u32,
+        period: &str,
+        calendar: &str,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_previous_period_levels(source_id, period, calendar)
+    }
+    pub fn add_opening_range(
+        &mut self,
+        source_id: u32,
+        duration_seconds: u32,
+        calendar: &str,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_opening_range(source_id, duration_seconds, calendar)
+    }
+    pub fn add_market_structure(
+        &mut self,
+        source_id: u32,
+        left: u32,
+        right: u32,
+        break_on: &str,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_market_structure(source_id, left, right, break_on)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_fair_value_gaps(
+        &mut self,
+        source_id: u32,
+        min_size: f64,
+        mitigation: &str,
+        mitigation_price: &str,
+        max_active: u32,
+        show_mitigated: bool,
+    ) -> Vec<u32> {
+        self.inner.borrow_mut().add_fair_value_gaps(
+            source_id,
+            min_size,
+            mitigation,
+            mitigation_price,
+            max_active,
+            show_mitigated,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_order_blocks(
+        &mut self,
+        source_id: u32,
+        left: u32,
+        right: u32,
+        break_on: &str,
+        zone: &str,
+        mitigation: &str,
+        mitigation_price: &str,
+        max_active: u32,
+        show_mitigated: bool,
+    ) -> Vec<u32> {
+        self.inner.borrow_mut().add_order_blocks(
+            source_id,
+            left,
+            right,
+            break_on,
+            zone,
+            mitigation,
+            mitigation_price,
+            max_active,
+            show_mitigated,
+        )
+    }
+
+    pub fn add_awesome_oscillator(&mut self, source_id: u32) -> u32 {
+        self.inner.borrow_mut().add_awesome_oscillator(source_id)
+    }
+
+    pub fn add_dpo(&mut self, source_id: u32, period: u32) -> u32 {
+        self.inner.borrow_mut().add_dpo(source_id, period)
+    }
+
+    pub fn add_chande_momentum(&mut self, source_id: u32, period: u32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_chande_momentum(source_id, period)
+    }
+
+    pub fn add_bollinger_metrics(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        deviation: f64,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_bollinger_metrics(source_id, period, deviation)
+    }
+
+    pub fn add_envelopes(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        percent: f64,
+        exponential: bool,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_envelopes(source_id, period, percent, exponential)
+    }
+
+    pub fn add_alma(&mut self, source_id: u32, period: u32, offset: f64, sigma: f64) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_alma(source_id, period, offset, sigma)
     }
 
     pub fn add_sma_with_source(&mut self, source_id: u32, source: &str, period: u32) -> u32 {
@@ -2755,6 +3070,24 @@ impl AerisChart {
     /// Add a session-anchored VWAP line on the source's pane (`volume_source` -1 = unit weights).
     pub fn add_vwap(&mut self, source_id: u32, volume_source: i32) -> u32 {
         self.inner.borrow_mut().add_vwap(source_id, volume_source)
+    }
+
+    /// Replace the host study calendar; invalid JSON or intervals leave the previous calendar intact.
+    pub fn set_study_calendar_json(&mut self, boundaries_json: &str) -> bool {
+        let Ok(boundaries) =
+            serde_json::from_str::<Vec<aeris_charts_engine::ResampleBoundary>>(boundaries_json)
+        else {
+            return false;
+        };
+        self.inner
+            .borrow_mut()
+            .engine
+            .set_study_calendar(boundaries)
+            .is_ok()
+    }
+
+    pub fn clear_study_calendar(&mut self) {
+        self.inner.borrow_mut().engine.clear_study_calendar();
     }
 
     /// Bind a host-created target to engine-owned, UTC boundary-driven OHLCV aggregation.
@@ -2968,6 +3301,189 @@ impl AerisChart {
     /// Add on-balance volume in its own oscillator pane (`volume_source` is required).
     pub fn add_obv(&mut self, source_id: u32, volume_source: i32) -> u32 {
         self.inner.borrow_mut().add_obv(source_id, volume_source)
+    }
+
+    pub fn add_accumulation_distribution(&mut self, source_id: u32, volume_source: i32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_accumulation_distribution(source_id, volume_source)
+    }
+
+    pub fn add_price_volume_trend(&mut self, source_id: u32, volume_source: i32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_price_volume_trend(source_id, volume_source)
+    }
+
+    pub fn add_chaikin_oscillator(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        fast: u32,
+        slow: u32,
+    ) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_chaikin_oscillator(source_id, volume_source, fast, slow)
+    }
+
+    pub fn add_klinger(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        fast: u32,
+        slow: u32,
+        signal: u32,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_klinger(source_id, volume_source, fast, slow, signal)
+    }
+
+    pub fn add_kama(&mut self, source_id: u32, period: u32, fast: u32, slow: u32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_kama(source_id, period, fast, slow)
+    }
+
+    pub fn add_mcginley(&mut self, source_id: u32, period: u32) -> u32 {
+        self.inner.borrow_mut().add_mcginley(source_id, period)
+    }
+
+    pub fn add_linear_regression(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        deviation: f64,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_linear_regression(source_id, period, deviation)
+    }
+
+    /// Add a Choppiness Index (0–100) line in its own oscillator pane (38.2/61.8 Chop Zone band
+    /// lines + channel fill).
+    pub fn add_choppiness(&mut self, source_id: u32, period: u32) -> u32 {
+        self.inner.borrow_mut().add_choppiness(source_id, period)
+    }
+
+    pub fn add_atr_bands(&mut self, source_id: u32, period: u32, multiplier: f64) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_atr_bands(source_id, period, multiplier)
+    }
+
+    pub fn add_relative_volume(&mut self, source_id: u32, volume_source: i32, period: u32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_relative_volume(source_id, volume_source, period)
+    }
+
+    pub fn add_volume_oscillator(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        fast: u32,
+        slow: u32,
+        signal: u32,
+    ) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_volume_oscillator(source_id, volume_source, fast, slow, signal)
+    }
+
+    pub fn add_elder_force(&mut self, source_id: u32, volume_source: i32, period: u32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_elder_force(source_id, volume_source, period)
+    }
+
+    pub fn add_ease_of_movement(
+        &mut self,
+        source_id: u32,
+        volume_source: i32,
+        period: u32,
+        divisor: f64,
+    ) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_ease_of_movement(source_id, volume_source, period, divisor)
+    }
+
+    pub fn add_historical_volatility(
+        &mut self,
+        source_id: u32,
+        period: u32,
+        annualization: f64,
+    ) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_historical_volatility(source_id, period, annualization)
+    }
+
+    pub fn add_trix(&mut self, source_id: u32, period: u32, signal: u32) -> Vec<u32> {
+        self.inner.borrow_mut().add_trix(source_id, period, signal)
+    }
+
+    pub fn add_kst(
+        &mut self,
+        source_id: u32,
+        roc: Vec<u32>,
+        smoothing: Vec<u32>,
+        signal: u32,
+    ) -> Vec<u32> {
+        let (Ok(roc), Ok(smoothing)) = (roc.try_into(), smoothing.try_into()) else {
+            return Vec::new();
+        };
+        self.inner
+            .borrow_mut()
+            .add_kst(source_id, roc, smoothing, signal)
+    }
+
+    pub fn add_tsi(&mut self, source_id: u32, long: u32, short: u32, signal: u32) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_tsi(source_id, long, short, signal)
+    }
+
+    pub fn add_mass_index(&mut self, source_id: u32, ema_period: u32, sum_period: u32) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_mass_index(source_id, ema_period, sum_period)
+    }
+
+    pub fn add_vortex(&mut self, source_id: u32, period: u32) -> Vec<u32> {
+        self.inner.borrow_mut().add_vortex(source_id, period)
+    }
+
+    pub fn add_coppock_curve(
+        &mut self,
+        source_id: u32,
+        long: u32,
+        short: u32,
+        smoothing: u32,
+    ) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_coppock_curve(source_id, long, short, smoothing)
+    }
+
+    pub fn add_fisher_transform(&mut self, source_id: u32, period: u32) -> Vec<u32> {
+        self.inner
+            .borrow_mut()
+            .add_fisher_transform(source_id, period)
+    }
+
+    pub fn add_ultimate_oscillator(
+        &mut self,
+        source_id: u32,
+        short: u32,
+        medium: u32,
+        long: u32,
+    ) -> u32 {
+        self.inner
+            .borrow_mut()
+            .add_ultimate_oscillator(source_id, short, medium, long)
     }
 
     /// Add Chaikin money flow in its own oscillator pane.
@@ -3408,7 +3924,7 @@ impl AerisChart {
                 return trading_result_json(Err(aeris_charts_engine::ChartError::new(
                     aeris_charts_engine::ErrorCode::InvalidOptions,
                     "as_of_max_staleness must be a non-negative whole number of seconds or null",
-                )))
+                )));
             }
         };
         trading_result_json(
@@ -5419,14 +5935,17 @@ impl AerisChart {
     pub fn set_crosshair(&mut self, x_css: f64, y_css: f64) {
         self.inner.borrow_mut().set_crosshair(x_css, y_css);
     }
-    /// the public reference's Ctrl-held magnet: the gesture layer forwards the live modifier state; a
-    /// Normal-mode crosshair then snaps to the hovered bar's rendered prices on the next
-    /// `render()` (OHLC for candles/bars, close/value for scalar series).
+    /// The held Ctrl/Cmd drawing-magnet modifier. The engine input controller reports it only
+    /// during drawing work (armed tool, pending creation or drawing drag), and a Normal-mode
+    /// crosshair resolves it against the worked drawing's effective magnet on the next
+    /// `render()`; outside drawing work it has no effect. Hosts that route input through the
+    /// controller never call this.
     pub fn set_crosshair_ohlc_magnet(&mut self, enabled: bool) {
         self.inner.borrow_mut().engine.crosshair_ohlc_magnet = enabled;
     }
 
-    /// Whether the OHLC crosshair magnet is currently engaged.
+    /// Whether the held Ctrl/Cmd drawing-magnet modifier is reported (not whether the crosshair
+    /// snaps: that follows the worked drawing's effective magnet).
     pub fn crosshair_ohlc_magnet(&self) -> bool {
         self.inner.borrow().engine.crosshair_ohlc_magnet
     }
@@ -5563,10 +6082,6 @@ impl AerisChart {
     }
     pub fn drawing_magnet_mode(&self) -> u8 {
         self.inner.borrow().drawing_magnet_mode()
-    }
-    /// Effective magnet (0/1/2) of the armed tool's next placement given the Ctrl/Cmd toggle.
-    pub fn armed_drawing_magnet(&self, toggle: bool) -> u8 {
-        self.inner.borrow().armed_drawing_magnet(toggle)
     }
     /// Keyboard-reachable handle count of a drawing (-1 when unknown or unplaceable).
     pub fn drawing_handle_count(&self, id: u32) -> i32 {

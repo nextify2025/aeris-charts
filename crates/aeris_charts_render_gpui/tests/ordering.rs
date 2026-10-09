@@ -15,7 +15,7 @@
 //!    paint on top.
 
 use aeris_charts_engine::{ChartFrame, FramePane};
-use aeris_charts_render::canvas2d::{execute as canvas_execute, Canvas2d, Viewport};
+use aeris_charts_render::canvas2d::{Canvas2d, Viewport, execute as canvas_execute};
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{Gradient, IRect, LineStyle, LineType, Prim, TextAlign};
 use aeris_charts_render_gpui::{

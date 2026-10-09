@@ -1,7 +1,7 @@
 //! `AO` (动量震荡指标). Ported from KLineChart `src/extension/indicator/awesomeOscillator.ts`.
 
-use super::stepper::{fold, rolling_mean_step, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold, rolling_mean_step};
 
 /// The running sums of the short and the long window over the median price. A running
 /// add/subtract sum cannot be recomputed from its window bit for bit, so they live in the

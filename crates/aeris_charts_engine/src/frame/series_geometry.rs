@@ -5,6 +5,7 @@ use super::conflation::line_runs;
 use super::*;
 use crate::VwapReset;
 use aeris_charts_core::TimePointIndex;
+use aeris_charts_indicators::study_annotations::{StudyAnnotations, StudyMarkerKind};
 use aeris_charts_render::line::{dash_runs, push_line_stroke};
 
 /// Append the strokes of one lone run's one-bar `segment` to `points` as independent point pairs
@@ -38,15 +39,15 @@ fn append_segment_pairs(
 /// `Prim::Segments` and clear it. A batch that gathered no pair (every dash piece degenerate)
 /// emits nothing.
 fn flush_segments(out: &mut Vec<Prim>, batch: &mut Option<(u32, u32)>, width: f32, color: Color) {
-    if let Some((first_point, segment_count)) = batch.take() {
-        if segment_count > 0 {
-            out.push(Prim::Segments {
-                first_point,
-                segment_count,
-                width,
-                color,
-            });
-        }
+    if let Some((first_point, segment_count)) = batch.take()
+        && segment_count > 0
+    {
+        out.push(Prim::Segments {
+            first_point,
+            segment_count,
+            width,
+            color,
+        });
     }
 }
 
@@ -135,6 +136,32 @@ fn color_runs(colors: &[Color]) -> Vec<(usize, usize, Color)> {
     out
 }
 
+/// Up or down for the bar at `index` under the volume tint `rule`: its close against its open,
+/// or against the previous non-whitespace close (`first_reference`, else its open, for the first
+/// row). `None` for a missing or whitespace row.
+fn bar_direction(
+    plot: PlotListView<'_>,
+    index: TimePointIndex,
+    rule: crate::HistogramUpDownRule,
+    first_reference: Option<f64>,
+) -> Option<bool> {
+    let row = plot.search(index, MismatchDirection::None)?;
+    if plot.is_whitespace_row(row) {
+        return None;
+    }
+    let close = plot.value_at(row, PlotValueIndex::Close);
+    let reference = match rule {
+        crate::HistogramUpDownRule::OpenClose => plot.value_at(row, PlotValueIndex::Open),
+        // The summary pyramid bounds this predecessor walk even across long whitespace runs.
+        crate::HistogramUpDownRule::PreviousClose => match plot.last_non_whitespace_row_before(row)
+        {
+            Some(previous) => plot.value_at(previous, PlotValueIndex::Close),
+            None => first_reference.unwrap_or_else(|| plot.value_at(row, PlotValueIndex::Open)),
+        },
+    };
+    (close.is_finite() && reference.is_finite()).then_some(close >= reference)
+}
+
 fn mix_area_brush_color(low: Color, high: Color, amount: f64) -> Color {
     let t = amount.clamp(0.0, 1.0);
     let channel = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * t).round() as u8;
@@ -210,6 +237,64 @@ fn single_point_segment(point: [f32; 2], half_bar: f32) -> [[f32; 2]; 2] {
         [point[0] - half_bar, point[1]],
         [point[0] + half_bar, point[1]],
     ]
+}
+
+/// The two-triangle/shaft arrow shared by ordinary series markers and structural swings.
+fn push_marker_arrow(
+    out: &mut Vec<Prim>,
+    x: f32,
+    y: f32,
+    size: f64,
+    hpr: f64,
+    up: bool,
+    color: Color,
+) {
+    let arrow_size = marker_shape_size(size, 1.0);
+    let half_arrow = (((arrow_size - 1.0) * 0.5) * hpr) as f32;
+    let base_size = ceiled_odd(size / 2.0);
+    let half_base = (((base_size - 1.0) * 0.5) * hpr) as f32;
+    out.push(Prim::Triangle {
+        a: [x, y + if up { -half_arrow } else { half_arrow }],
+        b: [x - half_arrow, y],
+        c: [x + half_arrow, y],
+        color,
+    });
+    out.push(Prim::RoundRect {
+        x: x - half_base,
+        y: if up { y } else { y - half_arrow },
+        w: half_base * 2.0,
+        h: half_arrow,
+        radii: [0.0; 4],
+        fill: color,
+        border_width: 0.0,
+        border_color: color,
+    });
+}
+
+/// Shared visible price-glyph placement for structural annotations and custom study plots.
+/// `direction` offsets a swing arrow away from its price; `None` stays at the exact price.
+fn study_price_marker_center(
+    x: i32,
+    price_y: i32,
+    size: f64,
+    ratios: (f64, f64),
+    direction: Option<bool>,
+    bounds: (i32, i32, i32),
+) -> Option<[f32; 2]> {
+    let (hpr, vpr) = ratios;
+    let (width, top, bottom) = bounds;
+    let half = marker_shape_size(size, 1.0) * hpr * 0.5;
+    let y = price_y as f64
+        + match direction {
+            Some(true) => size * vpr * 0.6,
+            Some(false) => -size * vpr * 0.6,
+            None => 0.0,
+        };
+    (x as f64 - half >= 0.0
+        && x as f64 + half <= width as f64
+        && y - half >= top as f64
+        && y + half < bottom as f64)
+        .then_some([x as f32, y as f32])
 }
 
 impl ChartEngine {
@@ -291,6 +376,266 @@ impl ChartEngine {
                         .is_some_and(|index| (from..=to).contains(&index))
             })
             .collect()
+    }
+
+    /// Paint confirmed study annotations into the anchor series' ordered geometry layer.
+    /// Rows are source-series rows, not LOD rows: sparse time mappings remain exact. The caller
+    /// owns confirmation-time gating and invalidation; this painter only projects visible geometry.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_study_annotations_frame(
+        &self,
+        anchor: SeriesId,
+        source: SeriesId,
+        annotations: &StudyAnnotations,
+        show_mitigated: bool,
+        from: i64,
+        to: i64,
+        width: i32,
+        hpr: f64,
+        vpr: f64,
+        out: &mut Vec<Prim>,
+    ) {
+        let Some(series) = self
+            .series
+            .iter()
+            .find(|s| s.id == anchor && s.visible && !s.removed)
+        else {
+            return;
+        };
+        let Some(pane) = self.panes.get(series.pane_index) else {
+            return;
+        };
+        let scale = pane_scale(pane, series_scale_target(series));
+        let Some(base) = self.series_base_value(source, from) else {
+            return;
+        };
+        if scale.is_empty() || from > to || width <= 0 {
+            return;
+        }
+        let plot = self.data.plot(source);
+        let visible_rows = plot.visible_rows(from, to);
+        let top = (pane.top * vpr).round() as i32;
+        let bottom = ((pane.top + pane.height) * vpr).round() as i32;
+        if bottom <= top {
+            return;
+        }
+        let up_color = verbatim_color(&series.up_color, UP);
+        let down_color = verbatim_color(&series.down_color, DOWN);
+        let border_color = series_stroke_color(series);
+        let x_for_row = |row: usize| -> Option<i32> {
+            let logical = plot.index_at(row)?;
+            Some((self.time_scale.index_to_coordinate(logical) * hpr).round() as i32)
+        };
+        let y_for_price = |price: f64| -> Option<i32> {
+            let y = scale.price_to_coordinate(price, base) * vpr;
+            y.is_finite().then(|| y.round() as i32)
+        };
+        let x_min = 0;
+        let x_max = width;
+
+        // Fills first, then borders, then structure strokes, then swing glyphs. No backend
+        // receives a separate clipping or annotation contract.
+        // A closed zone can also span a sparse gap with no rows in the viewport.
+        // The exact logical-index checks below reject a candidate beginning after `to`.
+        annotations.visit_visible_zones(
+            visible_rows.start,
+            visible_rows.end.max(visible_rows.start.saturating_add(1)),
+            show_mitigated,
+            |zone| {
+                if zone.end_row.is_some() && !show_mitigated {
+                    return;
+                }
+                if plot.index_at(zone.start_row).is_none_or(|index| index > to)
+                    || zone
+                        .end_row
+                        .is_some_and(|end| plot.index_at(end).is_none_or(|index| index < from))
+                {
+                    return;
+                }
+                let (Some(start_x), Some(end_x), Some(y_top), Some(y_bottom)) = (
+                    x_for_row(zone.start_row),
+                    zone.end_row.and_then(x_for_row).or(Some(width)),
+                    y_for_price(zone.top),
+                    y_for_price(zone.bottom),
+                ) else {
+                    return;
+                };
+                let left = start_x.min(end_x).max(x_min);
+                let right = start_x.max(end_x).min(x_max);
+                let upper = y_top.min(y_bottom).max(top);
+                let lower = y_top.max(y_bottom).min(bottom);
+                if right <= left || lower <= upper {
+                    return;
+                }
+                let tone = if zone.bullish { up_color } else { down_color };
+                let fill = Color::rgba(tone.r(), tone.g(), tone.b(), 38);
+                let rect = IRect {
+                    x: left,
+                    y: upper,
+                    w: right - left,
+                    h: lower - upper,
+                };
+                out.push(Prim::Rect { rect, color: fill });
+                out.push(Prim::RectFrame {
+                    rect,
+                    border: 1,
+                    color: border_color,
+                });
+            },
+        );
+        // A BOS/CHoCH stroke can cross a sparse viewport without a source row
+        // inside it, just as a closed zone can.
+        annotations.visit_visible_markers(
+            visible_rows.start,
+            visible_rows.end.max(visible_rows.start.saturating_add(1)),
+            |marker| {
+                let (StudyMarkerKind::Bos { .. } | StudyMarkerKind::Choch { .. }) = marker.kind
+                else {
+                    return;
+                };
+                let (Some(start_index), Some(end_index)) = (
+                    marker.from_row.and_then(|row| plot.index_at(row)),
+                    plot.index_at(marker.row),
+                ) else {
+                    return;
+                };
+                if start_index.min(end_index) > to || start_index.max(end_index) < from {
+                    return;
+                }
+                let (Some(start), Some(end), Some(y)) = (
+                    marker.from_row.and_then(x_for_row),
+                    x_for_row(marker.row),
+                    y_for_price(marker.price),
+                ) else {
+                    return;
+                };
+                let left = start.min(end).max(x_min);
+                let right = start.max(end).min(x_max);
+                if right <= left || y < top || y >= bottom {
+                    return;
+                }
+                let color = border_color;
+                out.push(Prim::HLine {
+                    y,
+                    x0: left,
+                    x1: right,
+                    width: 1.max(hpr.floor() as i32),
+                    style: crate::line_style_from_u8(series.line_style),
+                    color,
+                });
+                // At sub-4 CSS-px spacing the stroke remains legible but text is not.
+                if end_index >= from && end_index <= to && self.time_scale.bar_spacing() >= 4.0 {
+                    let label = if matches!(marker.kind, StudyMarkerKind::Bos { .. }) {
+                        "BOS"
+                    } else {
+                        "CHoCH"
+                    };
+                    let label_y = (y - (10.0 * vpr).round() as i32).max(top);
+                    if label_y < bottom {
+                        out.push(Prim::Text {
+                            x: ((left + right) as f64 * 0.5) as f32,
+                            y: label_y as f32,
+                            text: label.into(),
+                            color,
+                            size: (self.options.get().layout.font_size * vpr) as f32,
+                            family: self.options.get().layout.font_family.clone(),
+                            align: TextAlign::Center,
+                            weight: 400,
+                            italic: false,
+                        });
+                    }
+                }
+            },
+        );
+        annotations.visit_visible_markers(visible_rows.start, visible_rows.end, |marker| {
+            let up = match marker.kind {
+                StudyMarkerKind::SwingHigh => false,
+                StudyMarkerKind::SwingLow => true,
+                _ => return,
+            };
+            if plot
+                .index_at(marker.row)
+                .is_none_or(|index| index < from || index > to)
+            {
+                return;
+            }
+            let (Some(x), Some(y)) = (x_for_row(marker.row), y_for_price(marker.price)) else {
+                return;
+            };
+            let size = marker_envelope_size(self.time_scale.bar_spacing());
+            let Some([x, glyph_y]) =
+                study_price_marker_center(x, y, size, (hpr, vpr), Some(up), (width, top, bottom))
+            else {
+                return;
+            };
+            push_marker_arrow(
+                out,
+                x,
+                glyph_y,
+                size,
+                hpr,
+                up,
+                if up { up_color } else { down_color },
+            );
+        });
+    }
+
+    /// A custom Marker output is still a canonical scalar series; only its paint differs.
+    /// Walk exact visible rows rather than LOD line points so gaps and marker prices survive.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_custom_marker_plot_frame(
+        &self,
+        rs: ResolvedSeries,
+        from: i64,
+        to: i64,
+        width: i32,
+        hpr: f64,
+        vpr: f64,
+        out: &mut Vec<Prim>,
+        scale: &aeris_charts_core::scale::price_scale_core::PriceScaleCore,
+    ) {
+        if scale.is_empty() || from > to {
+            return;
+        }
+        let plot = self.data.plot(rs.id);
+        let pane = &self.panes[rs.pane.expect("visible series pane")];
+        let top = (pane.top * vpr).round() as i32;
+        let bottom = ((pane.top + pane.height) * vpr).round() as i32;
+        let size = marker_envelope_size(self.time_scale.bar_spacing());
+        let radius = (marker_shape_size(size, 1.0) * hpr * 0.5) as f32;
+        for row in plot.visible_rows(from, to) {
+            if plot.is_whitespace_row(row) {
+                continue;
+            }
+            let price = plot.value_at(row, PlotValueIndex::Close);
+            let y = scale.price_to_coordinate(price, rs.base_value) * vpr;
+            if !y.is_finite() {
+                continue;
+            }
+            let x = (self
+                .time_scale
+                .index_to_coordinate(plot.index_at(row).expect("visible marker row index"))
+                * hpr)
+                .round() as i32;
+            let Some([cx, cy]) = study_price_marker_center(
+                x,
+                y.round() as i32,
+                size,
+                (hpr, vpr),
+                None,
+                (width, top, bottom),
+            ) else {
+                continue;
+            };
+            out.push(Prim::Circle {
+                cx,
+                cy,
+                radius,
+                fill: rs.color,
+                stroke_width: 0.0,
+                stroke: rs.color,
+            });
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -656,6 +1001,18 @@ impl ChartEngine {
         // is the first visible, non-removed series (id 0 may be tombstoned).
         let primary = self.primary_series();
         let main = primary.map(|s| self.display_plot(s.id));
+        // A footprint drawn over a whitespace primary presents those bars, so it supplies the
+        // direction wherever the primary row carries none.
+        let presented = primary
+            .and_then(|primary| {
+                self.series.iter().find(|s| {
+                    !s.removed
+                        && s.visible
+                        && s.kind == SeriesKind::Footprint
+                        && s.pane_index == primary.pane_index
+                })
+            })
+            .map(|s| self.display_plot(s.id));
         let point_colors = self.data.point_colors(rs.id);
         let (histogram_updown, rule, volume_up, volume_down) = self.series_entry(rs.id).map_or(
             (
@@ -714,37 +1071,16 @@ impl ChartEngine {
                     Some(c) => Color(c),
                     None => {
                         if histogram_updown {
-                            // A whitespace row (or no row) on the primary series carries no
-                            // direction — the column falls back to its solid color.
-                            let direction = main.and_then(|m| {
-                                let row = m.search(
-                                    plot.index_at(r).expect("histogram row index"),
-                                    MismatchDirection::None,
-                                )?;
-                                if m.is_whitespace_row(row) {
-                                    return None;
-                                }
-                                let close = m.value_at(row, PlotValueIndex::Close);
-                                let reference = match rule {
-                                    crate::HistogramUpDownRule::OpenClose => {
-                                        m.value_at(row, PlotValueIndex::Open)
-                                    }
-                                    // The summary pyramid bounds this predecessor walk even
-                                    // across long whitespace runs.
-                                    crate::HistogramUpDownRule::PreviousClose => {
-                                        match m.last_non_whitespace_row_before(row) {
-                                            Some(previous) => {
-                                                m.value_at(previous, PlotValueIndex::Close)
-                                            }
-                                            None => first_reference.unwrap_or_else(|| {
-                                                m.value_at(row, PlotValueIndex::Open)
-                                            }),
-                                        }
-                                    }
-                                };
-                                (close.is_finite() && reference.is_finite())
-                                    .then_some(close >= reference)
-                            });
+                            // A slot no presented bar covers carries no direction — the column
+                            // falls back to its solid color.
+                            let index = plot.index_at(r).expect("histogram row index");
+                            let direction = main
+                                .and_then(|m| bar_direction(m, index, rule, first_reference))
+                                .or_else(|| {
+                                    presented.and_then(|m| {
+                                        bar_direction(m, index, rule, first_reference)
+                                    })
+                                });
                             match direction {
                                 Some(true) => volume_up,
                                 Some(false) => volume_down,
@@ -839,11 +1175,11 @@ impl ChartEngine {
         // Already the rendered stroke (see `series_stroke_color`).
         let color = rs.color;
         let point_colors = self.data.point_colors(rs.id);
-        // Bollinger background fill: the band between this UPPER output and its LOWER
+        // Band background fill: the band between this UPPER output and its LOWER
         // companion, in the band color at the public reference's 0.2 background alpha, painted under
         // the band strokes. Both outputs share bar times, so the rows (and x's) align
         // point-for-point; a count mismatch skips the fill rather than drawing a wrong one.
-        if let Some(lower_id) = self.bollinger_fill_companion(rs.id) {
+        if let Some(lower_id) = self.band_fill_companion(rs.id) {
             let lower_plot = self.data.plot(lower_id);
             let lower_close = |row: usize| lower_plot.value_at(row, PlotValueIndex::Close);
             let mut work = conflation::DensityWork::default();
@@ -1622,27 +1958,8 @@ impl ChartEngine {
                     });
                 }
                 crate::marker_shape::ARROW_UP | crate::marker_shape::ARROW_DOWN => {
-                    let arrow_size = marker_shape_size(size, 1.0);
-                    let half_arrow = (((arrow_size - 1.0) * 0.5) * hpr) as f32;
-                    let base_size = ceiled_odd(size / 2.0);
-                    let half_base = (((base_size - 1.0) * 0.5) * hpr) as f32;
                     let up = marker.shape == crate::marker_shape::ARROW_UP;
-                    out.push(Prim::Triangle {
-                        a: [x, y + if up { -half_arrow } else { half_arrow }],
-                        b: [x - half_arrow, y],
-                        c: [x + half_arrow, y],
-                        color: marker.color,
-                    });
-                    out.push(Prim::RoundRect {
-                        x: x - half_base,
-                        y: if up { y } else { y - half_arrow },
-                        w: half_base * 2.0,
-                        h: half_arrow,
-                        radii: [0.0; 4],
-                        fill: marker.color,
-                        border_width: 0.0,
-                        border_color: marker.color,
-                    });
+                    push_marker_arrow(out, x, y, size, hpr, up, marker.color);
                 }
                 _ => {
                     let radius = (((marker_shape_size(size, 0.8) - 1.0) * 0.5) * hpr) as f32;
@@ -1887,11 +2204,7 @@ impl ChartEngine {
                     .display_heikin_ashi_row(series_id, plot, last)
                     .map(|values| values[0])
                     .unwrap_or_else(|| plot.value_at(last, PlotValueIndex::Open));
-                if close >= open {
-                    UP
-                } else {
-                    DOWN
-                }
+                if close >= open { UP } else { DOWN }
             }
         }
         .solid();
@@ -2058,5 +2371,76 @@ impl ChartEngine {
                 push_anchor(out, cx, cy, fill);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod study_segment_tests {
+    use super::*;
+    use aeris_charts_indicators::study_annotations::StudyMarker;
+
+    #[test]
+    fn structure_stroke_crosses_viewport_before_its_break_label_enters() {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let times: Vec<_> = (0..200).map(|row| row as f64).collect();
+        let open: Vec<_> = (0..200).map(|row| 100.0 + row as f64).collect();
+        let high: Vec<_> = open.iter().map(|value| value + 2.0).collect();
+        let low: Vec<_> = open.iter().map(|value| value - 2.0).collect();
+        let close: Vec<_> = open.iter().map(|value| value + 0.5).collect();
+        chart
+            .set_series_data(0, &times, &open, &high, &low, &close)
+            .unwrap();
+        chart.time_scale.set_width(800.0);
+        chart.fit_content();
+        chart.build_frame();
+        chart.series_entry_mut(0).unwrap().line_style = 2;
+
+        let mut annotations = StudyAnnotations::default();
+        annotations.push_marker(StudyMarker {
+            row: 160,
+            confirm_row: 160,
+            price: 120.0,
+            kind: StudyMarkerKind::Bos { up: true },
+            from_row: Some(20),
+        });
+        let mut prims = Vec::new();
+        chart.build_study_annotations_frame(
+            0,
+            0,
+            &annotations,
+            false,
+            80,
+            90,
+            800,
+            1.0,
+            1.0,
+            &mut prims,
+        );
+        assert!(prims.iter().any(|prim| matches!(
+            prim,
+            Prim::HLine {
+                style: LineStyle::Dashed,
+                ..
+            }
+        )));
+        assert!(!prims.iter().any(|prim| matches!(prim, Prim::Text { .. })));
+        prims.clear();
+        chart.build_study_annotations_frame(
+            0,
+            0,
+            &annotations,
+            false,
+            150,
+            170,
+            800,
+            1.0,
+            1.0,
+            &mut prims,
+        );
+        assert!(
+            prims
+                .iter()
+                .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "BOS"))
+        );
     }
 }

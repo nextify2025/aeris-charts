@@ -353,10 +353,12 @@ mod tests {
         assert_eq!(shanghai.offset_at(1_705_320_000), 8 * 3_600);
         assert_eq!(shanghai.offset_at(0), 8 * 3_600);
         // Asia/Astana keeps its identifier and resolves through Asia/Almaty.
-        assert!(ChartTimeZone::parse("Asia/Astana")
-            .unwrap()
-            .offset_schedule()
-            .is_ok());
+        assert!(
+            ChartTimeZone::parse("Asia/Astana")
+                .unwrap()
+                .offset_schedule()
+                .is_ok()
+        );
     }
 
     #[test]

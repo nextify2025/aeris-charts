@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use super::*;
 use crate::synthetic_bars::{SyntheticBar, SyntheticBarOptions, SyntheticSourceBar};
 use crate::{PivotKind, SeriesHitKind, UtcOffsetSchedule, VwapReset};
-use aeris_charts_render::line::{dash_split, LinePoint};
+use aeris_charts_render::line::{LinePoint, dash_split};
 
 const HOUR: i64 = 3_600;
 const DAY: i64 = 86_400;
@@ -269,9 +269,10 @@ fn run_breaks_after_incremental_updates_match_full_installs() {
             (live.volume, &data.volume),
             (live.amount, &data.amount),
         ] {
-            assert!(live
-                .chart
-                .update_series_bar(id, data.times[row], [values[row]; 4]));
+            assert!(
+                live.chart
+                    .update_series_bar(id, data.times[row], [values[row]; 4])
+            );
         }
         let live_frame = settle(&mut live.chart);
         let mut full = intraday(&data, row + 1, true);
@@ -495,9 +496,10 @@ fn vwap_bands_and_pivots_break_on_their_own_reset_keys() {
     let frame = settle(&mut chart);
     let runs = strokes(&frame, AVERAGE);
     assert_eq!(days_of(&chart, &runs, data.minutes), vec![1, 2]);
-    assert!(runs
-        .iter()
-        .all(|run| run.iter().all(|point| point[1] == run[0][1])));
+    assert!(
+        runs.iter()
+            .all(|run| run.iter().all(|point| point[1] == run[0][1]))
+    );
 }
 
 #[test]
@@ -658,9 +660,10 @@ fn retention_trims_while_streaming_break_like_a_fresh_install_of_the_kept_rows()
             (live.volume, &data.volume),
             (live.amount, &data.amount),
         ] {
-            assert!(live
-                .chart
-                .update_series_bar(id, data.times[row], [values[row]; 4]));
+            assert!(
+                live.chart
+                    .update_series_bar(id, data.times[row], [values[row]; 4])
+            );
         }
         let live_frame = settle(&mut live.chart);
         let kept_from = live.chart.data.series_data(0).unwrap().0[0];
@@ -829,13 +832,23 @@ fn expected_segments(chart: &ChartEngine, output: SeriesId) -> Vec<Vec<[f32; 2]>
     let hpr = chart.pane_w.round().max(1.0) / chart.pane_w.max(1.0);
     let vpr = chart.pane_h.round().max(1.0) / chart.pane_h.max(1.0);
     let half = chart.time_scale.bar_spacing() * hpr / 2.0;
-    let (_, columns) = chart.data.series_data(output).unwrap();
+    // A study output starts at its first value, so its rows are offset from the source's.
+    let (times, columns) = chart.data.series_data(output).unwrap();
+    let offset = times.first().map_or(0, |first| {
+        chart
+            .data
+            .series_data(0)
+            .unwrap()
+            .0
+            .binary_search(first)
+            .unwrap()
+    });
     columns[3]
         .iter()
         .enumerate()
         .filter(|(_, value)| value.is_finite())
         .map(|(row, &value)| {
-            let x = chart.time_scale.index_to_coordinate(row as i64) * hpr;
+            let x = chart.time_scale.index_to_coordinate((offset + row) as i64) * hpr;
             let y = chart.series_price_to_coordinate(output, value).unwrap() * vpr;
             vec![[(x - half) as f32, y as f32], [(x + half) as f32, y as f32]]
         })
@@ -1085,7 +1098,7 @@ fn sub_pixel_daily_studies_stay_bounded_and_ordered() {
         let windows = stroke_windows(&frame, output_color(index));
         assert_eq!(windows.len(), 1, "output {index}: one batch, no polyline");
         assert!(windows[0].0);
-        let count = windows[0].1 .1 / 2;
+        let count = windows[0].1.1 / 2;
         assert!(
             count <= 4 * device_px + 2,
             "output {index} batches {count} segments for {device_px} device px"

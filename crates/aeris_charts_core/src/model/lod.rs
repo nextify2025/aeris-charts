@@ -11,6 +11,15 @@ use super::plot_list::{PlotValueIndex, PlotValues};
 pub const LOD_FANOUT: usize = 16;
 const NO_ROW: u32 = u32::MAX;
 
+/// Spare rows a growing level reserves past the rows it summarizes: one eighth of them plus one
+/// level-one group. A level sized exactly by a one-pass build would copy itself when a later
+/// append adds its next node, and the outputs aligned to one source reach that node on different
+/// ticks (each starts at its own warm-up row), so a bulk install with many studies would pay one
+/// whole-level copy per output on the live ticks after it instead of none.
+fn lod_headroom(rows: usize) -> usize {
+    rows / 8 + LOD_FANOUT * LOD_FANOUT
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LodSummary {
     first: u32,
@@ -265,20 +274,27 @@ impl LodPyramid {
                 .sum::<usize>()
     }
 
+    /// Size every level for `len` rows. A level that must grow reserves exactly the nodes for
+    /// `len + lod_headroom(len)` rows, so a pyramid built in one pass (a bulk install) takes the
+    /// tail appends that follow without copying a level, and no growth reserves past that bound.
     fn sync_layout(&mut self, len: usize) {
-        let mut counts = Vec::new();
+        let mut levels = 0;
         let mut count = len;
+        let mut reserved = len.saturating_add(lod_headroom(len));
         while count >= LOD_FANOUT {
             count = count.div_ceil(LOD_FANOUT);
-            counts.push(count);
-        }
-        self.levels.truncate(counts.len());
-        for (level, count) in counts.into_iter().enumerate() {
-            if level == self.levels.len() {
+            reserved = reserved.div_ceil(LOD_FANOUT);
+            if levels == self.levels.len() {
                 self.levels.push(Vec::new());
             }
-            self.levels[level].resize(count, LodSummary::EMPTY);
+            let nodes = &mut self.levels[levels];
+            if nodes.capacity() < count {
+                nodes.reserve_exact(reserved - nodes.len());
+            }
+            nodes.resize(count, LodSummary::EMPTY);
+            levels += 1;
         }
+        self.levels.truncate(levels);
     }
 }
 
@@ -449,11 +465,13 @@ mod tests {
         let data = vec![f64::NAN; 256];
         let mut pyramid = LodPyramid::default();
         pyramid.rebuild(values(&data));
-        assert!(pyramid
-            .view(values(&data))
-            .rows_on_range(0..data.len(), 1)
-            .0
-            .is_empty());
+        assert!(
+            pyramid
+                .view(values(&data))
+                .rows_on_range(0..data.len(), 1)
+                .0
+                .is_empty()
+        );
     }
 
     #[test]
@@ -473,6 +491,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 999_999]
         );
+    }
+
+    #[test]
+    fn a_pyramid_built_in_one_pass_takes_tail_appends_without_copying_a_level() {
+        // A bulk install builds every level at once; the live appends after it must not copy a
+        // level (Target M's new-bar spikes), for the next `rows / 8` rows at least.
+        let rows = 100_003;
+        let data = (0..rows + rows / 8)
+            .map(|row| (row % 97) as f64)
+            .collect::<Vec<_>>();
+        let mut pyramid = LodPyramid::default();
+        pyramid.rebuild(values(&data[..rows]));
+        let built = pyramid.capacity_bytes();
+        for len in rows + 1..=data.len() {
+            pyramid.rebuild_range(values(&data[..len]), len - 1..len);
+            assert_eq!(pyramid.capacity_bytes(), built, "appending row {}", len - 1);
+        }
+        let mut fresh = LodPyramid::default();
+        fresh.rebuild(values(&data));
+        assert_eq!(pyramid.levels, fresh.levels);
     }
 
     #[test]

@@ -24,8 +24,8 @@ use aeris_charts_engine::{
 };
 use aeris_charts_render_gpui::{AerisViewport, GpuiChartRenderer, Paint, PreparedAerisFrame};
 use gpui::{
-    canvas, div, prelude::*, px, size, App, Bounds, Context, Entity, Render, Window, WindowBounds,
-    WindowOptions,
+    App, Bounds, Context, Entity, Render, Window, WindowBounds, WindowOptions, canvas, div,
+    prelude::*, px, size,
 };
 use gpui_platform::application;
 
@@ -116,7 +116,7 @@ impl Capture {
             engine.apply_right_offset_option(0.0);
         }
         if feature == "markers" {
-            use aeris_charts_engine::{marker_pos, marker_shape, Marker};
+            use aeris_charts_engine::{Marker, marker_pos, marker_shape};
             use aeris_charts_render::color::Color;
 
             let start = fixture.end_time - (fixture.bar_count.saturating_sub(1) as i64) * 3_600;

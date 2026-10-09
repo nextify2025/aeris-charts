@@ -7,7 +7,7 @@
 use crate::{ChartEngine, SeriesKind};
 use aeris_charts_core::model::data_layer::{SeriesId, SeriesIdError};
 use aeris_charts_core::model::data_validation::{
-    ValidationError, ValidationReport, MAX_SAFE_VALUE, MIN_SAFE_VALUE,
+    MAX_SAFE_VALUE, MIN_SAFE_VALUE, ValidationError, ValidationReport,
 };
 use aeris_charts_core::model::plot_list::MismatchDirection;
 use aeris_charts_core::style::{MARKET_DOWN_RGB, MARKET_UP_RGB};
@@ -446,10 +446,11 @@ impl FeatureSeriesOptions {
         {
             self.width_percent = patch.width_percent.unwrap_or(self.width_percent);
         }
-        if let Some(radius) = patch.radius {
-            if radius.is_finite() && radius >= 0.0 {
-                self.radius = Some(radius);
-            }
+        if let Some(radius) = patch.radius
+            && radius.is_finite()
+            && radius >= 0.0
+        {
+            self.radius = Some(radius);
         }
         set!(low_color);
         set!(high_color);
@@ -1158,10 +1159,11 @@ mod tests {
             |text, _bold| text.len() as f64 * 7.0,
             |text, _bold| text.len() as f64 * 6.0,
         );
-        assert!(axis
-            .labels
-            .iter()
-            .any(|label| matches!(label.background, Some((.., color)) if color == close_color)));
+        assert!(
+            axis.labels
+                .iter()
+                .any(|label| matches!(label.background, Some((.., color)) if color == close_color))
+        );
     }
 
     #[test]
@@ -1208,10 +1210,11 @@ mod tests {
             |text, _bold| text.len() as f64 * 7.0,
             |text, _bold| text.len() as f64 * 6.0,
         );
-        assert!(axis
-            .labels
-            .iter()
-            .any(|label| matches!(label.background, Some((.., color)) if color == shader_color)));
+        assert!(
+            axis.labels.iter().any(
+                |label| matches!(label.background, Some((.., color)) if color == shader_color)
+            )
+        );
     }
 
     #[test]
@@ -1604,9 +1607,11 @@ mod tests {
                 Color::rgb(101, 50, 204),
             ]
         );
-        assert!(fields
-            .iter()
-            .all(|(rect, _)| rect.y == 0 && rect.h == 1_000));
+        assert!(
+            fields
+                .iter()
+                .all(|(rect, _)| rect.y == 0 && rect.h == 1_000)
+        );
         let spacing = background.time_scale.bar_spacing();
         let expected = [0, 1, 2, 4]
             .map(|logical| {
@@ -1786,13 +1791,15 @@ mod tests {
             .unwrap();
         background.time_scale.set_width(800.0);
         background.fit_content();
-        assert!(background.build_frame().panes[0]
-            .main
-            .iter()
-            .any(|primitive| {
-                matches!(primitive, aeris_charts_render::draw_list::Prim::Rect { color, .. }
+        assert!(
+            background.build_frame().panes[0]
+                .main
+                .iter()
+                .any(|primitive| {
+                    matches!(primitive, aeris_charts_render::draw_list::Prim::Rect { color, .. }
                 if color.a() == 255 && color.r() == 153 && color.g() == 50 && color.b() == 153)
-            }));
+                })
+        );
     }
 
     #[test]
@@ -1839,7 +1846,7 @@ mod tests {
     #[test]
     fn invalid_feature_timestamps_reject_atomically() {
         use aeris_charts_core::model::data_validation::{
-            TimestampErrorCategory, MAX_TIMESTAMP, MIN_TIMESTAMP,
+            MAX_TIMESTAMP, MIN_TIMESTAMP, TimestampErrorCategory,
         };
 
         let mut chart = ChartEngine::new(800.0, 500.0, 1.0);

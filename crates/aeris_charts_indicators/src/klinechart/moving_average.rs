@@ -4,8 +4,8 @@
 //! `lookback`, one `step` over one valid row, and a public whole-series function that is a fold of
 //! that same `step`.
 
-use super::stepper::{fold, rolling_mean_step, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold, rolling_mean_step};
 use crate::MAX_OUTPUTS;
 
 /// One running sum per period. A running add/subtract sum cannot be recomputed from its window

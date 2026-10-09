@@ -1,8 +1,8 @@
 //! Frame-production unit tests (extracted from `frame.rs`).
 
 use super::conflation::{
-    visible_histogram_rows_raw_reference, visible_line_rows_raw_reference,
-    visible_ohlc_raw_reference, DensityWork, VisibleHistogramRow, VisibleOhlc,
+    DensityWork, VisibleHistogramRow, VisibleOhlc, visible_histogram_rows_raw_reference,
+    visible_line_rows_raw_reference, visible_ohlc_raw_reference,
 };
 use super::*;
 use crate::{
@@ -13,9 +13,598 @@ use crate::{
 };
 use aeris_charts_core::model::data_layer::DataLayer;
 use aeris_charts_core::model::plot_list::{PlotList, PlotValues};
+use aeris_charts_indicators::study_annotations::{
+    StudyAnnotations, StudyMarker, StudyMarkerKind, StudyZone,
+};
 
 const LIVE_TEXT: Color = Color::rgb(0xff, 0xff, 0xff);
 const LIVE_COUNTDOWN: Color = Color::rgba(0xff, 0xff, 0xff, 0xb3);
+
+#[test]
+fn custom_marker_plot_uses_exact_visible_prices_without_line_or_whitespace_marks() {
+    use crate::custom_studies::{
+        CustomStudyDefinition, CustomStudyFault, CustomStudyInput, CustomStudyOutput,
+        CustomStudyPane, CustomStudyPlot, CustomStudyRuntime,
+    };
+
+    struct Marks;
+    impl CustomStudyRuntime for Marks {
+        fn compute(
+            &mut self,
+            input: CustomStudyInput<'_>,
+            out: &mut [Vec<f64>],
+        ) -> Result<(), CustomStudyFault> {
+            for row in input.from..input.times.len() {
+                out[0].push(if row == 1 {
+                    f64::NAN
+                } else {
+                    input.close[row] + 5.0
+                });
+            }
+            Ok(())
+        }
+    }
+
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let prices = [100.0, 110.0, 120.0, 130.0];
+    chart
+        .set_series_data(0, &[1.0, 2.0, 3.0, 4.0], &prices, &prices, &prices, &prices)
+        .unwrap();
+    chart
+        .register_custom_study(
+            CustomStudyDefinition {
+                type_id: "frame_marks".into(),
+                version: 1,
+                title: "Marks".into(),
+                parameters: vec![],
+                outputs: vec![CustomStudyOutput {
+                    name: "Events".into(),
+                    plot: CustomStudyPlot::Marker,
+                    pane: CustomStudyPane::Price,
+                    default_style: crate::IndicatorOutputStyle {
+                        visible: true,
+                        line_color: Some("#123456".into()),
+                        point_markers: true,
+                        ..Default::default()
+                    },
+                }],
+                uses_volume: false,
+            },
+            Box::new(|_| Ok(Box::new(Marks))),
+        )
+        .unwrap();
+    let output = chart
+        .add_custom_study(
+            "frame_marks",
+            0,
+            crate::IndicatorInputSource::Close,
+            None,
+            Default::default(),
+        )
+        .unwrap()[0];
+    assert!(chart.custom_marker_plot(output));
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    let color = Color::rgb(0x12, 0x34, 0x56);
+    let frame = chart.build_frame();
+    let marks: Vec<_> = frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Circle { cx, cy, fill, .. } if *fill == color => Some((*cx, *cy)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(marks.len(), 3);
+    let scale = pane_scale(
+        &chart.panes[0],
+        series_scale_target(chart.series_entry(output).unwrap()),
+    );
+    let base = chart.series_base_value(output, 0).unwrap();
+    for (mark, row) in marks.iter().zip([0, 2, 3]) {
+        let logical = chart.data.plot(output).index_at(row).unwrap();
+        assert_eq!(
+            mark.0,
+            chart.time_scale.index_to_coordinate(logical).round() as f32
+        );
+        assert_eq!(
+            mark.1,
+            scale.price_to_coordinate(prices[row] + 5.0, base).round() as f32
+        );
+    }
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Polyline { color: stroke, .. } if *stroke == color))
+    );
+
+    chart.set_visible_logical_range(2.0, 3.0);
+    let visible = chart.build_frame();
+    assert_eq!(
+        visible.panes[0]
+            .main
+            .iter()
+            .filter(|prim| matches!(prim, Prim::Circle { fill, .. } if *fill == color))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn combined_structure_custom_marker_and_auction_frame_uses_existing_primitives() {
+    use crate::custom_studies::{
+        CustomStudyDefinition, CustomStudyFault, CustomStudyInput, CustomStudyOutput,
+        CustomStudyPane, CustomStudyPlot, CustomStudyRuntime,
+    };
+    use crate::{
+        AggressorSide, AuctionMarkerOptions, FootprintAggregationOptions, FootprintTrade,
+        IndicatorInputSource, IndicatorKind, IndicatorOutputStyle,
+    };
+
+    struct Marks;
+    impl CustomStudyRuntime for Marks {
+        fn compute(
+            &mut self,
+            input: CustomStudyInput<'_>,
+            out: &mut [Vec<f64>],
+        ) -> Result<(), CustomStudyFault> {
+            out[0].extend(
+                (input.from..input.times.len())
+                    .map(|row| if row == 3 { input.close[row] } else { f64::NAN }),
+            );
+            Ok(())
+        }
+    }
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let times = (0..7)
+        .map(|row| 1_700_000_000.0 + row as f64 * 60.0)
+        .collect::<Vec<_>>();
+    let open = [9., 12., 12., 16., 16., 18., 19.];
+    let high = [10., 14., 12., 18., 16., 20., 21.];
+    let low = [8., 9., 10., 15., 15., 8., 16.];
+    let close = [9., 13., 11., 17., 15., 19., 20.];
+    chart
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .unwrap();
+    chart.add_indicator_kind(0, IndicatorKind::SwingPoints { left: 1, right: 1 }, None);
+    chart.add_indicator_kind(
+        0,
+        IndicatorKind::MarketStructure {
+            left: 1,
+            right: 1,
+            break_on: crate::StructureBreakOn::Close,
+        },
+        None,
+    );
+    chart.add_indicator_kind(
+        0,
+        IndicatorKind::FairValueGaps {
+            min_size: 0.0,
+            mitigation: crate::StructureMitigation::Touch,
+            mitigation_price: crate::StructureMitigationPrice::Wick,
+            max_active: 20,
+            show_mitigated: true,
+        },
+        None,
+    );
+    chart
+        .register_custom_study(
+            CustomStudyDefinition {
+                type_id: "combined_marker".into(),
+                version: 1,
+                title: "Marker".into(),
+                parameters: vec![],
+                outputs: vec![CustomStudyOutput {
+                    name: "event".into(),
+                    plot: CustomStudyPlot::Marker,
+                    pane: CustomStudyPane::Price,
+                    default_style: IndicatorOutputStyle {
+                        visible: true,
+                        point_markers: true,
+                        line_color: Some("#ff00ff".into()),
+                        ..Default::default()
+                    },
+                }],
+                uses_volume: false,
+            },
+            Box::new(|_| Ok(Box::new(Marks))),
+        )
+        .unwrap();
+    let marker = chart
+        .add_custom_study(
+            "combined_marker",
+            0,
+            IndicatorInputSource::Close,
+            None,
+            Default::default(),
+        )
+        .unwrap()[0];
+    let stream = chart
+        .add_trade_stream(
+            "combined_frame",
+            FootprintAggregationOptions {
+                tick_size: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let trades = [(AggressorSide::Sell, 100.), (AggressorSide::Buy, 25.)]
+        .into_iter()
+        .enumerate()
+        .map(|(offset, (aggressor, volume))| FootprintTrade {
+            timestamp_micros: times[0] as i64 * 1_000_000 + offset as i64,
+            price: 10.0,
+            volume,
+            aggressor,
+            bid: None,
+            ask: None,
+            sequence: None,
+            trade_id: None,
+            conditions: 0,
+            session_id: Some(1),
+        })
+        .collect();
+    chart.set_trade_stream_trades(stream, trades).unwrap();
+    chart
+        .add_auction_markers(
+            stream,
+            0,
+            AuctionMarkerOptions {
+                include_forming_bar: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    chart.time_scale.set_width(800.0);
+    chart.fit_content();
+    let frame = chart.build_frame();
+    let prims = &frame.panes[0].main;
+    assert!(chart.custom_marker_plot(marker));
+    assert!(
+        prims.iter().any(|p| matches!(p, Prim::Rect { .. })),
+        "zone fill"
+    );
+    assert!(
+        prims.iter().any(|p| matches!(p, Prim::RectFrame { .. })),
+        "zone border"
+    );
+    assert!(
+        prims.iter().any(|p| matches!(p, Prim::HLine { .. })),
+        "structure segment"
+    );
+    assert!(
+        prims.iter().any(|p| matches!(p, Prim::Text { .. })),
+        "structure label"
+    );
+    assert!(
+        prims
+            .iter()
+            .any(|p| matches!(p, Prim::Circle { fill, .. } if *fill == Color::rgb(0xff, 0, 0xff))),
+        "custom marker"
+    );
+    assert!(
+        prims.iter().any(|p| matches!(p, Prim::Triangle { .. })),
+        "auction mark"
+    );
+}
+
+#[test]
+fn study_binding_paints_inside_its_output_layer_without_host_markers() {
+    let mut chart = ohlc_chart(SeriesKind::Candlestick, 20);
+    let output = chart.add_sma(0, 2).unwrap();
+    let border = Color::rgb(0x11, 0x22, 0x33);
+    chart
+        .series
+        .iter_mut()
+        .find(|series| series.id == output)
+        .unwrap()
+        .line_color = Some("#112233".into());
+    let mut study = StudyAnnotations::default();
+    study.push_zone(StudyZone {
+        start_row: 3,
+        confirm_row: 4,
+        top: 110.0,
+        bottom: 105.0,
+        bullish: true,
+        end_row: None,
+        retired: false,
+    });
+    assert!(chart.inject_study_annotations_for_test(output, study));
+    let frame = chart.build_frame();
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::RectFrame { color, .. } if *color == border))
+    );
+    assert!(chart.series.iter().all(|series| series.markers.is_empty()));
+    chart
+        .series
+        .iter_mut()
+        .find(|series| series.id == output)
+        .unwrap()
+        .visible = false;
+    chart.invalidate_frame_series(output);
+    let hidden = chart.build_frame();
+    assert!(
+        !hidden.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::RectFrame { color, .. } if *color == border))
+    );
+}
+
+#[test]
+fn mitigated_zone_visibility_follows_the_binding_choice() {
+    let mut chart = ohlc_chart(SeriesKind::Candlestick, 20);
+    let border = Color::rgb(0x11, 0x22, 0x33);
+    for (show_mitigated, visible) in [(false, false), (true, true)] {
+        let output = chart.add_fair_value_gaps(
+            0,
+            0.0,
+            crate::StructureMitigation::Touch,
+            crate::StructureMitigationPrice::Wick,
+            20,
+            show_mitigated,
+        )[0];
+        assert!(chart.set_indicator_output_style(
+            output,
+            crate::IndicatorOutputStyle {
+                visible: true,
+                line_color: Some("#112233".into()),
+                ..Default::default()
+            },
+        ));
+        let mut annotations = StudyAnnotations::default();
+        annotations.push_zone(StudyZone {
+            start_row: 3,
+            confirm_row: 4,
+            top: 110.0,
+            bottom: 105.0,
+            bullish: true,
+            end_row: Some(10),
+            retired: false,
+        });
+        assert!(chart.inject_study_annotations_for_test(output, annotations));
+        let frame = chart.build_frame();
+        assert_eq!(
+            frame.panes[0]
+                .main
+                .iter()
+                .any(|prim| matches!(prim, Prim::RectFrame { color, .. } if *color == border)),
+            visible,
+        );
+        assert!(chart.remove_indicator_binding(output));
+    }
+}
+
+#[test]
+fn study_annotations_paint_in_shared_order_and_clip_to_the_pane() {
+    let mut chart = ohlc_chart(SeriesKind::Candlestick, 20);
+    chart.build_frame();
+    let anchor = chart.series[0].id;
+    chart.series_entry_mut(anchor).unwrap().line_style = 2;
+    let mut study = StudyAnnotations::default();
+    study.push_zone(StudyZone {
+        start_row: 2,
+        confirm_row: 3,
+        top: 112.0,
+        bottom: 100.0,
+        bullish: true,
+        end_row: None,
+        retired: false,
+    });
+    study.push_zone(StudyZone {
+        start_row: 4,
+        confirm_row: 5,
+        top: 110.0,
+        bottom: 99.0,
+        bullish: false,
+        end_row: Some(10),
+        retired: false,
+    });
+    study.push_marker(StudyMarker {
+        row: 8,
+        confirm_row: 8,
+        price: 108.0,
+        kind: StudyMarkerKind::Bos { up: true },
+        from_row: Some(2),
+    });
+    study.push_marker(StudyMarker {
+        row: 9,
+        confirm_row: 10,
+        price: 109.0,
+        kind: StudyMarkerKind::SwingHigh,
+        from_row: None,
+    });
+    let mut prims = Vec::new();
+    chart.build_study_annotations_frame(
+        anchor, anchor, &study, false, 0, 19, 800, 1.0, 1.0, &mut prims,
+    );
+    assert!(matches!(prims[0], Prim::Rect { .. }));
+    assert!(matches!(prims[1], Prim::RectFrame { .. }));
+    assert!(matches!(
+        prims[2],
+        Prim::HLine {
+            style: LineStyle::Dashed,
+            ..
+        }
+    ));
+    assert!(
+        prims
+            .iter()
+            .any(|p| matches!(p, Prim::Text { text, .. } if text == "BOS"))
+    );
+    assert!(prims.iter().any(|p| matches!(p, Prim::Triangle { .. })));
+    let pane = &chart.panes[0];
+    let top = pane.top.round() as i32;
+    let bottom = (pane.top + pane.height).round() as i32;
+    if let Prim::Rect { rect, .. } = prims[0] {
+        assert!(rect.x >= 0 && rect.x + rect.w <= 800);
+        assert!(rect.y >= top && rect.y + rect.h <= bottom);
+    }
+    prims.clear();
+    chart.build_study_annotations_frame(
+        anchor, anchor, &study, true, 6, 19, 800, 1.0, 1.0, &mut prims,
+    );
+    assert_eq!(
+        prims
+            .iter()
+            .filter(|p| matches!(p, Prim::Rect { .. }))
+            .count(),
+        2
+    );
+    assert!(
+        prims
+            .iter()
+            .all(|p| !matches!(p, Prim::Rect { rect, .. } if rect.x < 0))
+    );
+}
+#[test]
+fn structure_segment_uses_anchor_output_style_with_dashed_default() {
+    let mut chart = ohlc_chart(SeriesKind::Candlestick, 20);
+    let anchor = chart.add_market_structure(0, 1, 1, crate::StructureBreakOn::Wick)[0];
+    chart.build_frame();
+    let mut study = StudyAnnotations::default();
+    study.push_marker(StudyMarker {
+        row: 8,
+        confirm_row: 8,
+        price: 108.0,
+        kind: StudyMarkerKind::Bos { up: true },
+        from_row: Some(2),
+    });
+    let segment_style = |chart: &ChartEngine| {
+        let mut prims = Vec::new();
+        chart.build_study_annotations_frame(
+            anchor, 0, &study, false, 0, 19, 800, 1.0, 1.0, &mut prims,
+        );
+        prims.into_iter().find_map(|prim| match prim {
+            Prim::HLine { style, .. } => Some(style),
+            _ => None,
+        })
+    };
+    assert_eq!(segment_style(&chart), Some(LineStyle::Dashed));
+    for (line_style, expected) in [
+        (0, LineStyle::Solid),
+        (1, LineStyle::Dotted),
+        (2, LineStyle::Dashed),
+    ] {
+        assert!(chart.set_indicator_output_style(
+            anchor,
+            crate::IndicatorOutputStyle {
+                visible: true,
+                line_style,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(segment_style(&chart), Some(expected));
+    }
+}
+
+#[test]
+fn retired_zone_is_hidden_until_show_mitigated_and_ends_at_retirement() {
+    let mut chart = ohlc_chart(SeriesKind::Candlestick, 20);
+    chart.build_frame();
+    let anchor = chart.series[0].id;
+    let mut study = StudyAnnotations::default();
+    for (start_row, confirm_row) in [(2, 3), (5, 6)] {
+        study.push_zone_with_cap(
+            StudyZone {
+                start_row,
+                confirm_row,
+                top: 112.,
+                bottom: 100.,
+                bullish: true,
+                end_row: None,
+                retired: false,
+            },
+            1,
+        );
+    }
+    assert!(study.zones()[0].retired);
+    assert_eq!(study.zones()[0].end_row, Some(6));
+    let mut hidden = Vec::new();
+    chart.build_study_annotations_frame(
+        anchor,
+        anchor,
+        &study,
+        false,
+        0,
+        19,
+        800,
+        1.,
+        1.,
+        &mut hidden,
+    );
+    let mut shown = Vec::new();
+    chart.build_study_annotations_frame(
+        anchor, anchor, &study, true, 0, 19, 800, 1., 1., &mut shown,
+    );
+    assert_eq!(
+        hidden
+            .iter()
+            .filter(|p| matches!(p, Prim::RectFrame { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|p| matches!(p, Prim::RectFrame { .. }))
+            .count(),
+        2
+    );
+    let (Prim::RectFrame { rect: retired, .. }, Prim::RectFrame { rect: active, .. }) =
+        (&shown[1], &shown[3])
+    else {
+        panic!("fill then border for both zones")
+    };
+    assert!(retired.x + retired.w < active.x + active.w);
+}
+
+#[test]
+fn study_annotations_cull_offscreen_rows_and_drop_dense_labels() {
+    let mut chart = ohlc_chart(SeriesKind::Candlestick, 200);
+    chart.build_frame();
+    let anchor = chart.series[0].id;
+    let mut study = StudyAnnotations::default();
+    for row in [3, 30] {
+        study.push_marker(StudyMarker {
+            row,
+            confirm_row: row,
+            price: 120.0,
+            kind: StudyMarkerKind::Choch { up: false },
+            from_row: Some(row - 2),
+        });
+    }
+    study.push_marker(StudyMarker {
+        row: 31,
+        confirm_row: 31,
+        price: 120.0,
+        kind: StudyMarkerKind::SwingLow,
+        from_row: None,
+    });
+    chart.time_scale.set_bar_spacing(2.0);
+    let mut prims = Vec::new();
+    chart.build_study_annotations_frame(
+        anchor, anchor, &study, false, 20, 40, 800, 1.0, 1.0, &mut prims,
+    );
+    assert_eq!(
+        prims
+            .iter()
+            .filter(|p| matches!(p, Prim::HLine { .. }))
+            .count(),
+        1
+    );
+    assert!(!prims.iter().any(|p| matches!(p, Prim::Text { .. })));
+    chart.series[0].visible = false;
+    prims.clear();
+    chart.build_study_annotations_frame(
+        anchor, anchor, &study, false, 20, 40, 800, 1.0, 1.0, &mut prims,
+    );
+    assert!(prims.is_empty());
+}
 
 #[test]
 fn axis_text_uses_the_run_font_for_the_shared_cap_center_metric() {
@@ -122,15 +711,21 @@ fn explicit_general_axes_reserve_layout_and_emit_shared_axis_frame() {
     );
     let mut primitives = Vec::new();
     chart.build_axis_primitives_into(&frame, &mut primitives);
-    assert!(primitives
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "Jan")));
-    assert!(primitives
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::RotatedText { text, .. } if text == "Revenue")));
-    assert!(primitives
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Rect { .. })));
+    assert!(
+        primitives
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "Jan"))
+    );
+    assert!(
+        primitives.iter().any(
+            |primitive| matches!(primitive, Prim::RotatedText { text, .. } if text == "Revenue")
+        )
+    );
+    assert!(
+        primitives
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::Rect { .. }))
+    );
 }
 
 #[test]
@@ -156,10 +751,12 @@ fn temporal_general_axis_emits_utc_ticks_and_supports_atomic_runtime_view() {
 
     chart.recompute_layout_with_measure(true, |text, _| text.len() as f64 * 7.0, |_, _| 0.0);
     let frame = chart.build_axis_frame(80.0, |text, _| text.len() as f64 * 7.0, |_, _| 0.0);
-    assert!(frame
-        .labels
-        .iter()
-        .any(|label| label.text == "1 Ene" || label.text == "2 Ene"));
+    assert!(
+        frame
+            .labels
+            .iter()
+            .any(|label| label.text == "1 Ene" || label.text == "2 Ene")
+    );
     assert!(frame.labels.iter().any(|label| label.text.contains(':')));
 
     chart
@@ -179,12 +776,16 @@ fn temporal_general_axis_emits_utc_ticks_and_supports_atomic_runtime_view() {
         Some(panned.clone())
     );
 
-    assert!(chart
-        .zoom_general_axis("time", 2.0, JAN_2_2026 as f64 + 0.5)
-        .is_err());
-    assert!(chart
-        .zoom_general_axis("time", 1.0e20, JAN_2_2026 as f64)
-        .is_err());
+    assert!(
+        chart
+            .zoom_general_axis("time", 2.0, JAN_2_2026 as f64 + 0.5)
+            .is_err()
+    );
+    assert!(
+        chart
+            .zoom_general_axis("time", 1.0e20, JAN_2_2026 as f64)
+            .is_err()
+    );
     assert_eq!(chart.general_axis_effective_domain("time"), Some(panned));
 
     assert!(chart.reset_general_axis_view("time"));
@@ -245,24 +846,29 @@ fn complete_finite_numeric_domain_builds_geometry_ticks_and_runtime_views() {
         geometry.push(point)
     });
     assert_eq!(geometry.len(), 3);
-    assert!(geometry
-        .iter()
-        .all(|point| point.x.is_finite() && point.y.is_finite()));
+    assert!(
+        geometry
+            .iter()
+            .all(|point| point.x.is_finite() && point.y.is_finite())
+    );
     assert!((geometry[0].x - 0.0).abs() < 1e-9);
     assert!((geometry[1].x - plot.width * 0.5).abs() < 1e-9);
     assert!((geometry[2].x - plot.width).abs() < 1e-9);
 
     let axis = chart.build_axis_frame(80.0, |text, _| text.len() as f64 * 7.0, |_, _| 0.0);
-    assert!(axis
-        .labels
-        .iter()
-        .all(|label| label.x.is_finite() && label.y.is_finite()));
+    assert!(
+        axis.labels
+            .iter()
+            .all(|label| label.x.is_finite() && label.y.is_finite())
+    );
     assert!(axis.labels.iter().any(|label| label.text.contains('e')));
     let frame = chart.build_frame();
-    assert!(frame.panes[pane]
-        .under
-        .iter()
-        .any(|primitive| { matches!(primitive, Prim::VLine { .. }) }));
+    assert!(
+        frame.panes[pane]
+            .under
+            .iter()
+            .any(|primitive| { matches!(primitive, Prim::VLine { .. }) })
+    );
 
     chart.zoom_general_axis("extreme-x", 2.0, 0.0).unwrap();
     let Some(GeneralAxisDomain::Numeric(zoomed)) = chart.general_axis_effective_domain("extreme-x")
@@ -488,14 +1094,18 @@ fn general_grid_and_zero_lines_render_below_data_and_follow_axis_policy() {
         .apply_options(r#"{"grid":{"vertLines":{"visible":false}}}"#)
         .unwrap();
     let chart_vertical_disabled = chart.build_frame();
-    assert!(chart_vertical_disabled.panes[pane]
-        .under
-        .iter()
-        .all(|primitive| !matches!(primitive, Prim::VLine { color, .. } if *color == vertical)));
-    assert!(chart_vertical_disabled.panes[pane]
-        .under
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::VLine { color, .. } if *color == zero)));
+    assert!(
+        chart_vertical_disabled.panes[pane]
+            .under
+            .iter()
+            .all(|primitive| !matches!(primitive, Prim::VLine { color, .. } if *color == vertical))
+    );
+    assert!(
+        chart_vertical_disabled.panes[pane]
+            .under
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::VLine { color, .. } if *color == zero))
+    );
     chart
         .apply_options(r#"{"grid":{"vertLines":{"visible":true}}}"#)
         .unwrap();
@@ -623,10 +1233,12 @@ fn general_legend_snapshot_preserves_series_order_visibility_filtering_and_remov
             .collect::<Vec<_>>(),
         vec![first, hidden]
     );
-    assert!(chart
-        .general_legend_snapshot(Some(usize::MAX))
-        .items
-        .is_empty());
+    assert!(
+        chart
+            .general_legend_snapshot(Some(usize::MAX))
+            .items
+            .is_empty()
+    );
 
     assert_eq!(chart.general_series_order(None), vec![first, hidden, third]);
     assert!(chart.set_general_series_order(Some(pane_a), vec![hidden, first]));
@@ -665,9 +1277,11 @@ fn general_legend_snapshot_preserves_series_order_visibility_filtering_and_remov
         ))
         .unwrap();
     let rejected = GeneralSeriesOptions::xy_line(pane_b, datasets[0], "b-x", "b-log");
-    assert!(chart
-        .update_general_series_options(first, rejected)
-        .is_err());
+    assert!(
+        chart
+            .update_general_series_options(first, rejected)
+            .is_err()
+    );
     assert_eq!(chart.general_series(first).unwrap().y_axis_id(), "b-y");
 
     chart.recompute_layout_with_measure(true, |text, _| text.len() as f64 * 7.0, |_, _| 0.0);
@@ -1002,15 +1616,18 @@ fn general_references_render_all_kinds_and_extend_domains_only_when_requested() 
     chart.recompute_layout_with_measure(true, |text, _| text.len() as f64 * 7.0, |_, _| 0.0);
     let frame = chart.build_frame();
     let main = &frame.panes[pane].main;
-    assert!(main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Rect { .. })));
-    assert!(main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Circle { .. })));
-    assert!(main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::VLine { .. })));
+    assert!(
+        main.iter()
+            .any(|primitive| matches!(primitive, Prim::Rect { .. }))
+    );
+    assert!(
+        main.iter()
+            .any(|primitive| matches!(primitive, Prim::Circle { .. }))
+    );
+    assert!(
+        main.iter()
+            .any(|primitive| matches!(primitive, Prim::VLine { .. }))
+    );
 
     assert!(chart.remove_general_reference(ignored));
     assert_eq!(
@@ -1176,21 +1793,26 @@ fn category_column_series_owns_auto_domains_geometry_and_lifecycle() {
         })
         .collect();
     assert_eq!(rects.len(), 2, "missing rows must emit no column geometry");
-    assert!(frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "-5")));
-    assert!(!frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "99")));
+    assert!(
+        frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "-5"))
+    );
+    assert!(
+        !frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "99"))
+    );
 
     assert!(rects.iter().any(|rect| rect.y == baseline));
     assert!(rects.iter().any(|rect| rect.y + rect.h == baseline));
-    assert!(chart
-        .frame_series_segments(pane)
-        .iter()
-        .any(|segment| segment.series_id.is_none() && segment.end - segment.start >= rects.len()));
+    assert!(
+        chart.frame_series_segments(pane).iter().any(
+            |segment| segment.series_id.is_none() && segment.end - segment.start >= rects.len()
+        )
+    );
 
     let mut geometry = Vec::new();
     chart.visit_general_columns(chart.general_series(series).unwrap(), |item| {
@@ -1221,10 +1843,12 @@ fn category_column_series_owns_auto_domains_geometry_and_lifecycle() {
     assert!(chart.set_general_accessibility_focus(series, 0));
     assert_eq!(chart.general_accessibility_focused_hit(), Some(hit.clone()));
     let focused_frame = chart.build_frame();
-    assert!(focused_frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::RectFrame { border: 1, .. })));
+    assert!(
+        focused_frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::RectFrame { border: 1, .. }))
+    );
     assert!(chart.select_general_hovered());
     assert_eq!(chart.general_selected_hit(), Some(hit.clone()));
     let selected_frame = chart.build_frame();
@@ -1683,9 +2307,11 @@ fn percent_stacked_columns_normalize_each_category_and_validate_stack_contract()
 
     let mut rejected = GeneralSeriesOptions::column(pane, dataset_b, "percent-x", "percent-y");
     rejected.stack_id = Some("share".into());
-    assert!(chart
-        .update_general_series_options(second, rejected)
-        .is_err());
+    assert!(
+        chart
+            .update_general_series_options(second, rejected)
+            .is_err()
+    );
     let unchanged = chart.general_series(second).unwrap();
     assert_eq!(unchanged.title(), "Updated share");
     assert_eq!(unchanged.stack_mode(), GeneralStackMode::Percent);
@@ -2081,14 +2707,18 @@ fn xy_line_preserves_gaps_hits_rows_and_shared_frame_geometry() {
         8,
         "each valid path row must emit one two-triangle diamond above the stroke"
     );
-    assert!(frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "1")));
-    assert!(!frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "99")));
+    assert!(
+        frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "1"))
+    );
+    assert!(
+        !frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "99"))
+    );
 
     let first = geometry[0];
     let second = geometry[1];
@@ -2169,14 +2799,16 @@ fn xy_line_preserves_gaps_hits_rows_and_shared_frame_geometry() {
         (connected_geometry[1].x + connected_geometry[2].x) * 0.5,
         (connected_geometry[1].y + connected_geometry[2].y) * 0.5,
     );
-    assert!(chart
-        .general_hit_test(
-            pane,
-            connected_midpoint.0,
-            connected_midpoint.1,
-            crate::GeneralHitMode::Exact,
-        )
-        .is_some());
+    assert!(
+        chart
+            .general_hit_test(
+                pane,
+                connected_midpoint.0,
+                connected_midpoint.1,
+                crate::GeneralHitMode::Exact,
+            )
+            .is_some()
+    );
 
     let mut invalid = GeneralSeriesOptions::scatter(pane, dataset, "line-x", "line-y");
     invalid.connect_missing = true;
@@ -2232,18 +2864,20 @@ fn general_path_interpolation_drives_frame_geometry_and_exact_hits() {
             .series,
         series
     );
-    assert!(chart.build_frame().panes[pane]
-        .main
-        .iter()
-        .any(|primitive| {
-            matches!(
-                primitive,
-                Prim::Polyline {
-                    line_type: LineType::WithSteps,
-                    ..
-                }
-            )
-        }));
+    assert!(
+        chart.build_frame().panes[pane]
+            .main
+            .iter()
+            .any(|primitive| {
+                matches!(
+                    primitive,
+                    Prim::Polyline {
+                        line_type: LineType::WithSteps,
+                        ..
+                    }
+                )
+            })
+    );
 
     let mut curved = GeneralSeriesOptions::xy_line(pane, dataset, "curve-x", "curve-y");
     curved.interpolation = GeneralInterpolation::Curved;
@@ -2299,18 +2933,20 @@ fn general_path_interpolation_drives_frame_geometry_and_exact_hits() {
         curve_hit.series, series,
         "curved hit testing must follow the rendered spline"
     );
-    assert!(chart.build_frame().panes[pane]
-        .main
-        .iter()
-        .any(|primitive| {
-            matches!(
-                primitive,
-                Prim::Polyline {
-                    line_type: LineType::Curved,
-                    ..
-                }
-            )
-        }));
+    assert!(
+        chart.build_frame().panes[pane]
+            .main
+            .iter()
+            .any(|primitive| {
+                matches!(
+                    primitive,
+                    Prim::Polyline {
+                        line_type: LineType::Curved,
+                        ..
+                    }
+                )
+            })
+    );
 
     let mut invalid = GeneralSeriesOptions::scatter(pane, dataset, "curve-x", "curve-y");
     invalid.interpolation = GeneralInterpolation::Step;
@@ -2851,14 +3487,18 @@ fn xy_scatter_owns_independent_domains_hits_and_runtime_view() {
             .count(),
         3
     );
-    assert!(frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "0")));
-    assert!(!frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "99")));
+    assert!(
+        frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "0"))
+    );
+    assert!(
+        !frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "99"))
+    );
 
     chart
         .replace_general_xy_dataset_labeled(
@@ -2878,14 +3518,18 @@ fn xy_scatter_owns_independent_domains_hits_and_runtime_view() {
         )
         .unwrap();
     let custom_frame = chart.build_frame();
-    assert!(custom_frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "Midpoint")));
-    assert!(!custom_frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "Hidden")));
+    assert!(
+        custom_frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "Midpoint"))
+    );
+    assert!(
+        !custom_frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::Text { text, .. } if text == "Hidden"))
+    );
 
     let mut geometry = Vec::new();
     chart.visit_general_scatter_points(chart.general_series(series).unwrap(), |point| {
@@ -3398,25 +4042,29 @@ fn range_area_preserves_gaps_fills_band_hits_rows_and_exposes_bounds() {
             .collect::<Vec<_>>(),
         vec![true, false, false]
     );
-    assert!(chart.build_frame().panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::BandFill { point_count: 3, .. })));
+    assert!(
+        chart.build_frame().panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::BandFill { point_count: 3, .. }))
+    );
 
     let before = chart.general_tooltip_snapshot(series, 0).unwrap();
-    assert!(chart
-        .replace_general_xy_dataset(
-            dataset,
-            GeneralXyInput::RangeNumeric {
-                ids: Some(vec![GeneralRowId::Text("invalid".into())]),
-                x: vec![0.0],
-                low: vec![5.0],
-                low_valid: None,
-                high: vec![4.0],
-                high_valid: None,
-            },
-        )
-        .is_err());
+    assert!(
+        chart
+            .replace_general_xy_dataset(
+                dataset,
+                GeneralXyInput::RangeNumeric {
+                    ids: Some(vec![GeneralRowId::Text("invalid".into())]),
+                    x: vec![0.0],
+                    low: vec![5.0],
+                    low_valid: None,
+                    high: vec![4.0],
+                    high_valid: None,
+                },
+            )
+            .is_err()
+    );
     assert_eq!(chart.general_tooltip_snapshot(series, 0), Some(before));
 }
 
@@ -3478,10 +4126,12 @@ fn range_bar_uses_category_band_rectangles_and_exact_hits() {
         2
     );
     let frame = chart.build_frame();
-    assert!(frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Rect { .. })));
+    assert!(
+        frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::Rect { .. }))
+    );
     let mut bars = Vec::new();
     chart.visit_general_range_bars(chart.general_series(series).unwrap(), |bar| bars.push(bar));
     assert_eq!(bars.len(), 2);
@@ -3806,14 +4456,18 @@ fn error_bar_owns_xy_bounds_autoscale_geometry_hits_snapshots_and_atomic_updates
     chart.visit_general_error_bars(chart.general_series(series).unwrap(), |item| {
         geometry.push(item)
     });
-    assert!(frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::HLine { color, .. } if *color == expected)));
-    assert!(frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::VLine { color, .. } if *color == expected)));
+    assert!(
+        frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::HLine { color, .. } if *color == expected))
+    );
+    assert!(
+        frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::VLine { color, .. } if *color == expected))
+    );
     assert_eq!(
         frame.panes[pane]
             .main
@@ -3845,25 +4499,27 @@ fn error_bar_owns_xy_bounds_autoscale_geometry_hits_snapshots_and_atomic_updates
     assert_eq!(accessibility.items[1].high, None);
 
     let before = chart.general_tooltip_snapshot(series, 0).unwrap();
-    assert!(chart
-        .replace_general_xy_dataset(
-            dataset,
-            GeneralXyInput::ErrorNumeric {
-                ids: Some(vec![GeneralRowId::Text("bad".into())]),
-                x: vec![10.0],
-                y: vec![20.0],
-                y_valid: None,
-                x_low: vec![11.0],
-                x_low_valid: None,
-                x_high: vec![13.0],
-                x_high_valid: None,
-                y_low: vec![15.0],
-                y_low_valid: None,
-                y_high: vec![26.0],
-                y_high_valid: None,
-            },
-        )
-        .is_err());
+    assert!(
+        chart
+            .replace_general_xy_dataset(
+                dataset,
+                GeneralXyInput::ErrorNumeric {
+                    ids: Some(vec![GeneralRowId::Text("bad".into())]),
+                    x: vec![10.0],
+                    y: vec![20.0],
+                    y_valid: None,
+                    x_low: vec![11.0],
+                    x_low_valid: None,
+                    x_high: vec![13.0],
+                    x_high_valid: None,
+                    y_low: vec![15.0],
+                    y_low_valid: None,
+                    y_high: vec![26.0],
+                    y_high_valid: None,
+                },
+            )
+            .is_err()
+    );
     assert_eq!(chart.general_tooltip_snapshot(series, 0), Some(before));
 
     chart
@@ -3961,9 +4617,11 @@ fn category_error_bars_share_band_and_point_axes_without_numeric_x_bounds() {
             geometry.push(bar)
         });
         assert_eq!(geometry.len(), 2);
-        assert!(geometry
-            .iter()
-            .all(|bar| bar.x_low.is_none() && bar.x_high.is_none()));
+        assert!(
+            geometry
+                .iter()
+                .all(|bar| bar.x_low.is_none() && bar.x_high.is_none())
+        );
         assert!(geometry[0].x < geometry[1].x);
         assert_eq!(geometry[1].y_high, None);
         assert_eq!(
@@ -3989,22 +4647,24 @@ fn category_error_bars_share_band_and_point_axes_without_numeric_x_bounds() {
             (tooltip.x_low, tooltip.x_high, tooltip.low, tooltip.high),
             (None, None, Some(15.0), Some(26.0))
         );
-        assert!(chart
-            .replace_general_xy_dataset(
-                dataset,
-                GeneralXyInput::ErrorCategory {
-                    ids: None,
-                    categories: vec!["Q1".into()],
-                    category_indices: vec![0],
-                    y: vec![20.0],
-                    y_valid: None,
-                    y_low: vec![21.0],
-                    y_low_valid: None,
-                    y_high: vec![26.0],
-                    y_high_valid: None,
-                }
-            )
-            .is_err());
+        assert!(
+            chart
+                .replace_general_xy_dataset(
+                    dataset,
+                    GeneralXyInput::ErrorCategory {
+                        ids: None,
+                        categories: vec!["Q1".into()],
+                        category_indices: vec![0],
+                        y: vec![20.0],
+                        y_valid: None,
+                        y_low: vec![21.0],
+                        y_low_valid: None,
+                        y_high: vec![26.0],
+                        y_high_valid: None,
+                    }
+                )
+                .is_err()
+        );
         assert_eq!(chart.general_tooltip_snapshot(series, 0), Some(tooltip));
     }
 }
@@ -4087,18 +4747,24 @@ fn category_box_plots_validate_autoscale_geometry_hits_and_atomic_updates() {
     assert!(geometry[0].q1_y < geometry[0].min_y);
 
     let frame = chart.build_frame();
-    assert!(frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::Rect { .. })));
-    assert!(frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::HLine { .. })));
-    assert!(frame.panes[pane]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::VLine { .. })));
+    assert!(
+        frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::Rect { .. }))
+    );
+    assert!(
+        frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::HLine { .. }))
+    );
+    assert!(
+        frame.panes[pane]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::VLine { .. }))
+    );
 
     let first = geometry[0];
     let hit = chart
@@ -4139,26 +4805,28 @@ fn category_box_plots_validate_autoscale_geometry_hits_and_atomic_updates() {
     assert_eq!(missing.q3, Some(500.0));
 
     let before = chart.general_tooltip_snapshot(series, 0).unwrap();
-    assert!(chart
-        .replace_general_xy_dataset(
-            dataset,
-            GeneralXyInput::BoxCategory {
-                ids: Some(vec![GeneralRowId::Text("bad".into())]),
-                categories: vec!["Bad".into()],
-                category_indices: vec![0],
-                min: vec![5.0],
-                min_valid: None,
-                q1: vec![20.0],
-                q1_valid: None,
-                median: vec![15.0],
-                median_valid: None,
-                q3: vec![25.0],
-                q3_valid: None,
-                max: vec![30.0],
-                max_valid: None,
-            },
-        )
-        .is_err());
+    assert!(
+        chart
+            .replace_general_xy_dataset(
+                dataset,
+                GeneralXyInput::BoxCategory {
+                    ids: Some(vec![GeneralRowId::Text("bad".into())]),
+                    categories: vec!["Bad".into()],
+                    category_indices: vec![0],
+                    min: vec![5.0],
+                    min_valid: None,
+                    q1: vec![20.0],
+                    q1_valid: None,
+                    median: vec![15.0],
+                    median_valid: None,
+                    q3: vec![25.0],
+                    q3_valid: None,
+                    max: vec![30.0],
+                    max_valid: None,
+                },
+            )
+            .is_err()
+    );
     assert_eq!(chart.general_tooltip_snapshot(series, 0), Some(before));
 
     chart
@@ -4323,20 +4991,22 @@ fn category_heatmap_grid_owns_two_category_axes_geometry_hits_and_retention() {
     assert_eq!(missing.value, None);
 
     let before = chart.general_tooltip_snapshot(series, 0).unwrap();
-    assert!(chart
-        .replace_general_xy_dataset(
-            dataset,
-            GeneralXyInput::HeatmapCategoryCategory {
-                ids: None,
-                x_categories: vec!["Jan".into()],
-                x_category_indices: vec![0],
-                y_categories: vec!["North".into()],
-                y_category_indices: vec![1],
-                value: vec![1.0],
-                value_valid: None,
-            },
-        )
-        .is_err());
+    assert!(
+        chart
+            .replace_general_xy_dataset(
+                dataset,
+                GeneralXyInput::HeatmapCategoryCategory {
+                    ids: None,
+                    x_categories: vec!["Jan".into()],
+                    x_category_indices: vec![0],
+                    y_categories: vec!["North".into()],
+                    y_category_indices: vec![1],
+                    value: vec![1.0],
+                    value_valid: None,
+                },
+            )
+            .is_err()
+    );
     assert_eq!(chart.general_tooltip_snapshot(series, 0), Some(before));
 
     chart
@@ -4602,49 +5272,53 @@ fn temporal_error_bars_preserve_epoch_bounds_autoscale_geometry_and_atomic_updat
     assert_eq!(tooltip.x_high, Some(1_700_000_030_000.0));
     assert_eq!((tooltip.low, tooltip.high), (Some(15.0), Some(26.0)));
 
-    assert!(chart
-        .replace_general_xy_dataset(
-            dataset,
-            GeneralXyInput::ErrorTemporal {
-                ids: None,
-                x_epoch_ms: vec![1_700_000_000_000],
-                y: vec![20.0],
-                y_valid: None,
-                x_low_epoch_ms: vec![1_700_000_000_001.0],
-                x_low_valid: None,
-                x_high_epoch_ms: vec![1_700_000_030_000.0],
-                x_high_valid: None,
-                y_low: vec![15.0],
-                y_low_valid: None,
-                y_high: vec![26.0],
-                y_high_valid: None,
-            },
-        )
-        .is_err());
+    assert!(
+        chart
+            .replace_general_xy_dataset(
+                dataset,
+                GeneralXyInput::ErrorTemporal {
+                    ids: None,
+                    x_epoch_ms: vec![1_700_000_000_000],
+                    y: vec![20.0],
+                    y_valid: None,
+                    x_low_epoch_ms: vec![1_700_000_000_001.0],
+                    x_low_valid: None,
+                    x_high_epoch_ms: vec![1_700_000_030_000.0],
+                    x_high_valid: None,
+                    y_low: vec![15.0],
+                    y_low_valid: None,
+                    y_high: vec![26.0],
+                    y_high_valid: None,
+                },
+            )
+            .is_err()
+    );
     assert_eq!(
         chart.general_tooltip_snapshot(series, 0),
         Some(tooltip.clone())
     );
 
-    assert!(chart
-        .replace_general_xy_dataset(
-            dataset,
-            GeneralXyInput::ErrorTemporal {
-                ids: None,
-                x_epoch_ms: vec![1_700_000_000_000],
-                y: vec![20.0],
-                y_valid: None,
-                x_low_epoch_ms: vec![1_699_999_999_999.5],
-                x_low_valid: None,
-                x_high_epoch_ms: vec![1_700_000_030_000.0],
-                x_high_valid: None,
-                y_low: vec![15.0],
-                y_low_valid: None,
-                y_high: vec![26.0],
-                y_high_valid: None,
-            },
-        )
-        .is_err());
+    assert!(
+        chart
+            .replace_general_xy_dataset(
+                dataset,
+                GeneralXyInput::ErrorTemporal {
+                    ids: None,
+                    x_epoch_ms: vec![1_700_000_000_000],
+                    y: vec![20.0],
+                    y_valid: None,
+                    x_low_epoch_ms: vec![1_699_999_999_999.5],
+                    x_low_valid: None,
+                    x_high_epoch_ms: vec![1_700_000_030_000.0],
+                    x_high_valid: None,
+                    y_low: vec![15.0],
+                    y_low_valid: None,
+                    y_high: vec![26.0],
+                    y_high_valid: None,
+                },
+            )
+            .is_err()
+    );
     assert_eq!(chart.general_tooltip_snapshot(series, 0), Some(tooltip));
 
     chart
@@ -4823,14 +5497,16 @@ fn dense_scatter_hit_testing_uses_bounded_screen_space_candidates() {
         candidates < POINTS / 20,
         "dense hit query inspected {candidates} of {POINTS} points"
     );
-    assert!(chart
-        .general_hit_test(
-            pane,
-            x_css,
-            y_css,
-            crate::GeneralHitMode::Nearest { max_distance: 8.0 },
-        )
-        .is_some());
+    assert!(
+        chart
+            .general_hit_test(
+                pane,
+                x_css,
+                y_css,
+                crate::GeneralHitMode::Nearest { max_distance: 8.0 },
+            )
+            .is_some()
+    );
     assert!(chart.memory_usage().general_series_capacity_bytes > 0);
     let label_count = chart.build_frame().panes[pane]
         .main
@@ -4971,18 +5647,24 @@ fn marker_price_position_time_snapping_and_layers_are_engine_owned() {
 
     assert!(chart.set_series_markers_z_order(0, crate::marker_z_order::TOP));
     let top = chart.build_frame();
-    assert!(!top.panes[0]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Circle { fill, .. } if *fill == color)));
-    assert!(top.panes[0]
-        .top_prims
-        .iter()
-        .any(|prim| matches!(prim, Prim::Circle { fill, .. } if *fill == color)));
-    assert!(top.panes[0]
-        .top_prims
-        .iter()
-        .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "exact")));
+    assert!(
+        !top.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Circle { fill, .. } if *fill == color))
+    );
+    assert!(
+        top.panes[0]
+            .top_prims
+            .iter()
+            .any(|prim| matches!(prim, Prim::Circle { fill, .. } if *fill == color))
+    );
+    assert!(
+        top.panes[0]
+            .top_prims
+            .iter()
+            .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "exact"))
+    );
 }
 
 #[test]
@@ -5343,10 +6025,12 @@ fn million_bar_full_view_bounds_density_work_for_frame_and_hit_test() {
     for appended in 0..32 {
         let row = count + appended;
         assert!(chart.update_series_bar(0, row as f64, [101.0, 101.5, 100.5, 101.25],));
-        assert!(chart
-            .data
-            .last_lod_update_nodes(0)
-            .is_some_and(|nodes| nodes <= 5));
+        assert!(
+            chart
+                .data
+                .last_lod_update_nodes(0)
+                .is_some_and(|nodes| nodes <= 5)
+        );
         chart.set_visible_logical_range(0.0, row as f64);
         chart.build_frame();
         let append_work = chart.lod_work_stats();
@@ -5635,9 +6319,11 @@ fn crosshair_shade_right_is_off_by_default() {
     let mut chart = crosshair_chart();
     chart.set_crosshair_at(chart.time_scale.index_to_coordinate(1), 250.0);
     let frame = chart.build_frame();
-    assert!(overlay_prims(&chart, &frame, 0)
-        .iter()
-        .any(|prim| matches!(prim, Prim::VLine { .. })));
+    assert!(
+        overlay_prims(&chart, &frame, 0)
+            .iter()
+            .any(|prim| matches!(prim, Prim::VLine { .. }))
+    );
     assert!(
         !overlay_prims(&chart, &frame, 0)
             .iter()
@@ -5764,9 +6450,11 @@ fn crosshair_shade_right_skips_a_zero_width_remainder() {
         "fixture: the bar edge lands on the pane edge"
     );
     assert!(shade_rects(&chart, &frame, 0).is_empty());
-    assert!(overlay_prims(&chart, &frame, 0)
-        .iter()
-        .any(|prim| matches!(prim, Prim::VLine { .. })));
+    assert!(
+        overlay_prims(&chart, &frame, 0)
+            .iter()
+            .any(|prim| matches!(prim, Prim::VLine { .. }))
+    );
 }
 
 #[test]
@@ -5795,9 +6483,11 @@ fn crosshair_shade_right_follows_the_cursor_into_the_whitespace_slots() {
     let frame = chart.build_frame();
     assert!(shade_rects(&chart, &frame, 0).is_empty());
     let line_x = (strict_right_x * hpr).round() as i32;
-    assert!(overlay_prims(&chart, &frame, 0)
-        .iter()
-        .any(|prim| matches!(prim, Prim::VLine { x, .. } if *x == line_x)));
+    assert!(
+        overlay_prims(&chart, &frame, 0)
+            .iter()
+            .any(|prim| matches!(prim, Prim::VLine { x, .. } if *x == line_x))
+    );
 }
 
 #[test]
@@ -5849,9 +6539,11 @@ fn crosshair_shade_right_obeys_the_crosshair_gates_but_not_the_vertical_line_tog
         1,
         "independent of the vertical line"
     );
-    assert!(!overlay_prims(&chart, &frame, 0)
-        .iter()
-        .any(|prim| matches!(prim, Prim::VLine { .. })));
+    assert!(
+        !overlay_prims(&chart, &frame, 0)
+            .iter()
+            .any(|prim| matches!(prim, Prim::VLine { .. }))
+    );
 
     // An unparsable tint falls back to the default tint instead of dropping the veil.
     chart
@@ -5896,10 +6588,12 @@ fn crosshair_clamps_into_pane_instead_of_vanishing() {
     chart.crosshair = Some((10_000.0, 10_000.0));
     assert_eq!(chart.clamped_crosshair(), Some((799.0, 499.0)));
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::VLine { .. })));
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::VLine { .. }))
+    );
     assert!(frame.panes[0].main.iter().any(|p| matches!(
         p,
         Prim::HLine {
@@ -5911,18 +6605,22 @@ fn crosshair_clamps_into_pane_instead_of_vanishing() {
     chart.crosshair = Some((-50.0, -50.0));
     assert_eq!(chart.clamped_crosshair(), Some((0.0, 0.0)));
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::VLine { .. })));
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::VLine { .. }))
+    );
 
     // Hidden mode still suppresses the crosshair entirely.
     chart.crosshair_mode = CrosshairMode::Hidden;
     let frame = chart.build_frame();
-    assert!(!frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::VLine { .. })));
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::VLine { .. }))
+    );
 }
 
 #[test]
@@ -5945,10 +6643,12 @@ fn crosshair_draws_without_a_primary_series() {
     chart.crosshair = Some((200.0, 120.0));
 
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::VLine { .. })));
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::VLine { .. }))
+    );
     assert!(frame.panes[0].main.iter().any(|p| matches!(
         p,
         Prim::HLine {
@@ -5964,10 +6664,11 @@ fn crosshair_draws_without_a_primary_series() {
         |t, _bold| t.len() as f64 * 7.0,
         |t, _bold| t.len() as f64 * 6.0,
     );
-    assert!(axis
-        .labels
-        .iter()
-        .any(|l| l.midpoint == AxisTextMidpoint::StableTime));
+    assert!(
+        axis.labels
+            .iter()
+            .any(|l| l.midpoint == AxisTextMidpoint::StableTime)
+    );
     assert!(axis.labels.iter().any(|l| l.background.is_some()));
 }
 
@@ -6194,8 +6895,12 @@ fn crosshair_labels_cover_every_visible_populated_price_scale() {
     assert!(
         chart.series_apply_price_format_json(0, r#"{"type":"price","precision":0,"min_move":1}"#)
     );
-    assert!(chart
-        .series_apply_price_format_json(left, r#"{"type":"price","precision":2,"min_move":0.01}"#));
+    assert!(
+        chart.series_apply_price_format_json(
+            left,
+            r#"{"type":"price","precision":2,"min_move":0.01}"#
+        )
+    );
     chart.set_price_scale_mode_for(0, PriceScaleTarget::Left, PriceScaleMode::Logarithmic);
     chart.set_price_scale_inverted_for(0, PriceScaleTarget::Left, true);
     chart.time_scale.set_width(800.0);
@@ -6448,14 +7153,18 @@ fn named_scale_crosshair_labels_use_exact_strips_ranges_and_formatters() {
         })
         .collect();
     assert_eq!(crosshair.len(), 3);
-    assert!(crosshair
-        .iter()
-        .all(|label| (label.y - crosshair[0].y).abs() < 1e-9));
+    assert!(
+        crosshair
+            .iter()
+            .all(|label| (label.y - crosshair[0].y).abs() < 1e-9)
+    );
     assert!(crosshair.iter().any(|label| !label.text.contains('.')));
     assert!(crosshair.iter().any(|label| label.text.ends_with('%')));
-    assert!(crosshair
-        .iter()
-        .any(|label| label.text.contains('.') && !label.text.ends_with('%')));
+    assert!(
+        crosshair
+            .iter()
+            .any(|label| label.text.contains('.') && !label.text.ends_with('%'))
+    );
 
     for target in [PriceScaleTarget::Right, outer, left] {
         let (side, strip_x, strip_width) = chart
@@ -6601,10 +7310,12 @@ fn do_not_snap_to_hidden_series_indices_moves_to_a_visible_bar() {
     chart.crosshair = Some((x2, 120.0));
     let frame = chart.build_frame();
     let expected_x = chart.time_scale.index_to_coordinate(1).round() as i32;
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::VLine { x, .. } if *x == expected_x)));
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::VLine { x, .. } if *x == expected_x))
+    );
 }
 
 /// Two identical line series on the right scale (same last close => colliding label
@@ -6909,9 +7620,11 @@ fn price_line_family_renders_per_series_with_reference_defaults() {
     // from its tracked data point to the pane edge, dotted, 1px, following the series/bar color.
     let lines = dashed_ylines(&mut chart);
     assert_eq!(lines.len(), 2);
-    assert!(lines
-        .iter()
-        .all(|&(_, width, color, x0, x1)| width == 1 && color == LINE && x0 > 0 && x1 > x0));
+    assert!(
+        lines
+            .iter()
+            .all(|&(_, width, color, x0, x1)| width == 1 && color == LINE && x0 > 0 && x1 > x0)
+    );
 
     // priceLineVisible: false hides only that series' line.
     chart.series[1].price_line_visible = false;
@@ -6997,9 +7710,11 @@ fn bid_ask_lines_and_chips_render_only_when_enabled_with_values() {
     let primary = aeris_charts_core::style::DEFAULT_PRIMARY_RGB;
     let blue = Color::rgb(primary.0, primary.1, primary.2);
     let red = Color::rgb(0xf7, 0x52, 0x5f);
-    assert!(!hlines(&mut chart)
-        .iter()
-        .any(|&(_, c)| c == blue || c == red));
+    assert!(
+        !hlines(&mut chart)
+            .iter()
+            .any(|&(_, c)| c == blue || c == red)
+    );
     // Enable: one line per side, on the quotes' coordinates (zero shift with an exact-range scale).
     chart.series_apply_options_json(0, r##"{"bid_ask_visible": true}"##);
     let lines = hlines(&mut chart);
@@ -7057,13 +7772,17 @@ fn bid_ask_lines_and_chips_render_only_when_enabled_with_values() {
     assert!(hlines(&mut chart).iter().any(|&(_, c)| c == light));
     // Custom colors reach the frame verbatim-parsed; disabling hides everything.
     assert!(chart.series_apply_options_json(0, r##"{"ask_color": "#112233"}"##));
-    assert!(hlines(&mut chart)
-        .iter()
-        .any(|&(_, c)| c == Color::rgb(0x11, 0x22, 0x33)));
+    assert!(
+        hlines(&mut chart)
+            .iter()
+            .any(|&(_, c)| c == Color::rgb(0x11, 0x22, 0x33))
+    );
     chart.series_apply_options_json(0, r##"{"bid_ask_visible": false}"##);
-    assert!(!hlines(&mut chart)
-        .iter()
-        .any(|&(_, c)| c == Color::rgb(0x11, 0x22, 0x33)));
+    assert!(
+        !hlines(&mut chart)
+            .iter()
+            .any(|&(_, c)| c == Color::rgb(0x11, 0x22, 0x33))
+    );
     // Options surface round-trips the full configuration.
     let options: serde_json::Value =
         serde_json::from_str(&chart.series_options_json(0).unwrap()).unwrap();
@@ -7118,9 +7837,11 @@ fn explicit_price_line_color_unifies_the_live_line_and_complete_cluster() {
 
     let labels = boxed_labels(&mut chart);
     assert_eq!(labels.len(), 3);
-    assert!(labels
-        .iter()
-        .all(|label| matches!(label.background, Some((.., color)) if color == live)));
+    assert!(
+        labels
+            .iter()
+            .all(|label| matches!(label.background, Some((.., color)) if color == live))
+    );
     assert_eq!(
         labels
             .iter()
@@ -7178,9 +7899,11 @@ fn dashed_line_style_splits_the_polyline_into_solid_runs() {
     // A dashed stroke arrives as several solid sub-segments (gap geometry is frame-built, so
     // WebGPU and Canvas2D rasterize identical dashes).
     assert!(runs.len() > 1, "expected dash sub-segments, got {runs:?}");
-    assert!(runs
-        .iter()
-        .all(|&(.., style, line_type)| style == LineStyle::Solid && line_type == LineType::Simple));
+    assert!(
+        runs.iter()
+            .all(|&(.., style, line_type)| style == LineStyle::Solid
+                && line_type == LineType::Simple)
+    );
     // The runs leave real gaps: their on-length totals less than the full path length.
     let pool = &frame.panes[0].points;
     let on_length: f32 = runs
@@ -7352,18 +8075,21 @@ fn runtime_price_format_rebuilds_scale_ticks_layout_and_autoscale() {
             .collect();
         assert!(!tick_labels.is_empty());
         assert_eq!(tick_labels.iter().any(|label| label.contains('.')), decimal);
-        assert!(frame.panes[0]
-            .main
-            .iter()
-            .any(|primitive| { matches!(primitive, Prim::Rect { .. } | Prim::Polyline { .. }) }));
+        assert!(
+            frame.panes[0].main.iter().any(|primitive| {
+                matches!(primitive, Prim::Rect { .. } | Prim::Polyline { .. })
+            })
+        );
     }
 
     chart.set_price_scale_visible_range_for(0, PriceScaleTarget::Right, 115_900.0, 116_100.0);
     let manual = chart
         .price_scale_visible_range_for(0, PriceScaleTarget::Right)
         .unwrap();
-    assert!(chart
-        .series_apply_price_format_json(0, r#"{"type":"price","precision":2,"min_move":0.01}"#));
+    assert!(
+        chart
+            .series_apply_price_format_json(0, r#"{"type":"price","precision":2,"min_move":0.01}"#)
+    );
     chart.build_frame();
     assert_eq!(
         chart
@@ -7377,8 +8103,10 @@ fn runtime_price_format_rebuilds_scale_ticks_layout_and_autoscale() {
 fn scale_formatter_source_tracks_attached_z_order() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
     let second = chart.add_series(SeriesKind::Line);
-    assert!(chart
-        .series_apply_price_format_json(0, r#"{"type":"price","precision":2,"min_move":0.03}"#));
+    assert!(
+        chart
+            .series_apply_price_format_json(0, r#"{"type":"price","precision":2,"min_move":0.03}"#)
+    );
     assert!(chart.series_apply_price_format_json(
         second,
         r#"{"type":"price","precision":4,"min_move":0.0001}"#
@@ -7444,7 +8172,7 @@ fn hiding_sole_indicator_preserves_scale_format_and_layout() {
         .labels
         .iter()
         .filter(|label| label.background.is_none() && label.align == AxisTextAlign::Left)
-        .map(|label| label.text.clone())
+        .map(|label| (label.y.to_bits(), label.text.clone()))
         .collect();
     let initial_range = chart
         .price_scale_visible_range_for(0, indicator_scale)
@@ -7453,7 +8181,15 @@ fn hiding_sole_indicator_preserves_scale_format_and_layout() {
     assert_eq!(chart.scale_tick_base(0, indicator_scale), 1);
     assert_eq!(chart.scale_autoscale_min_move(0, indicator_scale), 1.0);
     assert!(!initial_ticks.is_empty());
-    assert!(initial_ticks.iter().all(|label| !label.contains('.')));
+    assert!(initial_ticks.iter().all(|(_, label)| !label.contains('.')));
+    // A tick under the indicator's own tag drops its text while the tag shows, so ticks match
+    // by coordinate, and by text wherever both frames show it.
+    let same_ticks = |a: &[(u64, String)], b: &[(u64, String)]| {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|((ya, ta), (yb, tb))| {
+                ya == yb && (ta == tb || ta.is_empty() || tb.is_empty())
+            })
+    };
 
     chart.set_series_visible(sma, false);
     assert!(chart.frame_requires_layout());
@@ -7464,11 +8200,11 @@ fn hiding_sole_indicator_preserves_scale_format_and_layout() {
         .labels
         .iter()
         .filter(|label| label.background.is_none() && label.align == AxisTextAlign::Left)
-        .map(|label| label.text.clone())
+        .map(|label| (label.y.to_bits(), label.text.clone()))
         .collect();
     assert_eq!(chart.scale_tick_base(0, indicator_scale), 1);
     assert_eq!(chart.scale_autoscale_min_move(0, indicator_scale), 1.0);
-    assert_eq!(hidden_ticks, initial_ticks);
+    assert!(same_ticks(&hidden_ticks, &initial_ticks));
     assert_eq!(
         chart.price_scale_visible_range_for(0, indicator_scale),
         Some(initial_range)
@@ -7487,7 +8223,7 @@ fn hiding_sole_indicator_preserves_scale_format_and_layout() {
         .labels
         .iter()
         .filter(|label| label.background.is_none() && label.align == AxisTextAlign::Left)
-        .map(|label| label.text.clone())
+        .map(|label| (label.y.to_bits(), label.text.clone()))
         .collect();
     assert_eq!(shown_ticks, initial_ticks);
     assert_eq!(
@@ -7685,12 +8421,16 @@ fn position_drawings_paint_information_and_entry_target_stop_axis_prices() {
             .any(|(text, color)| text.as_str() == "12.00" && *color == entry),
         "boxed labels: {boxed:?}"
     );
-    assert!(boxed
-        .iter()
-        .any(|(text, color)| text.as_str() == "13.00" && *color == reward));
-    assert!(boxed
-        .iter()
-        .any(|(text, color)| text.as_str() == "11.00" && *color == risk));
+    assert!(
+        boxed
+            .iter()
+            .any(|(text, color)| text.as_str() == "13.00" && *color == reward)
+    );
+    assert!(
+        boxed
+            .iter()
+            .any(|(text, color)| text.as_str() == "11.00" && *color == risk)
+    );
 }
 
 #[test]
@@ -7752,9 +8492,11 @@ fn position_square_controls_have_one_rounded_fill_and_inside_border() {
                         assert_eq!(*w, *h);
                         assert_eq!(x.fract(), 0.0);
                         assert_eq!(y.fract(), 0.0);
-                        assert!(radii
-                            .iter()
-                            .all(|radius| *radius > 0.0 && *radius == radii[0]));
+                        assert!(
+                            radii
+                                .iter()
+                                .all(|radius| *radius > 0.0 && *radius == radii[0])
+                        );
                         Some(())
                     }
                     _ => None,
@@ -8373,42 +9115,52 @@ fn stop_first_progress_darkens_only_the_traveled_loss_slice() {
         risk_progress.a() > risk_base.a(),
         "the traveled stop-loss slice must be intrinsically more opaque than the untouched zone"
     );
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == risk_progress)));
-    assert!(!frame.panes[0]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == reward_progress)));
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == risk_progress))
+    );
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == reward_progress))
+    );
 }
 
 #[test]
-fn bollinger_band_fill_paints_between_upper_and_lower() {
-    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
-    let times = [1.0, 2.0, 3.0, 4.0];
-    let values = [10.0, 11.0, 12.0, 11.0];
-    chart
-        .set_series_data(0, &times, &values, &values, &values, &values)
-        .unwrap();
-    chart.time_scale.set_width(800.0);
-    chart.fit_content();
-    chart.add_bollinger(0, 2, 2.0);
+fn moving_average_band_fill_paints_between_upper_and_lower() {
+    for envelopes in [false, true] {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        let times = [1.0, 2.0, 3.0, 4.0];
+        let values = [10.0, 11.0, 12.0, 11.0];
+        chart
+            .set_series_data(0, &times, &values, &values, &values, &values)
+            .unwrap();
+        chart.time_scale.set_width(800.0);
+        chart.fit_content();
+        if envelopes {
+            chart.add_envelopes(0, 2, 10.0, true);
+        } else {
+            chart.add_bollinger(0, 2, 2.0);
+        }
 
-    let frame = chart.build_frame();
-    let fill = frame.panes[0]
-        .main
-        .iter()
-        .find_map(|p| match p {
-            Prim::BandFill {
-                point_count, fill, ..
-            } => Some((*point_count, *fill)),
-            _ => None,
-        })
-        .expect("bollinger paints a band fill");
-    // Three valid rows (4 bars, warm-up 1) and the fill is the band color at 0.2 alpha.
-    assert_eq!(fill.0, 3);
-    assert_eq!(fill.1, Color::rgba(LINE.r(), LINE.g(), LINE.b(), 51));
+        let frame = chart.build_frame();
+        let fill = frame.panes[0]
+            .main
+            .iter()
+            .find_map(|p| match p {
+                Prim::BandFill {
+                    point_count, fill, ..
+                } => Some((*point_count, *fill)),
+                _ => None,
+            })
+            .expect("study paints a band fill");
+        // Three valid rows (4 bars, warm-up 1) and the fill is the band color at 0.2 alpha.
+        assert_eq!(fill.0, 3);
+        assert_eq!(fill.1, Color::rgba(LINE.r(), LINE.g(), LINE.b(), 51));
+    }
 }
 
 #[test]
@@ -8431,6 +9183,130 @@ fn rsi_channel_band_paints_a_translucent_strip_between_30_and_70() {
     assert!(strip, "the rsi pane paints its 30/70 channel strip");
 }
 
+/// Assert that `pane` paints exactly one threshold strip spanning `lower..upper` plus the two
+/// dotted boundary lines, at the coordinates the engine's own pane scale gives those levels.
+fn assert_threshold_region_lowered(
+    chart: &ChartEngine,
+    frame: &ChartFrame,
+    pane: usize,
+    lower: f64,
+    upper: f64,
+) {
+    let fill = Color::rgba(0x78, 0x7B, 0x86, 0x33);
+    let scale = &chart.panes[pane].price_scale;
+    let y = |price: f64| scale.price_to_coordinate(price, 0.0) as f32;
+    let (y_upper, y_lower) = (y(upper), y(lower));
+    let expected_rect = IRect {
+        x: 0,
+        y: y_upper.min(y_lower).round() as i32,
+        w: chart.pane_w.round() as i32,
+        h: (y_lower - y_upper).abs().round() as i32,
+    };
+    let strips = frame.panes[pane]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::Rect { rect, color } if *color == fill => Some(*rect),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        strips,
+        vec![expected_rect],
+        "{lower}/{upper} strip in pane {pane}"
+    );
+    let mut boundaries = frame.panes[pane]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::HLine {
+                y,
+                style: LineStyle::Dotted,
+                color,
+                ..
+            } if *color == Color::rgb(0x78, 0x7B, 0x86) => Some(*y),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    let mut expected = vec![y_upper.round() as i32, y_lower.round() as i32];
+    expected.sort_unstable();
+    assert_eq!(
+        boundaries, expected,
+        "{lower}/{upper} boundaries in pane {pane}"
+    );
+    // Neither the strip nor its boundaries leak into the price pane.
+    assert!(
+        !frame.panes[0].main.iter().any(|prim| match prim {
+            Prim::Rect { color, .. } => *color == fill,
+            Prim::HLine {
+                style: LineStyle::Dotted,
+                color,
+                ..
+            } => *color == Color::rgb(0x78, 0x7B, 0x86),
+            _ => false,
+        }),
+        "{lower}/{upper} region leaked into the price pane"
+    );
+}
+
+#[test]
+fn choppiness_chop_zone_lowers_like_the_rsi_channel() {
+    let times = (0..12).map(f64::from).collect::<Vec<_>>();
+    let close = [
+        10.0, 11.0, 10.5, 12.0, 11.0, 13.0, 12.5, 12.0, 14.0, 13.0, 12.0, 12.5,
+    ];
+    let high = close.map(|value| value + 1.0);
+    let low = close.map(|value| value - 0.75);
+    let settled = |add: &dyn Fn(&mut ChartEngine) -> SeriesId| {
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        chart
+            .set_series_data(0, &times, &close, &high, &low, &close)
+            .unwrap();
+        chart.time_scale.set_width(800.0);
+        chart.fit_content();
+        let output = add(&mut chart);
+        chart.build_frame();
+        (chart, output)
+    };
+
+    let (mut rsi_chart, rsi) = settled(&|chart| chart.add_rsi(0, 3).unwrap());
+    let frame = rsi_chart.build_frame();
+    assert_eq!(rsi_chart.series_entry(rsi).unwrap().pane_index, 1);
+    assert_threshold_region_lowered(&rsi_chart, &frame, 1, 30.0, 70.0);
+
+    // The Chop Zone is the same engine-owned threshold region on the single Choppiness output:
+    // a 38.2-61.8 strip plus dotted boundaries in its own oscillator pane, no extra series.
+    let (mut chart, chop) = settled(&|chart| chart.add_choppiness(0, 3).unwrap());
+    assert_eq!(
+        chart.series_entry(chop).unwrap().threshold_region,
+        Some(SeriesThresholdRegion {
+            lower: 38.2,
+            upper: 61.8,
+        })
+    );
+    assert_eq!(chart.series_entry(chop).unwrap().pane_index, 1);
+    assert_eq!(chart.series.len(), 2);
+    let frame = chart.build_frame();
+    assert_threshold_region_lowered(&chart, &frame, 1, 38.2, 61.8);
+
+    // Hiding the binding hides its zone with it; showing it restores the same geometry.
+    assert!(chart.set_indicator_binding_visible(chop, false));
+    let hidden = chart.build_frame();
+    assert!(
+        !hidden
+            .panes
+            .iter()
+            .any(|pane| pane.main.iter().any(|prim| matches!(
+                prim,
+                Prim::Rect { color, .. } if *color == Color::rgba(0x78, 0x7B, 0x86, 0x33)
+            )))
+    );
+    assert!(chart.set_indicator_binding_visible(chop, true));
+    let frame = chart.build_frame();
+    assert_threshold_region_lowered(&chart, &frame, 1, 38.2, 61.8);
+}
+
 #[test]
 fn line_visible_false_keeps_area_fill_but_drops_the_stroke() {
     let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
@@ -8446,27 +9322,35 @@ fn line_visible_false_keeps_area_fill_but_drops_the_stroke() {
 
     // reference lineVisible: the fill stays, the stroke goes.
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::AreaFill { .. })));
-    assert!(!frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::Polyline { .. })));
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::AreaFill { .. }))
+    );
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::Polyline { .. }))
+    );
 
     // A line series keeps nothing but its point markers.
     chart.series[0].kind = SeriesKind::Line;
     chart.series[0].point_markers = true;
     let frame = chart.build_frame();
-    assert!(!frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::Polyline { .. } | Prim::AreaFill { .. })));
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::Circle { .. })));
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::Polyline { .. } | Prim::AreaFill { .. }))
+    );
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::Circle { .. }))
+    );
 }
 
 #[test]
@@ -8542,24 +9426,32 @@ fn crosshair_marks_cover_all_line_series_with_per_series_options() {
         Color::rgb(0xff, 0xff, 0xff),
     );
     let marks = circles(&mut chart);
-    assert!(marks
-        .iter()
-        .any(|&(radius, color)| radius == 6.0 && color == background));
-    assert!(marks
-        .iter()
-        .any(|&(radius, color)| radius == 4.0 && color == LINE));
+    assert!(
+        marks
+            .iter()
+            .any(|&(radius, color)| radius == 6.0 && color == background)
+    );
+    assert!(
+        marks
+            .iter()
+            .any(|&(radius, color)| radius == 4.0 && color == LINE)
+    );
 
     chart.series[0].crosshair_marker_radius = 7.0;
     chart.series[0].crosshair_marker_border_width = 3.0;
     chart.series[0].crosshair_marker_border_color = Some("#010203".to_string());
     chart.series[0].crosshair_marker_background_color = Some("#040506".to_string());
     let marks = circles(&mut chart);
-    assert!(marks
-        .iter()
-        .any(|&(radius, color)| radius == 10.0 && color == Color::rgb(1, 2, 3)));
-    assert!(marks
-        .iter()
-        .any(|&(radius, color)| radius == 7.0 && color == Color::rgb(4, 5, 6)));
+    assert!(
+        marks
+            .iter()
+            .any(|&(radius, color)| radius == 10.0 && color == Color::rgb(1, 2, 3))
+    );
+    assert!(
+        marks
+            .iter()
+            .any(|&(radius, color)| radius == 7.0 && color == Color::rgb(4, 5, 6))
+    );
 }
 
 #[test]
@@ -8689,14 +9581,18 @@ fn baseline_quadrant_options_flow_into_fills_and_strokes() {
     // lineVisible: false drops both quadrant strokes but keeps the fills.
     chart.series[0].line_visible = false;
     let frame = chart.build_frame();
-    assert!(!frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::Polyline { .. })));
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::AreaFill { .. })));
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::Polyline { .. }))
+    );
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::AreaFill { .. }))
+    );
 }
 
 #[test]
@@ -8767,10 +9663,12 @@ fn baseline_reference_line_is_off_by_default() {
     let mut chart = baseline_chart(1.0, &[10.0, 20.0]);
     let frame = chart.build_frame();
     assert!(baseline_reference_lines(&frame, BASELINE_REFERENCE_LINE).is_empty());
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::AreaFill { .. })));
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::AreaFill { .. }))
+    );
 }
 
 #[test]
@@ -8903,9 +9801,11 @@ fn close_before_visible_range_uses_the_last_close_before_the_window() {
             _ => None,
         })
         .collect();
-    assert!(fills
-        .iter()
-        .any(|g| g.top == top_strong && g.bottom == top_faint));
+    assert!(
+        fills
+            .iter()
+            .any(|g| g.top == top_strong && g.bottom == top_faint)
+    );
     // A pinned baseline_value still wins over the mode.
     chart.series[0].baseline = Some(29.0);
     assert_eq!(chart.series_baseline_price(0), Some(29.0));
@@ -9073,10 +9973,12 @@ fn baseline_reference_line_disappears_with_the_fills_when_no_rows_are_visible() 
     let frame = chart.build_frame();
     assert_eq!(chart.visible_range(), None);
     assert!(baseline_reference_lines(&frame, BASELINE_REFERENCE_LINE).is_empty());
-    assert!(!frame.panes[0]
-        .main
-        .iter()
-        .any(|p| matches!(p, Prim::AreaFill { .. })));
+    assert!(
+        !frame.panes[0]
+            .main
+            .iter()
+            .any(|p| matches!(p, Prim::AreaFill { .. }))
+    );
     assert_eq!(chart.series_baseline_price(0), None);
 }
 
@@ -9348,12 +10250,16 @@ fn canonical_style_reaches_the_backend_neutral_frame() {
         prim,
         Prim::Rect { color, .. } | Prim::RectFrame { color, .. } if *color == theme_down
     )));
-    assert!(prims
-        .iter()
-        .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == VOLUME_UP)));
-    assert!(prims
-        .iter()
-        .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == VOLUME_DOWN)));
+    assert!(
+        prims
+            .iter()
+            .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == VOLUME_UP))
+    );
+    assert!(
+        prims
+            .iter()
+            .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == VOLUME_DOWN))
+    );
     assert!(prims.iter().any(|prim| matches!(
         prim,
         Prim::HLine { color, .. } | Prim::VLine { color, .. } if *color == CROSSHAIR_COLOR
@@ -9376,12 +10282,16 @@ fn canonical_style_reaches_the_backend_neutral_frame() {
         aeris_charts_core::style::DEFAULT_AXIS_TEXT_RGB.1,
         aeris_charts_core::style::DEFAULT_AXIS_TEXT_RGB.2,
     );
-    assert!(axis_prims
-        .iter()
-        .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == border)));
-    assert!(axis_prims
-        .iter()
-        .any(|prim| matches!(prim, Prim::Text { color, .. } if *color == axis_text)));
+    assert!(
+        axis_prims
+            .iter()
+            .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == border))
+    );
+    assert!(
+        axis_prims
+            .iter()
+            .any(|prim| matches!(prim, Prim::Text { color, .. } if *color == axis_text))
+    );
 }
 
 #[test]
@@ -9416,9 +10326,11 @@ fn malformed_grid_and_axis_css_fall_back_to_canonical_style() {
     );
     let mut axis_prims = Vec::new();
     chart.build_axis_primitives_into(&axis_frame, &mut axis_prims);
-    assert!(axis_prims
-        .iter()
-        .any(|prim| matches!(prim, Prim::Text { color, .. } if *color == axis_text)));
+    assert!(
+        axis_prims
+            .iter()
+            .any(|prim| matches!(prim, Prim::Text { color, .. } if *color == axis_text))
+    );
 }
 
 #[test]
@@ -9613,6 +10525,207 @@ fn previous_close_rule_skips_whitespace_and_opens_against_the_reference_price() 
         histogram_column_colors(&mut chart, &[VOLUME_UP, VOLUME_DOWN, solid])[0],
         VOLUME_DOWN
     );
+}
+
+#[test]
+fn updown_volume_takes_its_direction_from_a_footprint_over_a_whitespace_primary() {
+    let mut chart = ChartEngine::new(1200.0, 600.0, 1.0);
+    let times: Vec<f64> = (0..4).map(|minute| f64::from(minute) * 60.0).collect();
+    let nan = vec![f64::NAN; times.len()];
+    chart
+        .set_series_data(0, &times, &nan, &nan, &nan, &nan)
+        .unwrap();
+    let volume = chart.add_series(SeriesKind::Histogram);
+    let volumes = [10.0, 20.0, 30.0, 40.0];
+    chart
+        .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+        .unwrap();
+    chart.series_entry_mut(volume).unwrap().histogram_updown = true;
+    let presentation = chart
+        .add_order_flow_presentation(
+            "ES",
+            0,
+            crate::OrderFlowPresentationOptions {
+                aggregation: crate::FootprintAggregationOptions {
+                    tick_size: 1.0,
+                    ticks_per_row: 1,
+                    ..crate::FootprintAggregationOptions::default()
+                },
+                visual: crate::FootprintVisualOptions::default(),
+                show_footprint: true,
+                show_cumulative_delta: false,
+                show_delta_histogram: false,
+                big_trades: None,
+            },
+        )
+        .unwrap();
+    let trade = |timestamp_micros: i64, price: f64| crate::FootprintTrade {
+        timestamp_micros,
+        price,
+        volume: 1.0,
+        aggressor: crate::AggressorSide::Buy,
+        bid: None,
+        ask: None,
+        sequence: None,
+        trade_id: None,
+        conditions: 0,
+        session_id: Some(1),
+    };
+    // The tape covers only the last two minutes: the third closes up, the fourth down.
+    let tape = vec![
+        trade(120_000_000, 100.0),
+        trade(130_000_000, 102.0),
+        trade(180_000_000, 105.0),
+        trade(190_000_000, 101.0),
+    ];
+    chart
+        .update_order_flow_presentation(presentation, tape, false)
+        .unwrap();
+    // Structure bindings keep a whitespace-only anchor for their zones. It must not
+    // displace the primary or hide the footprint fallback for volume tint.
+    let reference = chart.add_series(SeriesKind::Candlestick);
+    let prices = [100.0, 101.0, 105.0, 101.0];
+    chart
+        .set_series_data(reference, &times, &prices, &prices, &prices, &prices)
+        .unwrap();
+    let base_index = chart.data.base_index();
+    let gaps = chart.add_fair_value_gaps(
+        reference,
+        0.0,
+        crate::StructureMitigation::Touch,
+        crate::StructureMitigationPrice::Wick,
+        20,
+        true,
+    );
+    assert_eq!(gaps.len(), 1);
+    // The all-whitespace anchor never moves the base index (the fork has no
+    // `whitespace_only` flag; its base index skips whitespace through the LOD pyramid).
+    assert_eq!(chart.data.base_index(), base_index);
+    chart.time_scale.set_width(1200.0);
+    chart.fit_content();
+
+    let frame = chart.build_frame();
+    let segment = chart
+        .frame_series_segments(0)
+        .iter()
+        .find(|segment| segment.series_id == Some(volume))
+        .unwrap();
+    let columns = frame.panes[0].main[segment.start..segment.end]
+        .iter()
+        .filter_map(|primitive| match primitive {
+            Prim::Rect { color, .. } => Some(*color),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // Uncovered slots have no presented bar and keep the series' solid color.
+    assert_eq!(columns, [HISTOGRAM, HISTOGRAM, VOLUME_UP, VOLUME_DOWN]);
+    chart.set_series_visible(presentation.footprint_series().unwrap(), false);
+    let frame = chart.build_frame();
+    let segment = chart
+        .frame_series_segments(0)
+        .iter()
+        .find(|segment| segment.series_id == Some(volume))
+        .unwrap();
+    let colors = frame.panes[0].main[segment.start..segment.end]
+        .iter()
+        .filter_map(|primitive| match primitive {
+            Prim::Rect { color, .. } => Some(*color),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        colors, [HISTOGRAM; 4],
+        "anchors cannot tint uncovered volume"
+    );
+    // A whitespace session slot past every real row extends the anchor with its source; the
+    // all-whitespace anchor still leaves the base index at the last real row.
+    assert!(chart.update_series_bar(reference, 240.0, [f64::NAN; 4]));
+    assert_eq!(chart.data.series_data(gaps[0]).unwrap().0.len(), 5);
+    assert_eq!(chart.data.merged_times().len(), 5);
+    assert_eq!(chart.data.base_index(), base_index);
+}
+
+/// The footprint fallback over a whitespace primary follows the volume series' tint rule: with
+/// `previous_close` a covered bar closing above its open but below the previous footprint close
+/// tints down, where `open_close` tints it up; the first covered bar has no previous close and
+/// compares with its open.
+#[test]
+fn updown_volume_over_a_whitespace_primary_follows_the_previous_close_rule() {
+    for (rule, last) in [
+        (crate::HistogramUpDownRule::OpenClose, VOLUME_UP),
+        (crate::HistogramUpDownRule::PreviousClose, VOLUME_DOWN),
+    ] {
+        let mut chart = ChartEngine::new(1200.0, 600.0, 1.0);
+        let times: Vec<f64> = (0..4).map(|minute| f64::from(minute) * 60.0).collect();
+        let nan = vec![f64::NAN; times.len()];
+        chart
+            .set_series_data(0, &times, &nan, &nan, &nan, &nan)
+            .unwrap();
+        let volume = chart.add_series(SeriesKind::Histogram);
+        let volumes = [10.0, 20.0, 30.0, 40.0];
+        chart
+            .set_series_data(volume, &times, &volumes, &volumes, &volumes, &volumes)
+            .unwrap();
+        let series = chart.series_entry_mut(volume).unwrap();
+        series.histogram_updown = true;
+        series.histogram_updown_rule = rule;
+        let presentation = chart
+            .add_order_flow_presentation(
+                "ES",
+                0,
+                crate::OrderFlowPresentationOptions {
+                    aggregation: crate::FootprintAggregationOptions {
+                        tick_size: 1.0,
+                        ticks_per_row: 1,
+                        ..crate::FootprintAggregationOptions::default()
+                    },
+                    visual: crate::FootprintVisualOptions::default(),
+                    show_footprint: true,
+                    show_cumulative_delta: false,
+                    show_delta_histogram: false,
+                    big_trades: None,
+                },
+            )
+            .unwrap();
+        let trade = |timestamp_micros: i64, price: f64| crate::FootprintTrade {
+            timestamp_micros,
+            price,
+            volume: 1.0,
+            aggressor: crate::AggressorSide::Buy,
+            bid: None,
+            ask: None,
+            sequence: None,
+            trade_id: None,
+            conditions: 0,
+            session_id: Some(1),
+        };
+        // The third minute closes up at 104; the fourth opens at 101 and closes at 103.
+        let tape = vec![
+            trade(120_000_000, 100.0),
+            trade(130_000_000, 104.0),
+            trade(180_000_000, 101.0),
+            trade(190_000_000, 103.0),
+        ];
+        chart
+            .update_order_flow_presentation(presentation, tape, false)
+            .unwrap();
+        chart.time_scale.set_width(1200.0);
+        chart.fit_content();
+        let frame = chart.build_frame();
+        let segment = chart
+            .frame_series_segments(0)
+            .iter()
+            .find(|segment| segment.series_id == Some(volume))
+            .unwrap();
+        let columns = frame.panes[0].main[segment.start..segment.end]
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Prim::Rect { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(columns, [HISTOGRAM, HISTOGRAM, VOLUME_UP, last], "{rule:?}");
+    }
 }
 
 #[test]
@@ -9846,10 +10959,12 @@ fn area_brush_is_transient_presentation_on_the_builtin_area_series() {
 
     assert!(chart.set_area_brush_state(0, selected, Vec::new()));
     let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|primitive| matches!(primitive, Prim::AreaFill { point_count: 5, .. })));
+    assert!(
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|primitive| matches!(primitive, Prim::AreaFill { point_count: 5, .. }))
+    );
     assert_eq!(
         frame.panes[0]
             .main
@@ -9933,10 +11048,11 @@ fn last_value_label_background_honors_the_per_point_color() {
         |t, _bold| t.len() as f64 * 7.0,
         |t, _bold| t.len() as f64 * 6.0,
     );
-    assert!(axis
-        .labels
-        .iter()
-        .any(|l| matches!(l.background, Some((.., c)) if c == Color(POINT_RED))));
+    assert!(
+        axis.labels
+            .iter()
+            .any(|l| matches!(l.background, Some((.., c)) if c == Color(POINT_RED)))
+    );
     let frame = chart.build_frame();
     assert!(frame.panes[0].main.iter().any(|p| matches!(
         p,
@@ -10225,7 +11341,9 @@ fn bold_round_labels_decile_rule() {
     );
     assert_eq!(
         bold,
-        vec![true, false, false, false, false, false, false, false, false, false, true]
+        vec![
+            true, false, false, false, false, false, false, false, false, false, true
+        ]
     );
     // Disabled: nothing bold.
     let bold = ChartEngine::bold_round_decisions(&[100.0, 120.0], false);
@@ -10258,12 +11376,16 @@ fn axis_primitives_keep_normal_and_round_tick_weights_distinct() {
 
     let mut primitives = Vec::new();
     chart.build_axis_primitives_into(&axis, &mut primitives);
-    assert!(primitives
-        .iter()
-        .any(|prim| matches!(prim, Prim::Text { text, weight: 400, .. } if text == "normal")));
-    assert!(primitives
-        .iter()
-        .any(|prim| matches!(prim, Prim::Text { text, weight: 700, .. } if text == "rounded")));
+    assert!(
+        primitives
+            .iter()
+            .any(|prim| matches!(prim, Prim::Text { text, weight: 400, .. } if text == "normal"))
+    );
+    assert!(
+        primitives
+            .iter()
+            .any(|prim| matches!(prim, Prim::Text { text, weight: 700, .. } if text == "rounded"))
+    );
 }
 
 #[test]
@@ -10487,7 +11609,7 @@ fn countdown_text_tracks_the_pinned_host_clock() {
     // Headless determinism: no host clock, no countdown row at all.
     assert_eq!(chart.series_countdown_text(0), None);
     assert_eq!(boxed_labels(&mut chart).len(), 1); // the plain price label only
-                                                   // 60s interval, last bar t=240: next close 300.
+    // 60s interval, last bar t=240: next close 300.
     chart.now_override = Some(250.0);
     assert_eq!(chart.series_countdown_text(0).as_deref(), Some("00:50"));
     chart.now_override = Some(299.7);
@@ -10873,13 +11995,16 @@ fn boxed_labels_begin_beyond_the_axis_border_at_every_dpr() {
             price_border as f32,
             "title chip must end at the border with no overlap or surface gap at dpr {dpr}"
         );
-        assert!(title_radii
-            .into_iter()
-            .filter(|radius| *radius > 0.0)
-            .all(|radius| {
-                (radius - crate::axis_metrics::AxisMetrics::TAG_RADIUS as f32 * dpr as f32).abs()
-                    < 1e-4
-            }));
+        assert!(
+            title_radii
+                .into_iter()
+                .filter(|radius| *radius > 0.0)
+                .all(|radius| {
+                    (radius - crate::axis_metrics::AxisMetrics::TAG_RADIUS as f32 * dpr as f32)
+                        .abs()
+                        < 1e-4
+                })
+        );
         assert!(
             primitives.iter().any(|primitive| matches!(
                 primitive,
@@ -10926,6 +12051,51 @@ fn axis_width_negotiation_includes_the_secondary_countdown_row() {
     let with_cluster =
         chart.optimal_price_axis_width_for(PriceScaleTarget::Right, measure, countdown_measure);
     assert_eq!(with_cluster, 48.0, "outside chip must not widen the strip");
+}
+
+/// A price tick whose text a boxed tag covers drops the text but keeps its measured advance.
+/// That holds for any host measure, including one that reports a width for the empty string:
+/// the strip is exactly as wide as with no tag at all, so a tag never moves the plot edge.
+#[test]
+fn ticks_hidden_under_a_tag_keep_the_axis_width_for_any_host_measure() {
+    // A fixed-advance stand-in for host glyph measurement, the empty string included.
+    let measure = |_: &str, _: bool| 48.0;
+    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+    let times: Vec<f64> = (0..60).map(|i| 1_000.0 + f64::from(i) * 60.0).collect();
+    let open: Vec<f64> = (0..60).map(|i| 100.0 + f64::from(i % 7)).collect();
+    let high: Vec<f64> = open.iter().map(|value| value + 3.0).collect();
+    let low: Vec<f64> = open.iter().map(|value| value - 3.0).collect();
+    let close: Vec<f64> = open.iter().map(|value| value + 1.0).collect();
+    chart
+        .set_series_data(0, &times, &open, &high, &low, &close)
+        .unwrap();
+    chart.recompute_layout_with_measure(true, measure, measure);
+    chart.fit_content();
+    chart.autoscale_visible();
+    chart.recompute_layout_with_measure(true, measure, measure);
+
+    // The live-price tag covers at least one tick, whose text is dropped.
+    let axis = chart.build_axis_frame(80.0, measure, measure);
+    assert!(
+        axis.labels.iter().any(|label| label.background.is_none()
+            && label.text.is_empty()
+            && label.measure_extra > 0.0),
+        "the fixture hides a tick under the live-price tag"
+    );
+    let with_tag = chart.optimal_price_axis_width_for(PriceScaleTarget::Right, measure, measure);
+    let strip_with_tag = chart.right_builtin_axis_w;
+    let bar_x_with_tag = chart.time_to_coordinate(times[30]).unwrap();
+
+    chart.series[0].last_value_visible = false;
+    let axis = chart.build_axis_frame(80.0, measure, measure);
+    assert!(axis.labels.iter().all(|label| label.measure_extra == 0.0));
+    let without_tag = chart.optimal_price_axis_width_for(PriceScaleTarget::Right, measure, measure);
+    assert_eq!(with_tag, without_tag);
+
+    // The full layout path keeps the plot edge, so a fixed bar stays where it was.
+    chart.recompute_layout_with_measure(true, measure, measure);
+    assert_eq!(chart.right_builtin_axis_w, strip_with_tag);
+    assert_eq!(chart.time_to_coordinate(times[30]).unwrap(), bar_x_with_tag);
 }
 
 #[test]
@@ -11064,10 +12234,12 @@ fn built_in_year_labels_honor_the_character_limit_without_truncation() {
         |text, _bold| text.len() as f64 * 7.0,
         |text, _bold| text.len() as f64 * 6.0,
     );
-    assert!(labels
-        .labels
-        .iter()
-        .any(|label| label.text == "custom-year"));
+    assert!(
+        labels
+            .labels
+            .iter()
+            .any(|label| label.text == "custom-year")
+    );
 }
 
 #[test]
@@ -11111,7 +12283,7 @@ fn compact_axis_fixture_strips_and_tags_share_metrics_across_dpr() {
         chart.series[0].title = "NDQ".to_string();
         chart.series[0].countdown_visible = true;
         chart.now_override = Some(250.0); // "00:50"
-                                          // Mid-pane crosshair so both crosshair tags render alongside live-price titles.
+        // Mid-pane crosshair so both crosshair tags render alongside live-price titles.
         let mid_x = chart.logical_to_coordinate(2.0).unwrap_or(400.0);
         chart.crosshair = Some((mid_x, 250.0));
         chart.recompute_layout_with_measure(
@@ -11598,13 +12770,15 @@ fn periodic_profile_presentation_reserves_bounded_rows() {
     for boundary in &mut tape_request.boundaries {
         boundary.session_id = 1;
     }
-    assert!(chart
-        .add_periodic_profile_presentation(
-            0,
-            tape_request,
-            PeriodicProfilePresentationOptions::default(),
-        )
-        .is_ok());
+    assert!(
+        chart
+            .add_periodic_profile_presentation(
+                0,
+                tape_request,
+                PeriodicProfilePresentationOptions::default(),
+            )
+            .is_ok()
+    );
 }
 
 #[test]
@@ -12629,9 +13803,11 @@ fn selection_anchors_paint_theme_derived_discs_on_the_selected_series() {
     let light_fills: Vec<_> = light.iter().copied().filter(|d| d.2 != BLUE).collect();
     assert_eq!(light.iter().filter(|d| d.2 == BLUE).count(), 5);
     assert_eq!(light_fills.len(), 5);
-    assert!(light_fills
-        .iter()
-        .all(|d| d.2 == Color::rgb(0xff, 0xff, 0xff)));
+    assert!(
+        light_fills
+            .iter()
+            .all(|d| d.2 == Color::rgb(0xff, 0xff, 0xff))
+    );
     // Deselecting (an empty-pane click) removes the anchors.
     chart.set_selected_series(None);
     assert!(frame_discs(&mut chart).is_empty());
@@ -12735,17 +13911,19 @@ fn text_tool_selection_paints_a_focus_border_without_anchor_handles() {
         .expect("hovered trend placeholder");
     assert_eq!(placeholder.a(), 0x99);
     assert!(chart.begin_drawing_text_edit(line, false));
-    assert!(chart.build_frame().panes[0]
-        .main
-        .iter()
-        .all(|prim| !matches!(prim, Prim::RotatedText { text, .. } if text == "+ Add text")));
+    assert!(
+        chart.build_frame().panes[0]
+            .main
+            .iter()
+            .all(|prim| !matches!(prim, Prim::RotatedText { text, .. } if text == "+ Add text"))
+    );
     assert!(chart.commit_drawing_text_edit());
     chart.set_hovered_text(None);
     chart.set_hovered_text(Some(text));
     assert_eq!(chart.hovered_text(), Some(text));
     let hover = border_frames(&mut chart);
     assert_eq!(hover.len(), 1);
-    assert_eq!(hover[0].2 .0 & 0xFF, 0x73, "hover ring at reduced opacity");
+    assert_eq!(hover[0].2.0 & 0xFF, 0x73, "hover ring at reduced opacity");
     // The chrome box: 1.2×size line height + the 6 css px chrome pad, 2 px frame (dpr 1).
     let expected_h = (TEXT_TOOL_DEFAULT_SIZE * 1.2 + 12.0).round() as i32;
     assert_eq!(hover[0].0.h, expected_h);
@@ -13104,9 +14282,11 @@ fn idle_bollinger_paints_below_candles_and_hover_promotes_the_group() {
         })
         .collect();
     // Idle BB group (upper, middle, lower in binding order) paints first (below price).
-    assert!(poly_colors
-        .windows(3)
-        .any(|w| w == ["#ff0000", "#00ff00", "#0000ff"]));
+    assert!(
+        poly_colors
+            .windows(3)
+            .any(|w| w == ["#ff0000", "#00ff00", "#0000ff"])
+    );
     // Candles are Rect bodies; idle BB polylines all precede the first candle body.
     let first_rect = main
         .iter()
@@ -13395,14 +14575,18 @@ fn separate_panes_hidden_removed_and_incremental_equality_hold() {
     assert_eq!(chart.panes.len(), 2);
     // Separate panes: price pane holds candles only; oscillator holds the indicator.
     let price_frame = chart.build_frame();
-    assert!(price_frame.panes[0]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Rect { .. })));
-    assert!(price_frame.panes[1]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Polyline { .. })));
+    assert!(
+        price_frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Rect { .. }))
+    );
+    assert!(
+        price_frame.panes[1]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::Polyline { .. }))
+    );
     // Indicator-only pane retains stable internal ordering (single RSI, trivially stable).
     assert_eq!(
         chart.effective_series_order().last(),
@@ -13513,10 +14697,12 @@ fn assert_retained_frame_matches_clean_rebuild(chart: &mut ChartEngine) {
             chart.frame_pane_segments(pane).unwrap().coordinate_revision,
             coordinate_revision
         );
-        assert!(chart
-            .frame_series_segments(pane)
-            .iter()
-            .all(|segment| segment.coordinate_revision == coordinate_revision));
+        assert!(
+            chart
+                .frame_series_segments(pane)
+                .iter()
+                .all(|segment| segment.coordinate_revision == coordinate_revision)
+        );
     }
     chart.retained_frame = RetainedFrame::default();
     chart.frame_invalidation.all();
@@ -13772,14 +14958,18 @@ fn dense_retained_frame_matches_clean_rebuild_after_update_pan_and_zoom() {
 
     assert!(chart.update_series_bar(0, count as f64 - 1.0, [103.0; 4]));
     assert_retained_frame_matches_clean_rebuild(&mut chart);
-    assert!(chart
-        .data
-        .last_lod_update_nodes(0)
-        .is_some_and(|nodes| nodes <= 4));
-    assert!(chart
-        .data
-        .last_lod_update_nodes(rsi)
-        .is_some_and(|nodes| nodes <= 4));
+    assert!(
+        chart
+            .data
+            .last_lod_update_nodes(0)
+            .is_some_and(|nodes| nodes <= 4)
+    );
+    assert!(
+        chart
+            .data
+            .last_lod_update_nodes(rsi)
+            .is_some_and(|nodes| nodes <= 4)
+    );
 
     chart.set_visible_logical_range(2_000.0, count as f64 - 2_000.0);
     assert_retained_frame_matches_clean_rebuild(&mut chart);
@@ -14283,9 +15473,11 @@ fn position_stats_refresh_instrument_metadata_and_handle_future_zero_risk_and_vi
             None,
         )
         .unwrap();
-    assert!(texts(&mut chart)
-        .iter()
-        .any(|text| text == "Open P&L: 0.50, Qty: 250"));
+    assert!(
+        texts(&mut chart)
+            .iter()
+            .any(|text| text == "Open P&L: 0.50, Qty: 250")
+    );
     chart
         .set_trading_snapshot(crate::TradingSnapshot {
             instrument: crate::InstrumentMetadata {
@@ -14298,12 +15490,16 @@ fn position_stats_refresh_instrument_metadata_and_handle_future_zero_risk_and_vi
         })
         .unwrap();
     let refreshed = texts(&mut chart);
-    assert!(refreshed
-        .iter()
-        .any(|text| text == "Open P&L: 0.50, Qty: 12.5"));
-    assert!(refreshed
-        .iter()
-        .any(|text| text == "Target: 1.00 (8.333%) 4, Amount: 1250"));
+    assert!(
+        refreshed
+            .iter()
+            .any(|text| text == "Open P&L: 0.50, Qty: 12.5")
+    );
+    assert!(
+        refreshed
+            .iter()
+            .any(|text| text == "Target: 1.00 (8.333%) 4, Amount: 1250")
+    );
     chart
         .set_instrument_metadata(crate::InstrumentMetadata {
             tick_size: Some(0.5),
@@ -14311,24 +15507,29 @@ fn position_stats_refresh_instrument_metadata_and_handle_future_zero_risk_and_vi
             ..Default::default()
         })
         .unwrap();
-    assert!(texts(&mut chart)
-        .iter()
-        .any(|text| text == "Open P&L: 0.50, Qty: 25"));
+    assert!(
+        texts(&mut chart)
+            .iter()
+            .any(|text| text == "Open P&L: 0.50, Qty: 25")
+    );
     assert!(chart.drawing_set_points(
         id,
         r#"[{"logical":6,"price":12},{"logical":8,"price":13},{"logical":6,"price":12}]"#
     ));
     let zero = texts(&mut chart);
-    assert!(zero
-        .iter()
-        .any(|text| text == "Risk/reward ratio: \u{2014}"));
+    assert!(
+        zero.iter()
+            .any(|text| text == "Risk/reward ratio: \u{2014}")
+    );
     assert!(zero.iter().any(|text| text.ends_with("Qty: \u{2014}")));
     assert!(chart.drawing_apply_options(id, r#"{"visible":false}"#));
-    assert!(!texts(&mut chart)
-        .iter()
-        .any(|text| text.starts_with("Target:")
-            || text.starts_with("Stop:")
-            || text.contains("Qty:")));
+    assert!(
+        !texts(&mut chart)
+            .iter()
+            .any(|text| text.starts_with("Target:")
+                || text.starts_with("Stop:")
+                || text.contains("Qty:"))
+    );
 }
 
 // ---- live-bar easing: the frame reads the eased last bar, queries read the real one ----

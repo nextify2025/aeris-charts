@@ -1,9 +1,11 @@
-import { test, expect } from "@playwright/test";
+import { expect } from "@playwright/test";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
+import { test, monitor_page, wait_for_chart } from "./page-ready.mjs";
 
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
 const reference_baseline = JSON.parse(readFileSync(new URL("../fixtures/d1/reference-baseline.json", import.meta.url), "utf8"));
@@ -17,13 +19,6 @@ test.beforeEach(async ({ page }) => {
   page.on("console", (message) => console.log(`[browser:${message.type()}] ${message.text()}`));
   page.on("pageerror", (error) => console.log(`[browser:pageerror] ${error.message}`));
 });
-
-async function wait_for_chart(page) {
-  await page.waitForFunction(() => window.__chart?.backend?.() !== undefined);
-  await page.evaluate(() => new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
-  }));
-}
 
 // Determinism hardening for pixel comparisons: resolve pending font loads, then run one
 // full paint through the real render path and discard it. First-use shaping, atlas upload,
@@ -45,12 +40,11 @@ async function capture_presented_frame(page, backend, extra_query = "") {
   };
 }
 
-function render_native_fixture(output) {
-  const args = process.platform === "win32"
-    ? ["+stable-x86_64-pc-windows-msvc", "run", "-p", "aeris_charts_native", "--example", "parity_fixture", "--", output]
-    : ["run", "-p", "aeris_charts_native", "--example", "parity_fixture", "--", output];
-  const result = spawnSync("cargo", args, { cwd: repository_root, encoding: "utf8" });
-  expect(result.status, `native fixture failed\n${result.stdout}\n${result.stderr}`).toBe(0);
+function render_native_fixture(name, output) {
+  const target_dir = process.env.CARGO_TARGET_DIR ?? join(repository_root, "target");
+  const executable = join(target_dir, "debug", "examples", name + (process.platform === "win32" ? ".exe" : ""));
+  const result = spawnSync(executable, [output], { cwd: repository_root, encoding: "utf8" });
+  expect(result.status, `native fixture ${executable} failed\n${result.error ?? ""}\n${result.stdout}\n${result.stderr}`).toBe(0);
 }
 
 function rgba_diff(a, b, tolerance) {
@@ -131,10 +125,7 @@ test("scaled four-color image matches WebGPU, Canvas2D, and native", async ({ br
   const gpu_center = crop_png(gpu.image, 22, 22, 20, 20);
   const canvas_center = crop_png(canvas.image, 22, 22, 20, 20);
   const native_path = test_info.outputPath("native-image.png");
-  const native_run = spawnSync("cargo", ["run", "-p", "aeris_charts_native", "--example", "image_parity_fixture", "--", native_path], {
-    cwd: repository_root, encoding: "utf8",
-  });
-  expect(native_run.status, `${native_run.stdout}\n${native_run.stderr}`).toBe(0);
+  render_native_fixture("image_parity_fixture", native_path);
   const native_center = crop_png(PNG.sync.read(readFileSync(native_path)), 22, 22, 20, 20);
   expect(rgba_diff(gpu_center.data, canvas_center.data, 1).different_pixels).toBe(0);
   expect(rgba_diff(gpu_center.data, native_center.data, 1).different_pixels).toBe(0);
@@ -671,7 +662,7 @@ test("native and browser Canvas2D panes consume the same fixture", async ({ page
   const browser_pane = new PNG({ width: pane_width, height: pane_height });
   PNG.bitblt(browser_full, browser_pane, 0, 0, pane_width, pane_height, 0, 0);
   const native_path = test_info.outputPath("native-pane.png");
-  render_native_fixture(native_path);
+  render_native_fixture("parity_fixture", native_path);
   const native_pane = PNG.sync.read(readFileSync(native_path));
   expect([native_pane.width, native_pane.height]).toEqual([pane_width, pane_height]);
 
@@ -1165,6 +1156,7 @@ test("reference spacing, DPR, and theme matrix reports regional fidelity @machin
       colorScheme: entry.theme,
     });
     const matrix_page = await context.newPage();
+    matrix_page.once("close", monitor_page(matrix_page));
     const query = new URLSearchParams({
       runtimeTest: "presentedFrame",
       backend: "canvas2d",
@@ -1249,6 +1241,7 @@ test("reference marker and overlay-volume fixtures report regional fidelity @mac
       colorScheme: "light",
     });
     const feature_page = await context.newPage();
+    feature_page.once("close", monitor_page(feature_page));
     const query = new URLSearchParams({
       runtimeTest: "presentedFrame",
       backend: "canvas2d",
@@ -1667,6 +1660,9 @@ async function render_measures(page, backend, theme) {
     chart.wasm.measure_pointer_down(start[0], start[1], true, false);
     chart.wasm.measure_pointer_move(end[0], end[1], false);
     chart.wasm.measure_pointer_up(end[0], end[1], false);
+    // The raw engine calls do not schedule a paint; without one the measure appears only on
+    // whatever repaint comes next (a countdown tick), possibly in just one backend's capture.
+    chart.render();
     const measured = JSON.parse(chart.wasm.measure_points_json());
     result.push(measured.map((point) => css(point.logical, point.price)));
     return result;

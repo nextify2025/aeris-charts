@@ -578,10 +578,10 @@ pub(crate) fn regression_fit_handles(
         return;
     };
     for handle in handles {
-        if let DrawingDragPart::Anchor(index @ (0 | 1)) = handle.part {
-            if let Some(point) = engine.drawing_point_px(drawing, derived[index]) {
-                handle.point = point;
-            }
+        if let DrawingDragPart::Anchor(index @ (0 | 1)) = handle.part
+            && let Some(point) = engine.drawing_point_px(drawing, derived[index])
+        {
+            handle.point = point;
         }
     }
 }

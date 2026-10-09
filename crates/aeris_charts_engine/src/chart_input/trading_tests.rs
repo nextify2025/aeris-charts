@@ -1581,14 +1581,18 @@ fn a_commit_that_disarms_the_tool_frees_the_line_under_a_resting_pointer() {
     arm_trend_line(&mut chart);
     assert_eq!(chart.trading_state.feedback_hover, None);
     let modifiers = DrawingModifiers::default();
-    assert!(chart
-        .drawing_tool_activate(60.0, 80.0, modifiers)
-        .created
-        .is_none());
-    assert!(chart
-        .drawing_tool_activate(200.0, 60.0, modifiers)
-        .created
-        .is_some());
+    assert!(
+        chart
+            .drawing_tool_activate(60.0, 80.0, modifiers)
+            .created
+            .is_none()
+    );
+    assert!(
+        chart
+            .drawing_tool_activate(200.0, 60.0, modifiers)
+            .created
+            .is_some()
+    );
     assert_eq!(chart.active_drawing_tool(), None);
     assert_eq!(chart.input_cursor(), ChartCursor::VerticalGrab);
     assert_eq!(

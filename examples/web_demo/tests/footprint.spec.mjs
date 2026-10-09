@@ -124,6 +124,52 @@ test("footprint shared-frame semantics execute through WebGPU", async ({ page })
   expect(screenshot.byteLength).toBeGreaterThan(10_000);
 });
 
+for (const backend of ["canvas2d", "webgpu"]) {
+  test(`every footprint cell mode paints distinct pixels from one tape (${backend})`, async ({ page }) => {
+    await open_chart(page, backend);
+    const modes = ["bid_ask", "total", "delta", "profile_in_bar", "volume_ladder", "horizontal_imbalance", "bid_ask_histogram"];
+    await page.evaluate(() => {
+      const chart = window.__chart;
+      chart.remove_series(window.__main);
+      window.__footprint = chart.add_series("footprint", {
+        tick_size: 1,
+        interval_seconds: 60,
+        imbalance_ratio: 3,
+        imbalance_minimum_volume: 5,
+        price_line_visible: false,
+        last_value_visible: false,
+      });
+      const micros = Math.floor(window.__data[0].time / 60) * 60 * 1_000_000;
+      window.__footprint.set_trades([
+        { timestamp_micros: micros + 1, price: 100, volume: 30, aggressor: "sell" },
+        { timestamp_micros: micros + 2, price: 100, volume: 6, aggressor: "buy" },
+        { timestamp_micros: micros + 3, price: 101, volume: 12, aggressor: "buy" },
+        { timestamp_micros: micros + 4, price: 101, volume: 40, aggressor: "sell" },
+        { timestamp_micros: micros + 5, price: 102, volume: 45, aggressor: "buy" },
+        { timestamp_micros: micros + 6, price: 102, volume: 5, aggressor: "sell" },
+      ]);
+      chart.time_scale().fit_content();
+      chart.time_scale().apply_options({ bar_spacing: 160 });
+    });
+    const frames = [];
+    for (const mode of modes) {
+      const frame = await page.evaluate(async (cell_mode) => {
+        window.__footprint.apply_options({ cell_mode });
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        return {
+          backend: window.__chart.backend(),
+          mode: window.__footprint.options().cell_mode,
+          image: window.__chart.take_screenshot().toDataURL("image/png"),
+        };
+      }, mode);
+      expect(frame.backend).toBe(backend);
+      expect(frame.mode).toBe(mode);
+      frames.push(frame.image);
+    }
+    expect(new Set(frames).size, "each cell mode renders its own geometry").toBe(modes.length);
+  });
+}
+
 test("typed footprint columns reject off-grid data without replacing accepted bars", async ({ page }) => {
   await open_chart(page);
   const result = await page.evaluate(() => {
@@ -350,8 +396,8 @@ test("live trade-stream tips do suffix-bounded dependent work and match a clean 
       chart.bind_trade_bar_series_to_stream(candles, stream);
       const cvd = chart.add_cvd_series(stream, 1, "continuous");
       const delta = chart.add_delta_series(stream, 1);
-      chart.add_trade_bubbles(footprint, stream, { minimum_volume: 3, max_markers: 32 });
-      return { stream, footprint, candles, cvd, delta };
+      const big_trades = chart.add_big_trades(footprint, stream, { filter: { mode: "fixed", minimum_volume: 3 } });
+      return { stream, footprint, candles, cvd, delta, big_trades };
     };
     const live = build("TEST:TIP:LIVE");
     const clean = build("TEST:TIP:CLEAN");
@@ -367,8 +413,8 @@ test("live trade-stream tips do suffix-bounded dependent work and match a clean 
         changed_bars: live.footprint.footprint_bars().length + 1 - bars_before,
         study_rows: after.dependent_rows_computed - before.dependent_rows_computed,
         bar_rows: after.bar_rows_projected - before.bar_rows_projected,
-        bubble_trades: after.bubble_trades_scanned - before.bubble_trades_scanned,
-        bubble_sizes: after.bubble_markers_sized - before.bubble_markers_sized,
+        big_trades_prints: after.big_trades_prints_scanned - before.big_trades_prints_scanned,
+        big_trades_replays: after.big_trades_replays - before.big_trades_replays,
       });
     }
     chart.set_trade_stream_trades(clean.stream, Array.from({ length: 520 }, (_, index) => trade(index)));
@@ -377,6 +423,7 @@ test("live trade-stream tips do suffix-bounded dependent work and match a clean 
       candles: handles.candles.data(),
       cvd: handles.cvd.data(),
       delta: handles.delta.data(),
+      big_trades: handles.big_trades.snapshot(),
     });
     return { tips, live: read(live), clean: read(clean) };
   });
@@ -387,12 +434,13 @@ test("live trade-stream tips do suffix-bounded dependent work and match a clean 
     // CVD and delta recompute, and the footprint and candles project, only the changed bars.
     expect(tip.study_rows).toBe(2 * tip.changed_bars);
     expect(tip.bar_rows).toBe(2 * tip.changed_bars);
-    // Bubbles fold only the new trade; a peak change rescales at most the 32 retained bubbles.
-    expect(tip.bubble_trades).toBe(1);
-    expect(tip.bubble_sizes).toBeLessThanOrEqual(32);
+    // Big trades fold only the new trade and never replay the tape.
+    expect(tip.big_trades_prints).toBe(1);
+    expect(tip.big_trades_replays).toBe(0);
   }
   expect(result.tips.some((tip) => tip.changed_bars === 2)).toBe(true);
   expect(result.live.bars.length).toBeGreaterThan(20);
+  expect(result.live.big_trades.bubbles.length).toBeGreaterThan(0);
   expect(result.live).toEqual(result.clean);
 });
 
@@ -421,8 +469,8 @@ test("retained live trade-stream tips evict history in place and keep the unreta
       chart.bind_trade_bar_series_to_stream(candles, stream);
       const cvd = chart.add_cvd_series(stream, 1, "continuous");
       const delta = chart.add_delta_series(stream, 1);
-      chart.add_trade_bubbles(footprint, stream, { minimum_volume: 3, max_markers: 32 });
-      return { stream, footprint, candles, cvd, delta };
+      const big_trades = chart.add_big_trades(footprint, stream, { filter: { mode: "fixed", minimum_volume: 3 } });
+      return { stream, footprint, candles, cvd, delta, big_trades };
     };
     const retained = build("TEST:TIP:RETAINED", 20);
     const unretained = build("TEST:TIP:UNRETAINED", null);
@@ -439,7 +487,8 @@ test("retained live trade-stream tips evict history in place and keep the unreta
       const after = chart.trade_stream_stats(retained.stream);
       tips.push({
         trimmed: first_open() !== opened_before,
-        bubble_trades: after.bubble_trades_scanned - before.bubble_trades_scanned,
+        big_trades_prints: after.big_trades_prints_scanned - before.big_trades_prints_scanned,
+        big_trades_replays: after.big_trades_replays - before.big_trades_replays,
         bar_rows: after.bar_rows_projected - before.bar_rows_projected,
       });
     }
@@ -448,14 +497,17 @@ test("retained live trade-stream tips evict history in place and keep the unreta
       candles: handles.candles.data(),
       cvd: handles.cvd.data(),
       delta: handles.delta.data(),
+      big_trades: handles.big_trades.snapshot(),
     });
     return { tips, retained: read(retained), unretained: read(unretained) };
   });
 
   expect(result.tips.filter((tip) => tip.trimmed).length).toBeGreaterThan(2);
   for (const tip of result.tips) {
-    // Every tip folds only its own trade, also the tips that cross the retention ceiling.
-    expect(tip.bubble_trades).toBe(1);
+    // Every tip folds only its own trade and replays nothing, also the tips that cross the
+    // retention ceiling: big trades evict the orders of evicted bars in place.
+    expect(tip.big_trades_prints).toBe(1);
+    expect(tip.big_trades_replays).toBe(0);
     // The footprint and candles project only the active bar and a bar the tip opened.
     expect(tip.bar_rows).toBeLessThanOrEqual(4);
   }
@@ -468,6 +520,245 @@ test("retained live trade-stream tips evict history in place and keep the unreta
   // Evicting history never rewrites the cumulative delta of the bars that remain.
   expect(result.retained.cvd).toEqual(tail(result.unretained.cvd));
   expect(result.retained.delta).toEqual(tail(result.unretained.delta));
+  // Retention drops the orders of evicted bars and never changes another one.
+  const first_bar = Math.floor(result.retained.bars[0].start_timestamp_micros / 1_000_000);
+  expect(result.retained.big_trades.bubbles.length).toBeGreaterThan(0);
+  expect(result.retained.big_trades).toEqual({
+    ...result.unretained.big_trades,
+    bubbles: result.unretained.big_trades.bubbles.filter((order) => order.bar_time >= first_bar),
+  });
+});
+
+test("big trades rebuild split prints into one order over ordinary candles", async ({ page }) => {
+  await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const stream = chart.add_trade_stream("CME:ES:big-trades", { tick_size: 0.25 });
+    const big_trades = chart.add_big_trades(window.__main, stream, {
+      filter: { mode: "fixed", minimum_volume: 10 },
+    });
+    const micros = window.__data[0].time * 1_000_000;
+    chart.set_trade_stream_trades(stream, [
+      // One sell order sweeping two levels, reported as two 6-lot prints.
+      { timestamp_micros: micros + 1, price: 100, volume: 6, aggressor: "sell", session_id: 1 },
+      { timestamp_micros: micros + 1, price: 99.75, volume: 6, aggressor: "sell", session_id: 1 },
+      { timestamp_micros: micros + 2, price: 100, volume: 3, aggressor: "buy", session_id: 1 },
+    ]);
+    const snapshot = big_trades.snapshot();
+    const defaults = big_trades.options();
+    big_trades.apply_options({ size: "large", show_volume: false });
+    const restyled = big_trades.options();
+    const invalid = (() => {
+      try {
+        big_trades.apply_options({ grouping_window_micros: -1 });
+        return null;
+      } catch (error) {
+        return error.code;
+      }
+    })();
+    const in_use = chart.trade_stream_stats(stream).dependent_count;
+    big_trades.remove();
+    const stale = (() => {
+      try {
+        big_trades.snapshot();
+        return null;
+      } catch (error) {
+        return error.code;
+      }
+    })();
+    return {
+      snapshot,
+      defaults,
+      restyled,
+      invalid,
+      in_use,
+      released: chart.trade_stream_stats(stream).dependent_count,
+      stale,
+    };
+  });
+
+  expect(result.snapshot.threshold).toBe(10);
+  expect(result.snapshot.bubbles).toHaveLength(1);
+  expect(result.snapshot.bubbles[0]).toMatchObject({
+    side: "sell",
+    volume: 12,
+    prints: 2,
+    low: 99.75,
+    high: 100,
+    vwap: 99.875,
+  });
+  expect(result.defaults).toMatchObject({
+    grouping_window_micros: 1000,
+    size: "medium",
+    show_volume: true,
+    visible: true,
+    text_color: null,
+  });
+  expect(result.restyled).toMatchObject({ size: "large", show_volume: false });
+  expect(result.invalid).toBe("invalid_options");
+  expect(result.in_use).toBe(1);
+  expect(result.released).toBe(0);
+  expect(result.stale).toBe("stale_handle");
+});
+
+test("auction markers expose deterministic tape-derived snapshots and reject invalid options", async ({ page }) => {
+  await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    chart.remove_series(window.__main);
+    const footprint = chart.add_series("footprint", {
+      tick_size: 1,
+      interval_seconds: 60,
+    });
+    const stream = chart.add_trade_stream("CME:ES:auction-markers", {
+      tick_size: 1,
+      interval_seconds: 60,
+    });
+    chart.bind_footprint_series_to_stream(footprint, stream);
+    const micros = Math.floor(window.__data[0].time / 60) * 60_000_000;
+    chart.set_trade_stream_trades(stream, [
+      { timestamp_micros: micros + 1, price: 100, volume: 150, aggressor: "sell", session_id: 1 },
+      { timestamp_micros: micros + 1, price: 100, volume: 30, aggressor: "buy", session_id: 1 },
+      { timestamp_micros: micros + 2, price: 101, volume: 25, aggressor: "buy", session_id: 1 },
+      { timestamp_micros: micros + 3, price: 102, volume: 5, aggressor: "buy", session_id: 1 },
+      { timestamp_micros: micros + 60_000_001, price: 100, volume: 120, aggressor: "sell", session_id: 1 },
+      { timestamp_micros: micros + 60_000_002, price: 101, volume: 15, aggressor: "buy", session_id: 1 },
+    ]);
+    const marker = chart.add_auction_markers(footprint, stream);
+    const defaults = marker.options();
+    const first = marker.snapshot();
+    const repeat = marker.snapshot();
+    marker.apply_options({ min_side_volume: 2, exhaustion_max_volume: 6 });
+    const updated = marker.options();
+    const invalid = (() => {
+      try {
+        marker.apply_options({ exhaustion_levels: 0 });
+        return null;
+      } catch (error) {
+        return error.code;
+      }
+    })();
+    const after_invalid = marker.options();
+    const in_use = chart.trade_stream_stats(stream).dependent_count;
+    marker.remove();
+    const stale = (() => {
+      try {
+        marker.snapshot();
+        return null;
+      } catch (error) {
+        return error.code;
+      }
+    })();
+    return {
+      defaults, first, repeat, updated, invalid, after_invalid, in_use,
+      released: chart.trade_stream_stats(stream).dependent_count, stale,
+    };
+  });
+
+  expect(result.defaults).toMatchObject({
+    min_side_volume: 0,
+    exhaustion_max_volume: 10,
+    exhaustion_levels: 3,
+    absorption_min_volume: 100,
+    absorption_ratio: 3,
+    extreme_levels: 2,
+    min_rejection_rows: 1,
+    extend_until_revisited: false,
+    include_forming_bar: false,
+    visible: true,
+  });
+  expect(result.first).toEqual(result.repeat);
+  expect(result.first).toEqual(expect.arrayContaining([
+    expect.objectContaining({ kind: "absorption", side: "low", price: 100, volume: 150 }),
+    expect.objectContaining({ kind: "exhaustion", side: "high", price: 102, volume: 5 }),
+  ]));
+  expect(result.first.every((mark) => mark.bar_time === result.first[0].bar_time)).toBe(true);
+  for (const mark of result.first) {
+    expect(["unfinished_auction", "exhaustion", "absorption"]).toContain(mark.kind);
+    expect(["high", "low"]).toContain(mark.side);
+    expect(Number.isFinite(mark.price)).toBe(true);
+    expect(Number.isFinite(mark.volume)).toBe(true);
+  }
+  expect(result.updated).toMatchObject({ min_side_volume: 2, exhaustion_max_volume: 6 });
+  expect(result.invalid).toBe("invalid_options");
+  expect(result.after_invalid).toEqual(result.updated);
+  expect(result.in_use).toBe(1);
+  expect(result.released).toBe(result.in_use - 1);
+  expect(result.stale).toBe("stale_handle");
+});
+
+test("footprint, auction markers and big trades share late prints and retention", async ({ page }) => {
+  await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    chart.remove_series(window.__main);
+    const footprint = chart.add_series("footprint", { tick_size: 1, interval_seconds: 60 });
+    const stream = chart.add_trade_stream("CME:ES:auction-shared", { tick_size: 1, interval_seconds: 60 });
+    chart.bind_footprint_series_to_stream(footprint, stream);
+    const base = Math.floor(window.__data[0].time / 60) * 60_000_000;
+    chart.set_trade_stream_trades(stream, [
+      { timestamp_micros: base + 1, price: 100, volume: 110, aggressor: "sell", session_id: 1 },
+      { timestamp_micros: base + 2, price: 100, volume: 10, aggressor: "buy", session_id: 1 },
+      { timestamp_micros: base + 60_000_001, price: 101, volume: 1, aggressor: "buy", session_id: 1 },
+    ]);
+    const markers = chart.add_auction_markers(footprint, stream);
+    const big = chart.add_big_trades(footprint, stream, { filter: { mode: "fixed", minimum_volume: 100 } });
+    const initial = markers.snapshot().find((mark) => mark.kind === "unfinished_auction" && mark.side === "low");
+    const initialBig = big.snapshot().bubbles.map((bubble) => bubble.volume);
+    chart.update_trade_stream_trades(stream,
+      [{ timestamp_micros: base + 3, price: 100, volume: 200, aggressor: "sell", session_id: 1 }]);
+    const repaired = markers.snapshot().find((mark) => mark.kind === "unfinished_auction" && mark.side === "low");
+    const repairedBig = big.snapshot().bubbles.map((bubble) => bubble.volume);
+    const level = footprint.footprint_bar(0).levels.find((row) => row.price === 100);
+    footprint.apply_options({ max_points: 1 });
+    return {
+      initial: initial?.volume, repaired: repaired?.volume, initialBig, repairedBig,
+      bid: level.bid_volume, retainedTimes: [...new Set(markers.snapshot().map((mark) => mark.bar_time))],
+      retainedBars: footprint.footprint_bars().length,
+    };
+  });
+  expect(result).toMatchObject({ initial: 120, repaired: 320, bid: 310, retainedBars: 1 });
+  expect(result.initialBig).toContain(110);
+  expect(result.repairedBig).toContain(200);
+  expect(result.retainedTimes).toEqual([]);
+});
+
+test("big trades rejections carry typed error codes", async ({ page }) => {
+  await open_chart(page);
+  const result = await page.evaluate(() => {
+    const chart = window.__chart;
+    const code = (action) => {
+      try {
+        action();
+        return null;
+      } catch (error) {
+        return error.code;
+      }
+    };
+    const stream = chart.add_trade_stream("CME:ES:big-trades-errors", { tick_size: 0.25 });
+    const histogram = chart.add_series("histogram");
+    const unknown_stream = code(() => chart.add_big_trades(window.__main, 999_999));
+    const unknown_series = code(() => chart.add_big_trades(999_999, stream));
+    const unsupported = code(() => chart.add_big_trades(histogram, stream));
+    const invalid = code(() => chart.add_big_trades(window.__main, stream, { grouping_window_micros: -1 }));
+    const added = [];
+    let limit = null;
+    while (limit === null && added.length < 32) {
+      limit = code(() => added.push(chart.add_big_trades(window.__main, stream)));
+    }
+    const indicators = added.length;
+    for (const handle of added) handle.remove();
+    return { unknown_stream, unknown_series, unsupported, invalid, limit, indicators };
+  });
+
+  expect(result).toEqual({
+    unknown_stream: "invalid_handle",
+    unknown_series: "invalid_handle",
+    unsupported: "unsupported_operation",
+    invalid: "invalid_options",
+    limit: "resource_limit",
+    indicators: 16,
+  });
 });
 
 test("trade replay clock masks retained future events and reports seek work", async ({ page }) => {

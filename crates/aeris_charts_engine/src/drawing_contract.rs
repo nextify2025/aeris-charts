@@ -315,10 +315,10 @@ impl DrawingPriceSegment {
                     "price segment {index} has a non-finite bound"
                 )));
             }
-            if let (Some(from), Some(to)) = (segment.from_time, segment.to_time) {
-                if from >= to {
-                    return Err(invalid(format!("price segment {index} is empty")));
-                }
+            if let (Some(from), Some(to)) = (segment.from_time, segment.to_time)
+                && from >= to
+            {
+                return Err(invalid(format!("price segment {index} is empty")));
             }
             if !(Self::MIN_FACTOR..=Self::MAX_FACTOR).contains(&segment.factor) {
                 return Err(invalid(format!(
@@ -1319,10 +1319,12 @@ mod tests {
         assert_eq!(levels[6].label(true, None), "1");
         assert_eq!(golden.label(false, Some("161.80")), "161.80");
         assert_eq!(golden.label(false, None), "");
-        assert!(FIBONACCI_TIME_ZONES
-            .windows(3)
-            .skip(1)
-            .all(|w| w[2] == w[0] + w[1]));
+        assert!(
+            FIBONACCI_TIME_ZONES
+                .windows(3)
+                .skip(1)
+                .all(|w| w[2] == w[0] + w[1])
+        );
     }
 
     #[test]

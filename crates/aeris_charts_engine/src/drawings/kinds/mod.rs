@@ -414,8 +414,8 @@ fn legacy_fork_segment_label(kind: DrawingKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::DrawingFamily;
-    use crate::drawings::DRAWING_TOOL_SPECS;
     use crate::DrawingKind;
+    use crate::drawings::DRAWING_TOOL_SPECS;
 
     /// The family (if any) owning each wire id: upstream's catalog has none, the ranges and the
     /// own-line tools have theirs.

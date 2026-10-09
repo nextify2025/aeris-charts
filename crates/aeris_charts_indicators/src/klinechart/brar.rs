@@ -1,7 +1,7 @@
 //! `BRAR` (情绪指标). Ported from KLineChart `src/extension/indicator/brar.ts`.
 
-use super::stepper::{fold, Out, Window};
 use super::Column;
+use super::stepper::{Out, Window, fold};
 
 /// BRAR outputs in KLineChart figure order.
 #[derive(Clone, Debug, PartialEq)]

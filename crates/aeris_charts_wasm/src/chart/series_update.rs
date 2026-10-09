@@ -3,7 +3,7 @@
 //! only decodes the JS boundary encoding and reports ingestion diagnostics.
 
 use super::*;
-use aeris_charts_core::model::data_validation::{sanitize_ohlc_owned, SanitizedOhlc};
+use aeris_charts_core::model::data_validation::{SanitizedOhlc, sanitize_ohlc_owned};
 use aeris_charts_engine::{SeriesBarPatch, SeriesUpdateOutcome, SeriesUpdateRejection};
 
 /// JS numbers are exact only up to 2^53 - 1, so a sequence beyond that cannot be monotonic.
@@ -209,13 +209,12 @@ impl ChartInner {
         };
         if let (Some(sequence), Some(last_applied)) =
             (sequence, self.engine.series_update_sequence(id as SeriesId))
+            && sequence <= last_applied
         {
-            if sequence <= last_applied {
-                return outcome_json(
-                    SeriesUpdateOutcome::StaleSequence { last_applied },
-                    Some(sequence),
-                );
-            }
+            return outcome_json(
+                SeriesUpdateOutcome::StaleSequence { last_applied },
+                Some(sequence),
+            );
         }
         let (s, diagnostics) = match sanitize_typed_batch(times, open, high, low, close) {
             Ok(batch) => batch,
