@@ -534,8 +534,7 @@ fn bind_builtin_studies(chart: &mut ChartEngine, volume: SeriesId) -> usize {
 
 /// Exchange time of the session-study workloads: a SHFE-style UTC+8 zone whose trading day opens
 /// at 21:00 the previous evening, so the default exchange study calendar does real work (an
-/// offset-schedule lookup per row and a session-open anchor per trading day) instead of reducing
-/// to UTC days.
+/// offset-schedule lookup per row) instead of reducing to UTC days.
 const STUDY_TIME_ZONE: &str = "Asia/Shanghai";
 const STUDY_SESSION_START_SECONDS: i32 = -3 * 3_600;
 

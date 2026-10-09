@@ -272,7 +272,7 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 - 破坏性：`StudyCalendarPolicy` 新增 `Exchange` 变体并派生 `Default`（默认 `Exchange`）；该枚举不是 `#[non_exhaustive]`，穷尽 `match` 的代码需要新增分支。新增 `StudyCalendarPolicy::{NAMES, name, from_name}`（线上名称 `"exchange"`、`"utc"`、`"host"`）。
 - 行为变更：`IndicatorKind::schema_definition("session_levels" | "previous_period_levels" | "opening_range", ..)` 与 `indicator_schema` 报告的 `calendar` 默认值由 `Utc` 改为 `Exchange`，选项为 `["exchange", "utc", "host"]`；反序列化缺少 `calendar` 字段的 `SessionLevels`、`PreviousPeriodLevels` 与 `OpeningRange` 时取 `Exchange`。显式传入 `Utc` 或 `Host` 的调用不受影响；交易所时间为 UTC 且交易时段起点为 0 时 `Exchange` 与 `Utc` 的输出相同。
 - 交易所时区、交易时段起点或日历日期轴变化时，`Exchange` 绑定与 VWAP、枢轴点一起经 `rebuild_calendar_indicators` 重建，宿主无需调用任何重建方法。
-- 新增方法：`aeris_charts_core::scale::exchange_time::ExchangeTime::session_open_utc(time)`（`time` 之前（含）最近一次本地交易时段起点的 UTC 时刻，开盘区间的锚点）。`aeris_charts_indicators::SessionSource` 新增 `Exchange { trading_day_seconds, session_open }` 变体（两个 `&dyn Fn(i64) -> i64`），不再派生 `Debug`，改为手写实现；穷尽匹配它的代码需要新增分支。
+- 新增方法：`aeris_charts_core::scale::exchange_time::ExchangeTime::session_open_utc(time)`（`time` 之前（含）最近一次本地交易时段起点的 UTC 时刻，开盘区间的锚点）。`aeris_charts_indicators::SessionSource` 新增 `Exchange { trading_day_seconds, session_open }` 变体（两个 `&dyn Fn(i64) -> i64`），不再派生 `Debug`，改为手写实现；穷尽匹配它的代码需要新增分支。`session_open_utc` 与 `session_open` 字段已由后续的“开盘区间锚定在时段第一根有效 K 线”分组移除。
 
 **Choppiness Chop Zone**（自有线，合并 `85bc10b` 之后的后续工作 F2(b)，所有者决定 Q-D；参见[指标计算与绑定](../architecture/data/indicators.md#广度层补全)与[兼容性](compatibility.md#已记录的不兼容变更)）。
 
@@ -302,6 +302,11 @@ GPUI 只在视图被 notify 之后才重新绘制它。gpui-fast 的保留模式
 - `ChartEngine::set_price_format_for_scale` 的含义（签名不变）。所选格式现在保留在窗格比例尺上：之后加入该比例尺的价格类系列（新系列、创建或重建的足迹图、内置/自定义/外部研究与 KLineChart 模板、窗格或比例尺移动、`rebind_price_scale_series`）采用它，成交量、百分比与自定义格式不变，已安装的价格带阶梯保留。返回值变化：窗格与比例尺存在时即返回 `true`，即使比例尺上还没有系列（此前返回 `false`）；只有未知的窗格/比例尺或无效的 `min_move` 返回 `false`。所选格式不写入持久化文档，恢复后需要重新调用。
 - 引擎构建的价格文本统一经 `format_scale_price`（crate 内部）：宿主 `priceFormatter`、比例尺所选格式、tick 网格上的品种精度、比例尺格式化器来源系列的格式、默认值。行为变更：交易标签与成交读数现在先询问宿主 `priceFormatter`（此前只看 `InstrumentMetadata::price_precision`，否则固定两位小数，从不调用宿主格式化器）；比例尺所选格式优先于品种精度；斐波那契档位价格、价格标签绘图与绘图的价格/价格变化指标此前固定两位小数，现在跟随比例尺；没有可见范围时的警报回退文本同样跟随。合并时的自有线调整：本仓库的 `drawing_price_text`（crate 内部）并入上游的 `format_drawing_price`，各族统计框、测量工具、江恩方图、预测与投影标注以及 KLineChart 价格线因此同样让比例尺所选格式优先于品种精度；比例尺的格式化器来源保留价格带阶梯时，所选格式下的交易与绘图价格按各价格带的精度输出，与该比例尺的刻度和最新值标签一致（上游没有阶梯）。
 - 坐标轴标签的放置（视觉行为变更，类型不变）。每个带框的价格坐标轴标签在一个 pass 中按持仓、订单与触发价、警报、价格线与绘图标签的优先级放置：空闲时保持精确价格，否则取最近的空闲位置；窗格过满时金融操作标签留在原价，价格线与绘图标签被省略；按优先级逆序绘制，系列簇最后绘制。此前金融操作标签不参与放置，总是位于精确坐标并可能与其他标签重叠。测量、头寸与矩形工具的价格轴投影标签在上游即属于绘图标签组。本仓库的调整仅在于：通过 `DrawingSpec.axis_price_label` 产生坐标轴标签的 KLineChart `simple_tag`、`price_line` 与十字线标签，同样按绘图标签的优先级参与。被标签遮挡的价格刻度现在以空文本出现在 `AxisFrame.labels` 中（`measure_extra` 保留其宽度，坐标轴宽度不变）；按刻度文本读取坐标轴的帧检查器或像素基线需要跳过空文本并更新基线。
+
+**开盘区间锚定在时段第一根有效 K 线**（自有线，合并 `86e2aa2` 之后的后续工作，所有者决定 2026-10-09；即移除 `ExchangeTime::session_open_utc` 的提交，可用 `git log -S'fn session_open_utc' -- crates/aeris_charts_core/src/scale/exchange_time.rs` 找到其中较新的一个；参见[开盘区间锚点](../features/studies.md#开盘区间锚点)与[兼容性](compatibility.md#已记录的不兼容变更)）。下一次 Aeris Terminal 更换固定修订时需要评审：
+
+- 行为变更（签名不变）：`SessionStudy::OpeningRange`、`session_study`、`SessionStudyState` 以及 `ChartEngine::add_opening_range` 与任何 `IndicatorKind::OpeningRange` 绑定，在 `Exchange`、`Utc` 与 `Host` 三种来源下都从时段第一根有效 K 线（开高低收均为有限值且最高不低于最低）的时间开始计时，此前分别从最近一次本地交易时段起点、UTC 午夜与宿主时段起点开始。第一根 K 线晚于时段起点的时段，以及开盘柱缺失或为空白数据的时段，输出会不同；其余时段不变。
+- 破坏性（源码级）：移除 `aeris_charts_core::scale::exchange_time::ExchangeTime::session_open_utc`；`aeris_charts_indicators::SessionSource::Exchange` 只剩 `trading_day_seconds` 字段，构造它时写出 `session_open` 的代码需要删去该字段。`SessionSource` 仍是手写 `Debug`，输出不变。
 
 **其他源码级变更。** 每一项都注明携带该变更的提交。所涉及的公共枚举均不是 `#[non_exhaustive]`，因此每新增一个变体，对穷尽的 `match` 都是编译期破坏性变更；每新增一个字段，对列出全部字段的结构体字面量也是如此。
 

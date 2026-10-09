@@ -1288,9 +1288,12 @@ export type klinechart_indicator_kind = `klinechart_${klinechart_indicator_name}
  * ({@link time_scale_options.time_zone} and {@link time_scale_options.session_start}, or the
  * declarative `timeScale.timeZone` / `timeScale.sessionStart`), the calendar VWAP resets and
  * pivots use: days, Monday weeks and months are counted on the trading date, so a night session
- * that crosses midnight belongs to the next trading day, week and month, and an opening range
- * starts at the session start. Changing the time zone or the session start recomputes these
- * studies. On a chart whose exchange time is UTC with a midnight session start it equals `utc`.
+ * that crosses midnight belongs to the next trading day, week and month. Under every calendar an
+ * opening range starts at the session's first valid bar (the later of the session start and its
+ * first bar), so a market that opens after the session start still gets one; if the opening bar is
+ * missing or whitespace, the range starts at the first valid bar. Changing the time zone or the
+ * session start recomputes these studies. On a chart whose exchange time is UTC with a midnight
+ * session start it equals `utc`.
  * `utc` groups by UTC calendar day/week/month; `host` uses spans supplied by set_study_calendar.
  */
 export type study_calendar_policy = "exchange" | "utc" | "host";

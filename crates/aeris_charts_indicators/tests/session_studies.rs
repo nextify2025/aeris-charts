@@ -691,14 +691,11 @@ fn exchange_source_with_the_utc_calendar_equals_utc_and_replays_incrementally() 
     let utc_day = |time: i64| time.div_euclid(DAY) * DAY;
     let identity = SessionSource::Exchange {
         trading_day_seconds: &utc_day,
-        session_open: &utc_day,
     };
     // A +8h exchange whose trading day starts at 21:00 local (13:00 UTC).
     let night_day = |time: i64| (time + 11 * 3_600).div_euclid(DAY) * DAY;
-    let night_open = |time: i64| (time + 11 * 3_600).div_euclid(DAY) * DAY - 11 * 3_600;
     let night = SessionSource::Exchange {
         trading_day_seconds: &night_day,
-        session_open: &night_open,
     };
     for kind in [
         SessionStudy::SessionLevels,
@@ -745,8 +742,9 @@ fn exchange_source_with_the_utc_calendar_equals_utc_and_replays_incrementally() 
         );
         assert_eq!(state.last_work_rows(), times.len());
     }
-    // The night-session opening range is anchored at 21:00 local, not at UTC midnight: the
-    // two-hour range of the trading day opened at 13:00 UTC covers 13:00 and 14:00 only.
+    // The night-session opening range is anchored at the trading day's first bar (21:00 local,
+    // 13:00 UTC) and the bar at UTC midnight stays in the same trading day: the two-hour range
+    // covers 13:00 and 14:00 only.
     let day_start = 13 * 3_600;
     let window = [day_start, day_start + 3_600, day_start + 2 * 3_600, DAY];
     let range = session_study(
@@ -770,4 +768,200 @@ fn exchange_source_with_the_utc_calendar_equals_utc_and_replays_incrementally() 
             point(12., 4., None),
         ]
     );
+}
+
+/// 15-minute bars from 01:30 UTC (09:30 in a +8h zone) for `days` days: an A-share-style
+/// market whose first bar is later than the UTC midnight or exchange session start.
+fn late_open_bars(days: i64, per_day: i64) -> Vec<i64> {
+    (0..days)
+        .flat_map(|day| (0..per_day).map(move |bar| day * 86_400 + 5_400 + bar * 900))
+        .collect()
+}
+
+#[test]
+fn opening_range_starts_at_the_first_bar_when_the_market_opens_after_the_session_start() {
+    const DAY: i64 = 86_400;
+    let times = [5_400, 6_300, 7_200, 8_100, DAY + 5_400, DAY + 7_200];
+    let highs = [10., 12., 30., 40., 20., 25.];
+    let lows = [5., 4., 1., 0., 15., 14.];
+    let closes = [7.; 6];
+    let bars = input(&times, &highs, &lows, &closes);
+    let kind = SessionStudy::OpeningRange {
+        duration_seconds: 1_800,
+    };
+    // 09:30-10:00 local: the 09:30 and 09:45 bars form the range; 10:00 and later keep it.
+    let expected = [
+        point(10., 5., None),
+        point(12., 4., None),
+        point(12., 4., None),
+        point(12., 4., None),
+        point(20., 15., None),
+        point(20., 15., None),
+    ];
+    assert_eq!(session_study(bars, SessionSource::Utc, kind), expected);
+    // The same market on a +8h exchange calendar whose session starts at local midnight.
+    let local_day = |time: i64| (time + 8 * 3_600).div_euclid(DAY) * DAY;
+    let exchange = SessionSource::Exchange {
+        trading_day_seconds: &local_day,
+    };
+    assert_eq!(session_study(bars, exchange, kind), expected);
+}
+
+#[test]
+fn opening_range_anchors_at_the_first_valid_row_after_a_whitespace_opening_bar() {
+    let times = [5_400, 6_300, 7_200, 8_100];
+    let highs = [f64::NAN, 12., 30., 40.];
+    let lows = [f64::NAN, 4., 1., 0.];
+    let closes = [f64::NAN, 7., 7., 7.];
+    let bars = input(&times, &highs, &lows, &closes);
+    let kind = SessionStudy::OpeningRange {
+        duration_seconds: 1_800,
+    };
+    // The missing 09:30 bar does not anchor: the range runs 09:45-10:15.
+    let expected = [
+        SessionStudyPoint::default(),
+        point(12., 4., None),
+        point(30., 1., None),
+        point(30., 1., None),
+    ];
+    assert_eq!(session_study(bars, SessionSource::Utc, kind), expected);
+    // A host span that opens on the whitespace row anchors at the first valid row as well.
+    let spans = [SessionSpan {
+        start: 5_400,
+        end: 9_000,
+        session_id: 1,
+    }];
+    assert_eq!(
+        session_study(bars, SessionSource::Host(&spans), kind),
+        expected
+    );
+}
+
+#[test]
+fn opening_range_reanchors_through_tip_replacement_and_checkpoint_replay() {
+    // 32 bars per session, so row 1024 (a checkpoint) is the first row of session 32.
+    let times = late_open_bars(40, 32);
+    let mut highs: Vec<_> = (0..times.len())
+        .map(|row| 100. + (row % 32) as f64)
+        .collect();
+    let mut lows: Vec<_> = (0..times.len())
+        .map(|row| 50. - (row % 32) as f64)
+        .collect();
+    let mut closes = vec![75.; times.len()];
+    let kind = SessionStudy::OpeningRange {
+        duration_seconds: 1_800,
+    };
+    let blank = |highs: &mut [f64], lows: &mut [f64], closes: &mut [f64], row: usize| {
+        highs[row] = f64::NAN;
+        lows[row] = f64::NAN;
+        closes[row] = f64::NAN;
+    };
+    let fill = |highs: &mut [f64], lows: &mut [f64], closes: &mut [f64], row: usize| {
+        highs[row] = 500. + row as f64;
+        lows[row] = 1.;
+        closes[row] = 250.;
+    };
+    let mut state = SessionStudyState::new(kind);
+    // The tip is the whitespace first row of a session, then becomes a valid bar, then blank again.
+    let tip = 3 * 32;
+    blank(&mut highs, &mut lows, &mut closes, tip);
+    let prefix = |highs: &[f64], lows: &[f64], closes: &[f64], end: usize| {
+        (
+            times[..end].to_vec(),
+            highs[..end].to_vec(),
+            lows[..end].to_vec(),
+            closes[..end].to_vec(),
+        )
+    };
+    for step in 0..3 {
+        match step {
+            1 => fill(&mut highs, &mut lows, &mut closes, tip),
+            2 => blank(&mut highs, &mut lows, &mut closes, tip),
+            _ => {}
+        }
+        let (t, h, l, c) = prefix(&highs, &lows, &closes, tip + 1);
+        let bars = input(&t, &h, &l, &c);
+        state.update(bars, SessionSource::Utc, if step == 0 { 0 } else { tip });
+        assert_eq!(
+            state.outputs(),
+            session_study(bars, SessionSource::Utc, kind),
+            "tip step {step}"
+        );
+        let expected = if step == 1 {
+            point(500. + tip as f64, 1., None)
+        } else {
+            SessionStudyPoint::default()
+        };
+        assert_eq!(state.outputs()[tip], expected, "tip step {step}");
+    }
+    // Append the next bar: with the whitespace first row, it anchors the range itself.
+    let (t, h, l, c) = prefix(&highs, &lows, &closes, tip + 3);
+    let bars = input(&t, &h, &l, &c);
+    state.update(bars, SessionSource::Utc, tip + 1);
+    assert_eq!(
+        state.outputs(),
+        session_study(bars, SessionSource::Utc, kind)
+    );
+    assert_eq!(
+        state.outputs()[tip + 1..],
+        [
+            point(highs[tip + 1], lows[tip + 1], None),
+            point(highs[tip + 2], lows[tip + 2], None)
+        ]
+    );
+    // Historical corrections of a session's first row across the 1024-row checkpoint.
+    let bars = input(&times, &highs, &lows, &closes);
+    state.update(bars, SessionSource::Utc, tip + 3);
+    assert_eq!(
+        state.outputs(),
+        session_study(bars, SessionSource::Utc, kind)
+    );
+    for (row, valid) in [(1024, false), (1024, true), (1023 - 31, false), (tip, true)] {
+        if valid {
+            fill(&mut highs, &mut lows, &mut closes, row);
+        } else {
+            blank(&mut highs, &mut lows, &mut closes, row);
+        }
+        let bars = input(&times, &highs, &lows, &closes);
+        state.update(bars, SessionSource::Utc, row);
+        let full = session_study(bars, SessionSource::Utc, kind);
+        assert_eq!(state.outputs(), full, "repair {row} valid {valid}");
+        // 09:30 (or 09:45 after a blank opening bar) through 10:00 or 10:15 local.
+        let first = if valid { row } else { row + 1 };
+        let high = highs[first].max(highs[first + 1]);
+        let low = lows[first].min(lows[first + 1]);
+        assert_eq!(full[first + 2], point(high, low, None), "repair {row}");
+        assert_eq!(full[row + 31], point(high, low, None), "repair {row}");
+    }
+
+    // 30 bars per session: session 34 opens at row 1020 and straddles the 1024-row checkpoint,
+    // whose runtime must carry the anchor (row 1021, after a whitespace opening bar).
+    let times = late_open_bars(40, 30);
+    let mut highs: Vec<_> = (0..times.len())
+        .map(|row| 100. + (row % 30) as f64)
+        .collect();
+    let mut lows = vec![10.; times.len()];
+    let mut closes = vec![50.; times.len()];
+    blank(&mut highs, &mut lows, &mut closes, 1020);
+    let kind = SessionStudy::OpeningRange {
+        duration_seconds: 2 * 3_600,
+    };
+    let mut state = SessionStudyState::new(kind);
+    state.update(input(&times, &highs, &lows, &closes), SessionSource::Utc, 0);
+    // 09:45-11:45 local covers rows 1021-1028; row 1029 (11:45) is outside.
+    for (row, high, expected) in [(1028, 900., 900.), (1029, 2_000., 900.), (1024, 950., 950.)] {
+        highs[row] = high;
+        let bars = input(&times, &highs, &lows, &closes);
+        state.update(bars, SessionSource::Utc, row);
+        assert_eq!(
+            state.outputs(),
+            session_study(bars, SessionSource::Utc, kind),
+            "straddling repair {row}"
+        );
+        assert_eq!(
+            state.outputs()[1049],
+            point(expected, 10., None),
+            "repair {row}"
+        );
+    }
 }

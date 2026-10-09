@@ -13819,7 +13819,9 @@ mod session_study_regressions {
         check(&chart, changed, &high, &low);
         assert!(chart.update_series_bar(0, 190., [29., 38., 20., 31.]));
         assert_eq!(values(&chart, levels[0]).last(), Some(&Some(38.)));
-        assert_eq!(values(&chart, opening[0]).last(), Some(&Some(36.)));
+        // Session 2's range runs from its first bar (120), not the span start (100): the 190 bar
+        // is still inside the 90-second range.
+        assert_eq!(values(&chart, opening[0]).last(), Some(&Some(38.)));
         assert_eq!(values(&chart, sma).last(), Some(&Some(37.)));
     }
 
@@ -14357,11 +14359,12 @@ mod session_study_regressions {
         let mut chart = shfe_chart();
         let opening = chart.add_opening_range(0, 3_600, StudyCalendarPolicy::Exchange);
         // Thursday's range is the first hour after Wednesday 21:00 (row 1 only); Monday's is the
-        // first hour after Friday 21:00 (row 4 only), not after the Monday day start.
+        // first hour after Friday 21:00 (row 4 only), not after the Monday day start. Wednesday's
+        // night session is not in the data, so its range starts at its first day bar (row 0).
         assert_eq!(
             values(&chart, opening[0]),
             [
-                None,
+                Some(10.),
                 Some(20.),
                 Some(20.),
                 Some(20.),
@@ -14373,13 +14376,117 @@ mod session_study_regressions {
         assert_eq!(
             values(&chart, opening[1]),
             [
-                None,
+                Some(5.),
                 Some(15.),
                 Some(15.),
                 Some(15.),
                 Some(25.),
                 Some(25.),
                 Some(25.)
+            ]
+        );
+    }
+
+    #[test]
+    fn exchange_opening_range_starts_at_the_first_bar_of_an_a_share_session() {
+        // Asia/Shanghai with the session start at local midnight: the market opens at 09:30.
+        let rows = [
+            (cst(2, 5, 9, 30), 10., 5.),
+            (cst(2, 5, 9, 45), 12., 4.),
+            (cst(2, 5, 10, 0), 30., 1.),
+            (cst(2, 5, 13, 0), 40., 0.),
+            (cst(2, 6, 9, 30), 20., 15.),
+            (cst(2, 6, 9, 45), 19., 14.),
+            (cst(2, 6, 10, 0), 50., 2.),
+        ];
+        let times = rows.iter().map(|row| row.0).collect::<Vec<_>>();
+        let high = rows.iter().map(|row| row.1).collect::<Vec<_>>();
+        let low = rows.iter().map(|row| row.2).collect::<Vec<_>>();
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        install(&mut chart, &times, &high, &low);
+        assert!(chart.set_time_zone("Asia/Shanghai").unwrap());
+        assert_eq!(chart.exchange_time.session_start_seconds(), 0);
+        let opening = chart.add_opening_range(0, 1_800, StudyCalendarPolicy::Exchange);
+        // 09:30-10:00 local: the 09:30 and 09:45 bars set the levels, which stay fixed after 10:00.
+        assert_eq!(
+            values(&chart, opening[0]),
+            [
+                Some(10.),
+                Some(12.),
+                Some(12.),
+                Some(12.),
+                Some(20.),
+                Some(20.),
+                Some(20.)
+            ]
+        );
+        assert_eq!(
+            values(&chart, opening[1]),
+            [
+                Some(5.),
+                Some(4.),
+                Some(4.),
+                Some(4.),
+                Some(15.),
+                Some(14.),
+                Some(14.)
+            ]
+        );
+        // A live 10:15 bar leaves the range fixed.
+        assert!(chart.update_series_bar(0, cst(2, 6, 10, 15), [30., 60., 1., 30.]));
+        assert_eq!(values(&chart, opening[0]).last(), Some(&Some(20.)));
+        assert_eq!(values(&chart, opening[1]).last(), Some(&Some(14.)));
+    }
+
+    #[test]
+    fn exchange_opening_range_without_a_night_session_starts_at_the_first_day_bar() {
+        // SHFE around the 2024 Spring Festival: no night session before Thursday Feb 8 (the chart
+        // starts there) or before Monday Feb 19, the first trading day after the holiday.
+        let rows = [
+            (cst(2, 8, 9, 0), 10., 5.),
+            (cst(2, 8, 9, 30), 12., 4.),
+            (cst(2, 8, 10, 0), 30., 1.),
+            (cst(2, 19, 9, 0), 20., 15.),
+            (cst(2, 19, 9, 30), 22., 14.),
+            (cst(2, 19, 10, 0), 40., 2.),
+            (cst(2, 19, 21, 0), 50., 45.), // Monday night opens Tuesday Feb 20 at 21:00
+            (cst(2, 19, 21, 30), 51., 44.),
+            (cst(2, 19, 22, 0), 90., 10.),
+        ];
+        let times = rows.iter().map(|row| row.0).collect::<Vec<_>>();
+        let high = rows.iter().map(|row| row.1).collect::<Vec<_>>();
+        let low = rows.iter().map(|row| row.2).collect::<Vec<_>>();
+        let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
+        install(&mut chart, &times, &high, &low);
+        assert!(chart.set_time_zone("Asia/Shanghai").unwrap());
+        chart.set_session_start_seconds(-3 * 3_600).unwrap();
+        let opening = chart.add_opening_range(0, 3_600, StudyCalendarPolicy::Exchange);
+        assert_eq!(
+            values(&chart, opening[0]),
+            [
+                Some(10.),
+                Some(12.),
+                Some(12.),
+                Some(20.),
+                Some(22.),
+                Some(22.),
+                Some(50.),
+                Some(51.),
+                Some(51.)
+            ]
+        );
+        assert_eq!(
+            values(&chart, opening[1]),
+            [
+                Some(5.),
+                Some(4.),
+                Some(4.),
+                Some(15.),
+                Some(14.),
+                Some(14.),
+                Some(45.),
+                Some(44.),
+                Some(44.)
             ]
         );
     }

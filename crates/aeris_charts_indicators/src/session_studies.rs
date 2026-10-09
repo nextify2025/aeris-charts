@@ -12,12 +12,10 @@ pub enum SessionSource<'a> {
     /// Exchange trading days. `trading_day_seconds` maps a timestamp to the UTC-midnight seconds
     /// of its trading date (identity on UTC days = the `Utc` source); days, Monday weeks and civil
     /// months are counted on that date, so a night session that crosses midnight belongs to the
-    /// next trading day, week and month. `session_open` maps the first row of a trading day to
-    /// the instant its session opened (the opening-range anchor). Both are evaluated per row in
-    /// O(1) or O(log transitions); neither retains the input.
+    /// next trading day, week and month. Evaluated per row in O(1) or O(log transitions); it
+    /// does not retain the input.
     Exchange {
         trading_day_seconds: &'a dyn Fn(i64) -> i64,
-        session_open: &'a dyn Fn(i64) -> i64,
     },
 }
 
@@ -62,7 +60,11 @@ pub enum SessionStudy {
     SessionLevels,
     /// Completed period levels become available only on the first row of the next period.
     PreviousPeriodLevels(PreviousPeriod),
-    /// Running high and low until the elapsed wall-clock duration expires, then fixed.
+    /// Running high and low until the elapsed wall-clock duration expires, then fixed. The
+    /// duration counts from the session's first valid bar: every bar of a session is at or after
+    /// its start, so this is the later of the session start and its first bar, and a market that
+    /// opens after the configured start (or a session whose opening bar is missing) still gets a
+    /// range.
     OpeningRange { duration_seconds: i64 },
 }
 
@@ -164,8 +166,9 @@ impl HostCursor {
 struct Runtime {
     host: HostCursor,
     active_key: Option<i64>,
-    /// Opening instant of the active session (the opening-range anchor), fixed on its first row.
-    session_open: i128,
+    /// Time of the active session's first valid row (the opening-range anchor); `None` until one
+    /// arrives, so whitespace rows never anchor.
+    anchor: Option<i64>,
     aggregate: Option<Aggregate>,
     previous: Option<Aggregate>,
 }
@@ -179,29 +182,22 @@ impl Runtime {
         row: usize,
     ) -> SessionStudyPoint {
         let time = input.times[row];
-        // The session's opening instant: known per row for UTC days and host spans, and taken
-        // from the first row of an exchange trading day (its local session start).
-        let (session_key, open, day) = match source {
+        let (session_key, day) = match source {
             SessionSource::Host(spans) => {
                 let Some(group) = self.host.at(spans, time) else {
                     return SessionStudyPoint::default();
                 };
-                (
-                    group.ordinal as i64,
-                    Some(i128::from(group.start)),
-                    (group.end - 1).div_euclid(86_400),
-                )
+                (group.ordinal as i64, (group.end - 1).div_euclid(86_400))
             }
             SessionSource::Utc => {
                 let day = time.div_euclid(86_400);
-                (day, Some(i128::from(day) * 86_400), day)
+                (day, day)
             }
             SessionSource::Exchange {
                 trading_day_seconds,
-                ..
             } => {
                 let day = trading_day_seconds(time).div_euclid(86_400);
-                (day, None, day)
+                (day, day)
             }
         };
         let key = match kind {
@@ -218,11 +214,8 @@ impl Runtime {
             }
             self.active_key = Some(key);
             self.aggregate = None;
-            if let SessionSource::Exchange { session_open, .. } = source {
-                self.session_open = i128::from(session_open(time));
-            }
+            self.anchor = None;
         }
-        let start = open.unwrap_or(self.session_open);
         let (open, high, low, close) = (
             input.open[row],
             input.high[row],
@@ -239,7 +232,9 @@ impl Runtime {
         }
         let include = match kind {
             SessionStudy::OpeningRange { duration_seconds } => {
-                duration_seconds > 0 && i128::from(time) - start < i128::from(duration_seconds)
+                let anchor = *self.anchor.get_or_insert(time);
+                duration_seconds > 0
+                    && i128::from(time) - i128::from(anchor) < i128::from(duration_seconds)
             }
             _ => true,
         };

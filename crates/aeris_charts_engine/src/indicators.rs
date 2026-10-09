@@ -5005,13 +5005,11 @@ impl ChartEngine {
         let end = self.indicator_data_end(index, rows, full_replace);
         let exchange_time = &self.exchange_time;
         let trading_day_seconds = |time| exchange_time.trading_day_seconds(time);
-        let session_open = |time| exchange_time.session_open_utc(time);
         let session_source = match self.indicators[index].calendar {
             Some(StudyCalendarPolicy::Host) => SessionSource::Host(&self.study_calendar_spans),
             Some(StudyCalendarPolicy::Utc) => SessionSource::Utc,
             _ => SessionSource::Exchange {
                 trading_day_seconds: &trading_day_seconds,
-                session_open: &session_open,
             },
         };
         let kind = session_study_kind(&self.indicators[index].kind).expect("session kind");

@@ -35,11 +35,11 @@
 - 公允价值缺口由三根 K 线确认：第三根的低点高于第一根的高点（多头），或第三根的高点低于第一根的低点（空头），且缺口大于 `min_size`。
 - 订单块是确认的结构突破之前最后一根反向 K 线，区域取其影线（`zone: "wick"`）或实体（`"body"`）；向前搜索最多 `MAX_ORDER_BLOCK_SEARCH_ROWS`（500）行。
 - 区域在价格触及（`touch`）、穿过一半（`half`）或完全穿过（`full`）时被缓解，比较价格为影线或收盘价（`mitigation_price`）。每侧最多 64 个活动区域（`max_active` 为 1 到 64）；超出时最旧的区域在该行退役（`retired: true`），仍保留在历史中。`show_mitigated` 决定已缓解与已退役的区域是否继续绘制。
-- 交易时段高低点在每个交易所交易日、UTC 日或宿主时段内持续发展（取决于[时段日历](#时段日历)）。上一周期水平只在下一周期的第一行开始提供。开盘区间从时段开始起持续 `duration_seconds` 秒发展，之后保持不变直到时段结束。
+- 交易时段高低点在每个交易所交易日、UTC 日或宿主时段内持续发展（取决于[时段日历](#时段日历)）。上一周期水平只在下一周期的第一行开始提供。开盘区间从时段内第一根有效 K 线起持续 `duration_seconds` 秒发展（即时段起点与该时段第一根 K 线中较晚的一个，见[开盘区间锚点](#开盘区间锚点)），之后保持不变直到时段结束。
 
 ## 空白数据
 
-时段研究遵循本仓库的空白数据契约：非有限或不完整的 OHLC 行不产生点，也不影响累计的水平，如同该行不存在。上一周期水平只把有效行视为观测到的周期数据：整个交易日、周、月或宿主时段都是空白数据时，它不发布新的聚合，下一个有效周期沿用最后一个观测到的周期的水平（上游 `4cfea16`）；交易时段高低点与开盘区间只由当前时段的有效行发展。
+时段研究遵循本仓库的空白数据契约：非有限或不完整的 OHLC 行不产生点，也不影响累计的水平，如同该行不存在。上一周期水平只把有效行视为观测到的周期数据：整个交易日、周、月或宿主时段都是空白数据时，它不发布新的聚合，下一个有效周期沿用最后一个观测到的周期的水平（上游 `4cfea16`）；交易时段高低点与开盘区间只由当前时段的有效行发展，空白数据行也不确定开盘区间的锚点。
 
 结构研究按柱计数：空白数据行位于枢轴窗口中时，该窗口不确认摆动点，而不是像窗口类指标那样跳过该行，这是上游的规则，本仓库保留。空白数据行本身不输出任何值；摆动点在空白数据行上不延续阶梯水平（这一行为与上游 `ef97955` 相同，合并时提前采用，因为本仓库的运行时在数据末端停止，若空白行仍输出阶梯值，增量结果会与重新安装不一致）。
 
@@ -65,11 +65,9 @@
 
 时段研究带有日历策略：
 
-- `exchange`（默认，所有者决定 Q-A）：图表的交易所日历，即 `timeScale.timeZone`（或顶层 `timezone`）与 `timeScale.sessionStart` 决定的交易日，与 VWAP 重置和枢轴点使用同一个 `ExchangeTime`。日、从周一开始的周与自然月都按交易日的日期计数：跨越午夜的夜盘属于下一个交易日，也属于该交易日所在的周与月；在负的交易时段起点下，周五夜盘属于下周一的交易日，因此也属于下一周。开盘区间从该交易日第一行之前（含）最近一次本地交易时段起点开始计时（`ExchangeTime::session_open_utc`）：上期所式 21:00 夜盘从当晚 21:00 开始，CME 式周日 17:00 开盘从周日开始，而不是被周末回滚到周五。交易所时间为 UTC 且交易时段起点为 0 时，它与 `utc` 的结果逐行相同。
+- `exchange`（默认，所有者决定 Q-A）：图表的交易所日历，即 `timeScale.timeZone`（或顶层 `timezone`）与 `timeScale.sessionStart` 决定的交易日，与 VWAP 重置和枢轴点使用同一个 `ExchangeTime`。日、从周一开始的周与自然月都按交易日的日期计数：跨越午夜的夜盘属于下一个交易日，也属于该交易日所在的周与月；在负的交易时段起点下，周五夜盘属于下周一的交易日，因此也属于下一周。开盘区间从该交易日第一根有效 K 线开始计时（见[开盘区间锚点](#开盘区间锚点)）：上期所式 21:00 夜盘从当晚 21:00 的第一根柱开始，CME 式周日 17:00 开盘从周日晚上的第一根柱开始。交易所时间为 UTC 且交易时段起点为 0 时，它与 `utc` 的结果逐行相同。
 - `utc`：UTC 自然日、从周一开始的 UTC 周与 UTC 月。它不读取图表的交易所时区与交易时段起点。
 - `host`：使用宿主通过 `set_study_calendar` 提供的时段。日历最多 20,000 个有序、不相交的区间，校验失败时原子拒绝并保留原日历；相邻且 `session_id` 相同的区间合并为一个时段，未被覆盖的行不属于任何时段（不输出）。宿主时段的交易日取其最后一个包含秒的 UTC 日期，用于上一周期的周与月。宿主可以用 `resample_boundaries` 从交易所时段窗口生成这些区间，无需另写边界逻辑。
-
-`exchange` 的开盘区间锚定在交易时段起点，而不是数据中的第一根柱：交易时段起点为 0 的 A 股图表上，开盘区间从本地午夜开始计时，09:30 的第一根柱已在区间之外；某个交易日没有夜盘（例如长假后的第一个交易日）时，同样没有开盘区间。需要按真实开盘时刻计算时，宿主应把 `sessionStart` 设为开盘时刻，或使用 `host` 策略提供精确的交易时段。
 
 `exchange` 与 `utc` 策略每行只做常数次（或按时区转换点个数取对数次）的日期计算，不保存任何日历数据；追加与修订正在形成的柱仍只处理一行。
 
@@ -78,6 +76,14 @@
 宿主日历只在运行时存在：它不进入导出的文档，导入不会清除或恢复它，`clear_study_calendar` 清空它。替换或清空宿主日历会从第一行重建每个 `host` 策略的绑定及其依赖的研究，然后重新同步时间点，使用的是同一个引擎函数（`rebuild_calendar_indicators`）。`exchange` 与 `utc` 绑定不受影响。
 
 日历策略属于绑定定义，随 V3 文档持久化（`"exchange"`、`"utc"` 或 `"host"`）；缺少该字段的文档读作 `exchange`。默认值在合并上游后的后续工作 F2(a) 中由 `utc` 改为 `exchange`，兼容性说明见[兼容性](../api/compatibility.md)。
+
+### 开盘区间锚点
+
+开盘区间锚定在时段起点与该时段第一根 K 线中较晚的一个（所有者决定，2026-10-09），三种日历规则相同。时段内的每根 K 线都不早于时段起点（`host` 时段只包含区间内的行，`utc` 日从 UTC 午夜开始，`exchange` 交易日从本地交易时段起点开始），因此锚点就是该时段第一根有效 K 线（开高低收均为有限值且最高不低于最低）的时间；空白数据行不确定锚点。一行满足“该行时间减锚点小于 `duration_seconds`”时计入开盘区间。
+
+因此开盘晚于配置起点的市场无需额外配置即有开盘区间：交易时段起点为 0 的 A 股图表从 09:30 的第一根柱开始计时，`utc` 日历上 UTC 午夜（北京时间 08:00）之后的 A 股交易日同样如此；没有夜盘的交易日（例如长假后的第一个交易日，或图表数据从日盘开始的第一天）从日盘第一根柱开始计时。所有者接受的代价是：开盘那根柱缺失或为空白数据时，区间从第一根存在的有效柱开始，整个区间随之后移，而不是从真实开盘时刻开始。
+
+锚点是时段状态的一部分，随 1,024 行检查点与尾部状态一起保存；修订使某个时段的第一行在空白与有效之间变化时，从检查点或尾部状态的重放会重新确定锚点，结果与全量重算一致。
 
 ## 注释只用于显示
 
@@ -93,9 +99,8 @@
 
 ## 验证
 
-- `aeris_charts_indicators`：`structure_studies` 与 `study_annotations` 的单元测试、`tests/session_studies.rs`（批量与增量、检查点、宿主时段、交易所日历、周与月）。
-- `aeris_charts_core`：`session_open_is_the_latest_local_session_start_at_or_before_the_time`。
-- 引擎：`structure_engine_tests`、`annotation_binding_tests`、`session_study_regressions`、`study_segment_tests`、`calendar_replacement_*`、`structure_and_session_slot_fill_ticks_take_the_tail_path`、`structure_studies_refuse_as_of_sources_atomically`、`study_outputs_report_warmup_and_no_fixed_convergence`、`structure_anchors_show_no_legend_value_and_are_never_hit`、`exchange_calendar_*` 与 `exchange_time_changes_rebuild_every_exchange_study_in_one_operation`（上期所式夜盘的周与月、UTC 图表上与 `utc` 相同、时区与交易时段起点变化的一次重建、V3 往返），以及包含七个研究的空白数据、随机变更与有界工作量测试。
+- `aeris_charts_indicators`：`structure_studies` 与 `study_annotations` 的单元测试、`tests/session_studies.rs`（批量与增量、检查点、宿主时段、交易所日历、周与月；其中 `opening_range_*` 覆盖首根柱晚于时段起点（UTC 日历与 +8 小时、起点为 0 的交易所日历）、首行为空白数据时锚定在第一根有效行、修订当前柱使时段首行在空白与有效之间切换，以及跨越 1,024 行检查点的重放）。
+- 引擎：`structure_engine_tests`、`annotation_binding_tests`、`session_study_regressions`、`study_segment_tests`、`calendar_replacement_*`、`structure_and_session_slot_fill_ticks_take_the_tail_path`、`structure_studies_refuse_as_of_sources_atomically`、`study_outputs_report_warmup_and_no_fixed_convergence`、`structure_anchors_show_no_legend_value_and_are_never_hit`、`exchange_calendar_*`、`exchange_opening_range_*` 与 `exchange_time_changes_rebuild_every_exchange_study_in_one_operation`（上期所式夜盘的周与月、A 股式 09:30 开盘与长假后无夜盘交易日的开盘区间、UTC 图表上与 `utc` 相同、时区与交易时段起点变化的一次重建、V3 往返），以及包含七个研究的空白数据、随机变更与有界工作量测试。
 - 浏览器：`study-foundation`、`structure-studies`、`session-studies`（含交易所日历的夜盘周与月及时区变化）、`study-replay`、`indicator-catalog` 与 `persistence`（V3 文档中 `exchange` 日历的往返，以及缺少日历字段时读作 `exchange`）规格。
 - 性能：`perf_gate` 的 Target M（studies）在 1,000,000 行上对追加与预先安装的时段槽位计时，并要求每个 Tick 的扫描行数为常数且每个绑定都有报告；Target T 在 1,000,000 行上测量七个研究同时绑定时的末端替换 p99、一次回溯 20,000 行的历史修正，以及一次交易所时区变化对三个时段研究的整段重建。两者的时段研究都使用默认的 `exchange` 日历，图表为 `Asia/Shanghai` 时区、交易时段起点 −3 小时（见[性能契约](../development/performance.md#指标与绘图性能目标)）。Target V 在 10,000 与 1,000,000 行上测量每一种 `IndicatorKind`（含结构与时段研究、KDJ 与 KLineChart 模板）的末端追加与替换 p99：每个绑定 0.5 ms 以内，全部同时绑定 4 ms 以内，增长不超过 10 倍（见[性能契约](../development/performance.md#指标与绘图性能目标)）。
 
