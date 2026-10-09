@@ -5,11 +5,44 @@
 //! plugin registry.  New built-in tools should describe their placement/editing invariants here
 //! and keep only genuinely tool-specific geometry/math in the drawing engine.
 //!
-//! Wire ids are reserved per family so parallel family work never collides:
-//! core 0..=31, lines 32..=47, channels 48..=63, fibonacci 64..=95, pitchforks_gann 96..=127,
-//! projection_annotations 128..=159, patterns_elliott_cycles 160..=191, shapes 192..=223, and
-//! 224..=255 unassigned. B8 family tools define their `DrawingToolSpec` constants in their own
-//! `kinds/<family>.rs` module; this file lists them inside that family's reserved block.
+//! Wire ids: `0..=84` is AerisTerminal upstream's contiguous catalog, in upstream order, and
+//! upstream appends new tools from 85. The own-line tools (not in upstream) take the top of the
+//! `u8` space, `240..=246`, so upstream's contiguous growth never collides with them. Ids only
+//! cross the JS/wasm boundary in-process; persisted documents carry tool names, so an id is never
+//! stored. Legacy fork tool names are input-only aliases (`LEGACY_DRAWING_KIND_NAMES`).
+//!
+//! Renderer ownership follows `spec().family`: `None` for every upstream kind except the three
+//! measuring ranges (wire ids `13..=15`), which take upstream's `geometry.rs` body resolver, frame
+//! arm, and hit code; `Some` for those three ranges and the own-line tools, whose constants live in
+//! their `kinds/<family>.rs` module.
+
+// ponytail: fork renderer extras retired by the upstream B8 sync and not yet re-applied on
+// upstream's lowering (their options stay stored but inert). Lines: the one engine-formatted stats
+// box every line tool's `labels` rendered as (InfoLine's five-stat box and stats_position included;
+// each visible label now prints on its own line through upstream's label path, with the date range
+// and duration still engine-formatted), TrendAngle's arc and reference line, the fork arrowhead
+// geometry, and a ray's `extend_*` toggles (upstream's ray is always a ray). Channels: the parallel
+// channel's middle line, flat_top_bottom's crossing split, regression asymmetric and toggled
+// deviations (folded into one symmetric `regression_deviations` at the wider enabled side, a lossy
+// conversion), OHLC source selection, Pearson's R, fit-line handles, and time-only regression
+// moves (upstream's anchors are free handles, so a regression moves on both axes). Fibonacci:
+// per-level palette lines, dashed trend line, fan grid, full circles, vertical label alignment,
+// phi spiral, and level labels and selected bands as hit targets. Pitchforks and Gann: zone fills
+// as selected hit targets, base-midpoint handle, Gann box time levels and angles, square stats box,
+// fan scale ratio, fixed-square size and corner handle, price-basis rescale. Patterns: harmonic
+// ratio connectors and labels, point labels as hit targets, shaded XABCD triangles,
+// head-and-shoulders neckline, triangle apex extension, 12-degree Elliott notation, show_wave,
+// progressive previews. Annotations: projection sector, note pin and reveal-on-focus, price-note
+// leader, speech bubbles, the default texts of new annotations ("Note", "Callout", ...), signpost
+// pole and its editor on placement (upstream's signpost is a two-anchor marker that opens none),
+// arrow-mark text, multi-line family boxes for note/comment/callout/price_note/anchored_text,
+// bars-pattern box fit and LOD aggregation, the forecast's source and target boxes (absolute
+// change, Success/Failure on market colors, the box as a hit target; the target time stays, one
+// line above upstream's outcome label). Shapes: symmetric rotated rectangle and width handles,
+// ellipse bounds handles, on-curve anchors with tangent extension and chord fills, closed
+// polylines, clip-aware flattening. Re-applied on upstream's lowering instead: channel
+// `extend_*`, the callout's tip and box handles, the highlighter's once-filled tube, and the
+// regression trend's dashed anchor segment while it has no fit.
 
 use super::kinds::DrawingFamily;
 use super::DrawingKind;
@@ -119,6 +152,7 @@ pub(crate) enum DrawingLogicalExtent {
     Finite,
     Full,
     FromFirst,
+    Ray,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -472,7 +506,329 @@ const ANCHORED_VWAP: DrawingToolSpec = DrawingToolSpec {
     axis_tag_text: false,
 };
 
-/// Every built-in tool. B8 families append only inside their own reserved block.
+const fn line_spec(kind: DrawingKind, wire_id: u8, name: &'static str) -> DrawingToolSpec {
+    DrawingToolSpec {
+        kind,
+        wire_id,
+        name,
+        ..TREND_LINE
+    }
+}
+
+const RAY: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Ray,
+    price_extent: DrawingPriceExtent::Full,
+    ..line_spec(DrawingKind::Ray, 16, "ray")
+};
+const EXTENDED_LINE: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Full,
+    price_extent: DrawingPriceExtent::Full,
+    ..line_spec(DrawingKind::ExtendedLine, 17, "extended_line")
+};
+const INFO_LINE: DrawingToolSpec = line_spec(DrawingKind::InfoLine, 18, "info_line");
+const TREND_ANGLE: DrawingToolSpec = line_spec(DrawingKind::TrendAngle, 19, "trend_angle");
+const CROSS_LINE: DrawingToolSpec = DrawingToolSpec {
+    kind: DrawingKind::CrossLine,
+    wire_id: 20,
+    name: "cross_line",
+    placement: DrawingPlacement::ClickAnchors { count: 1 },
+    straighten: DrawingStraightenMode::None,
+    logical_extent: DrawingLogicalExtent::Full,
+    price_extent: DrawingPriceExtent::Full,
+    text_layout: DrawingTextLayout::Box,
+    axis_price_label: true,
+    ..TREND_LINE
+};
+const ARROW_LINE: DrawingToolSpec = line_spec(DrawingKind::ArrowLine, 21, "arrow_line");
+
+const fn channel_spec(
+    kind: DrawingKind,
+    wire_id: u8,
+    name: &'static str,
+    anchors: u8,
+) -> DrawingToolSpec {
+    DrawingToolSpec {
+        kind,
+        wire_id,
+        name,
+        placement: DrawingPlacement::ClickAnchors { count: anchors },
+        straighten: DrawingStraightenMode::None,
+        price_extent: DrawingPriceExtent::Full,
+        default_width: 1.0,
+        ..TREND_LINE
+    }
+}
+
+const PARALLEL_CHANNEL: DrawingToolSpec =
+    channel_spec(DrawingKind::ParallelChannel, 22, "parallel_channel", 3);
+const REGRESSION_TREND: DrawingToolSpec = DrawingToolSpec {
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(DrawingKind::RegressionTrend, 23, "regression_trend", 2)
+};
+const FLAT_TOP_CHANNEL: DrawingToolSpec =
+    channel_spec(DrawingKind::FlatTopChannel, 24, "flat_top_channel", 3);
+const FLAT_BOTTOM_CHANNEL: DrawingToolSpec =
+    channel_spec(DrawingKind::FlatBottomChannel, 25, "flat_bottom_channel", 3);
+const DISJOINT_CHANNEL: DrawingToolSpec =
+    channel_spec(DrawingKind::DisjointChannel, 26, "disjoint_channel", 4);
+const POLYLINE: DrawingToolSpec = DrawingToolSpec {
+    kind: DrawingKind::Polyline,
+    wire_id: 34,
+    name: "polyline",
+    ..PATH
+};
+const HIGHLIGHTER: DrawingToolSpec = DrawingToolSpec {
+    kind: DrawingKind::Highlighter,
+    wire_id: 35,
+    name: "highlighter",
+    default_width: 12.0,
+    ..BRUSH
+};
+
+const fn shape_spec(
+    kind: DrawingKind,
+    wire_id: u8,
+    name: &'static str,
+    count: u8,
+) -> DrawingToolSpec {
+    DrawingToolSpec {
+        kind,
+        wire_id,
+        name,
+        placement: DrawingPlacement::ClickAnchors { count },
+        straighten: DrawingStraightenMode::None,
+        default_width: 1.0,
+        text_layout: DrawingTextLayout::Box,
+        ..TREND_LINE
+    }
+}
+
+const ROTATED_RECTANGLE: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Full,
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(DrawingKind::RotatedRectangle, 27, "rotated_rectangle", 3)
+};
+const ELLIPSE: DrawingToolSpec = shape_spec(DrawingKind::Ellipse, 28, "ellipse", 2);
+const CIRCLE: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Full,
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(DrawingKind::Circle, 29, "circle", 2)
+};
+const TRIANGLE: DrawingToolSpec = shape_spec(DrawingKind::Triangle, 30, "triangle", 3);
+const ARC: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Full,
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(DrawingKind::Arc, 31, "arc", 3)
+};
+const CURVE: DrawingToolSpec = shape_spec(DrawingKind::Curve, 32, "curve", 3);
+const DOUBLE_CURVE: DrawingToolSpec = shape_spec(DrawingKind::DoubleCurve, 33, "double_curve", 4);
+const FIBONACCI_RETRACEMENT: DrawingToolSpec = DrawingToolSpec {
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(
+        DrawingKind::FibonacciRetracement,
+        36,
+        "fibonacci_retracement",
+        2,
+    )
+};
+const FIBONACCI_EXTENSION: DrawingToolSpec = DrawingToolSpec {
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(
+        DrawingKind::FibonacciExtension,
+        37,
+        "fibonacci_extension",
+        3,
+    )
+};
+const FIBONACCI_CHANNEL: DrawingToolSpec = DrawingToolSpec {
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(DrawingKind::FibonacciChannel, 38, "fibonacci_channel", 3)
+};
+const FIBONACCI_TIME_ZONES: DrawingToolSpec = DrawingToolSpec {
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(
+        DrawingKind::FibonacciTimeZones,
+        39,
+        "fibonacci_time_zones",
+        2,
+    )
+};
+const FIBONACCI_TREND_TIME: DrawingToolSpec = DrawingToolSpec {
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(
+        DrawingKind::FibonacciTrendTime,
+        40,
+        "fibonacci_trend_time",
+        3,
+    )
+};
+const FIBONACCI_SPEED_FAN: DrawingToolSpec = DrawingToolSpec {
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(DrawingKind::FibonacciSpeedFan, 41, "fibonacci_speed_fan", 2)
+};
+const FIBONACCI_SPEED_ARCS: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Full,
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(
+        DrawingKind::FibonacciSpeedArcs,
+        42,
+        "fibonacci_speed_arcs",
+        2,
+    )
+};
+const FIBONACCI_CIRCLES: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Full,
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(DrawingKind::FibonacciCircles, 43, "fibonacci_circles", 2)
+};
+const FIBONACCI_SPIRAL: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Full,
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(DrawingKind::FibonacciSpiral, 44, "fibonacci_spiral", 2)
+};
+const FIBONACCI_WEDGE: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Full,
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(DrawingKind::FibonacciWedge, 45, "fibonacci_wedge", 3)
+};
+const fn pitchfork_spec(kind: DrawingKind, wire_id: u8, name: &'static str) -> DrawingToolSpec {
+    DrawingToolSpec {
+        logical_extent: DrawingLogicalExtent::Full,
+        price_extent: DrawingPriceExtent::Full,
+        ..shape_spec(kind, wire_id, name, 3)
+    }
+}
+const ANDREWS_PITCHFORK: DrawingToolSpec =
+    pitchfork_spec(DrawingKind::AndrewsPitchfork, 46, "andrews_pitchfork");
+const SCHIFF_PITCHFORK: DrawingToolSpec =
+    pitchfork_spec(DrawingKind::SchiffPitchfork, 47, "schiff_pitchfork");
+const MODIFIED_SCHIFF_PITCHFORK: DrawingToolSpec = pitchfork_spec(
+    DrawingKind::ModifiedSchiffPitchfork,
+    48,
+    "modified_schiff_pitchfork",
+);
+const INSIDE_PITCHFORK: DrawingToolSpec =
+    pitchfork_spec(DrawingKind::InsidePitchfork, 49, "inside_pitchfork");
+const PITCHFAN: DrawingToolSpec = pitchfork_spec(DrawingKind::Pitchfan, 50, "pitchfan");
+const PATTERN_XABCD: DrawingToolSpec =
+    shape_spec(DrawingKind::PatternXabcd, 51, "pattern_xabcd", 5);
+const PATTERN_CYPHER: DrawingToolSpec =
+    shape_spec(DrawingKind::PatternCypher, 52, "pattern_cypher", 5);
+const PATTERN_ABCD: DrawingToolSpec = shape_spec(DrawingKind::PatternAbcd, 53, "pattern_abcd", 4);
+const PATTERN_HEAD_SHOULDERS: DrawingToolSpec = shape_spec(
+    DrawingKind::PatternHeadShoulders,
+    54,
+    "pattern_head_shoulders",
+    7,
+);
+const PATTERN_TRIANGLE: DrawingToolSpec =
+    shape_spec(DrawingKind::PatternTriangle, 55, "pattern_triangle", 5);
+const PATTERN_THREE_DRIVES: DrawingToolSpec = shape_spec(
+    DrawingKind::PatternThreeDrives,
+    56,
+    "pattern_three_drives",
+    6,
+);
+const ELLIOTT_IMPULSE: DrawingToolSpec =
+    shape_spec(DrawingKind::ElliottImpulse, 57, "elliott_impulse", 6);
+const ELLIOTT_CORRECTION: DrawingToolSpec =
+    shape_spec(DrawingKind::ElliottCorrection, 58, "elliott_correction", 4);
+const ELLIOTT_TRIANGLE: DrawingToolSpec =
+    shape_spec(DrawingKind::ElliottTriangle, 59, "elliott_triangle", 6);
+const ELLIOTT_DOUBLE_COMBINATION: DrawingToolSpec = shape_spec(
+    DrawingKind::ElliottDoubleCombination,
+    60,
+    "elliott_double_combination",
+    4,
+);
+const ELLIOTT_TRIPLE_COMBINATION: DrawingToolSpec = shape_spec(
+    DrawingKind::ElliottTripleCombination,
+    61,
+    "elliott_triple_combination",
+    6,
+);
+const CYCLIC_LINES: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Full,
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(DrawingKind::CyclicLines, 62, "cyclic_lines", 2)
+};
+const TIME_CYCLES: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Ray,
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(DrawingKind::TimeCycles, 63, "time_cycles", 2)
+};
+// The wave swings as far below its first anchor as the second sits above it, past the anchors'
+// price box, so only its time side bounds it.
+const SINE_LINE: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Ray,
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(DrawingKind::SineLine, 64, "sine_line", 2)
+};
+const ARROW_MARKER_UP: DrawingToolSpec =
+    shape_spec(DrawingKind::ArrowMarkerUp, 65, "arrow_marker_up", 1);
+const ARROW_MARKER_DOWN: DrawingToolSpec =
+    shape_spec(DrawingKind::ArrowMarkerDown, 66, "arrow_marker_down", 1);
+const ARROW_MARKER_LEFT: DrawingToolSpec =
+    shape_spec(DrawingKind::ArrowMarkerLeft, 67, "arrow_marker_left", 1);
+const ARROW_MARKER_RIGHT: DrawingToolSpec =
+    shape_spec(DrawingKind::ArrowMarkerRight, 68, "arrow_marker_right", 1);
+const FLAG_MARK: DrawingToolSpec = shape_spec(DrawingKind::FlagMark, 69, "flag_mark", 1);
+const SIGNPOST: DrawingToolSpec = shape_spec(DrawingKind::Signpost, 70, "signpost", 2);
+const fn text_annotation_spec(
+    kind: DrawingKind,
+    wire_id: u8,
+    name: &'static str,
+    count: u8,
+) -> DrawingToolSpec {
+    DrawingToolSpec {
+        kind,
+        wire_id,
+        name,
+        placement: DrawingPlacement::ClickAnchors { count },
+        requests_text_editor: true,
+        ..TEXT
+    }
+}
+const NOTE: DrawingToolSpec = text_annotation_spec(DrawingKind::Note, 71, "note", 1);
+const COMMENT: DrawingToolSpec = text_annotation_spec(DrawingKind::Comment, 72, "comment", 1);
+// The tip and the box each keep a handle (the own line's callout editing; upstream's text
+// annotations have none), so the leader's tip moves without moving the box.
+const CALLOUT: DrawingToolSpec = DrawingToolSpec {
+    handles: DrawingHandleMode::Anchors,
+    ..text_annotation_spec(DrawingKind::Callout, 73, "callout", 2)
+};
+// The note's line spans the whole pane width at its price, so no time range bounds it.
+const PRICE_NOTE: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Full,
+    price_extent: DrawingPriceExtent::Full,
+    ..text_annotation_spec(DrawingKind::PriceNote, 74, "price_note", 1)
+};
+const PRICE_LABEL: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Full,
+    price_extent: DrawingPriceExtent::Finite,
+    ..shape_spec(DrawingKind::PriceLabel, 75, "price_label", 1)
+};
+const ANCHORED_TEXT: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Full,
+    price_extent: DrawingPriceExtent::Full,
+    ..text_annotation_spec(DrawingKind::AnchoredText, 76, "anchored_text", 1)
+};
+const ICON_STAMP: DrawingToolSpec = shape_spec(DrawingKind::IconStamp, 77, "icon_stamp", 1);
+const GANN_BOX: DrawingToolSpec = shape_spec(DrawingKind::GannBox, 78, "gann_box", 2);
+const GANN_SQUARE: DrawingToolSpec = shape_spec(DrawingKind::GannSquare, 79, "gann_square", 2);
+const GANN_SQUARE_FIXED: DrawingToolSpec =
+    shape_spec(DrawingKind::GannSquareFixed, 80, "gann_square_fixed", 2);
+const GANN_FAN: DrawingToolSpec = DrawingToolSpec {
+    logical_extent: DrawingLogicalExtent::Ray,
+    price_extent: DrawingPriceExtent::Full,
+    ..shape_spec(DrawingKind::GannFan, 81, "gann_fan", 2)
+};
+const PROJECTION: DrawingToolSpec = shape_spec(DrawingKind::Projection, 82, "projection", 2);
+const FORECAST: DrawingToolSpec = shape_spec(DrawingKind::Forecast, 83, "forecast", 2);
+const BARS_PATTERN: DrawingToolSpec = shape_spec(DrawingKind::BarsPattern, 84, "bars_pattern", 3);
+
+/// Every built-in tool: AerisTerminal upstream's contiguous catalog (wire ids `0..=84`, in
+/// upstream order), then the own-line tools at the top of the `u8` space (`240..=246`).
 pub(crate) const DRAWING_TOOL_SPECS: &[DrawingToolSpec] = &[
     TREND_LINE,
     HORIZONTAL_LINE,
@@ -487,98 +843,86 @@ pub(crate) const DRAWING_TOOL_SPECS: &[DrawingToolSpec] = &[
     FIXED_RANGE_VOLUME_PROFILE,
     ANCHORED_VOLUME_PROFILE,
     ANCHORED_VWAP,
-    // B8: lines — begin
-    super::kinds::lines::RAY,
-    super::kinds::lines::EXTENDED_LINE,
-    super::kinds::lines::INFO_LINE,
-    super::kinds::lines::TREND_ANGLE,
-    super::kinds::lines::CROSS_LINE,
-    super::kinds::lines::ARROW_LINE,
+    super::kinds::projection_annotations::PRICE_RANGE,
+    super::kinds::projection_annotations::DATE_RANGE,
+    super::kinds::projection_annotations::DATE_PRICE_RANGE,
+    RAY,
+    EXTENDED_LINE,
+    INFO_LINE,
+    TREND_ANGLE,
+    CROSS_LINE,
+    ARROW_LINE,
+    PARALLEL_CHANNEL,
+    REGRESSION_TREND,
+    FLAT_TOP_CHANNEL,
+    FLAT_BOTTOM_CHANNEL,
+    DISJOINT_CHANNEL,
+    POLYLINE,
+    HIGHLIGHTER,
+    ROTATED_RECTANGLE,
+    ELLIPSE,
+    CIRCLE,
+    TRIANGLE,
+    ARC,
+    CURVE,
+    DOUBLE_CURVE,
+    FIBONACCI_RETRACEMENT,
+    FIBONACCI_EXTENSION,
+    FIBONACCI_CHANNEL,
+    FIBONACCI_TIME_ZONES,
+    FIBONACCI_TREND_TIME,
+    FIBONACCI_SPEED_FAN,
+    FIBONACCI_SPEED_ARCS,
+    FIBONACCI_CIRCLES,
+    FIBONACCI_SPIRAL,
+    FIBONACCI_WEDGE,
+    ANDREWS_PITCHFORK,
+    SCHIFF_PITCHFORK,
+    MODIFIED_SCHIFF_PITCHFORK,
+    INSIDE_PITCHFORK,
+    PITCHFAN,
+    PATTERN_XABCD,
+    PATTERN_CYPHER,
+    PATTERN_ABCD,
+    PATTERN_HEAD_SHOULDERS,
+    PATTERN_TRIANGLE,
+    PATTERN_THREE_DRIVES,
+    ELLIOTT_IMPULSE,
+    ELLIOTT_CORRECTION,
+    ELLIOTT_TRIANGLE,
+    ELLIOTT_DOUBLE_COMBINATION,
+    ELLIOTT_TRIPLE_COMBINATION,
+    CYCLIC_LINES,
+    TIME_CYCLES,
+    SINE_LINE,
+    ARROW_MARKER_UP,
+    ARROW_MARKER_DOWN,
+    ARROW_MARKER_LEFT,
+    ARROW_MARKER_RIGHT,
+    FLAG_MARK,
+    SIGNPOST,
+    NOTE,
+    COMMENT,
+    CALLOUT,
+    PRICE_NOTE,
+    PRICE_LABEL,
+    ANCHORED_TEXT,
+    ICON_STAMP,
+    GANN_BOX,
+    GANN_SQUARE,
+    GANN_SQUARE_FIXED,
+    GANN_FAN,
+    PROJECTION,
+    FORECAST,
+    BARS_PATTERN,
+    // Own-line tools (not in AerisTerminal upstream), wire ids 240..=246.
     super::kinds::lines::HORIZONTAL_SEGMENT,
     super::kinds::lines::VERTICAL_RAY,
     super::kinds::lines::VERTICAL_SEGMENT,
     super::kinds::lines::PRICE_LINE,
-    // B8: lines — end
-    // B8: channels — begin
-    super::kinds::channels::PARALLEL_CHANNEL,
-    super::kinds::channels::REGRESSION_TREND,
-    super::kinds::channels::FLAT_TOP_BOTTOM,
-    super::kinds::channels::DISJOINT_CHANNEL,
     super::kinds::channels::PRICE_CHANNEL,
-    // B8: channels — end
-    // B8: fibonacci — begin
-    super::kinds::fibonacci::FIB_RETRACEMENT,
-    super::kinds::fibonacci::TREND_BASED_FIB_EXTENSION,
-    super::kinds::fibonacci::FIB_CHANNEL,
-    super::kinds::fibonacci::FIB_TIME_ZONE,
-    super::kinds::fibonacci::TREND_BASED_FIB_TIME,
-    super::kinds::fibonacci::FIB_SPEED_RESISTANCE_FAN,
-    super::kinds::fibonacci::FIB_SPEED_RESISTANCE_ARCS,
-    super::kinds::fibonacci::FIB_CIRCLES,
-    super::kinds::fibonacci::FIB_SPIRAL,
-    super::kinds::fibonacci::FIB_WEDGE,
-    // B8: fibonacci — end
-    // B8: pitchforks_gann — begin
-    super::kinds::pitchforks_gann::ANDREWS_PITCHFORK,
-    super::kinds::pitchforks_gann::SCHIFF_PITCHFORK,
-    super::kinds::pitchforks_gann::MODIFIED_SCHIFF_PITCHFORK,
-    super::kinds::pitchforks_gann::INSIDE_PITCHFORK,
-    super::kinds::pitchforks_gann::PITCHFAN,
-    super::kinds::pitchforks_gann::GANN_BOX,
-    super::kinds::pitchforks_gann::GANN_SQUARE,
-    super::kinds::pitchforks_gann::GANN_SQUARE_FIXED,
-    super::kinds::pitchforks_gann::GANN_FAN,
-    // B8: pitchforks_gann — end
-    // B8: projection_annotations — begin
-    super::kinds::projection_annotations::FORECAST,
-    super::kinds::projection_annotations::BARS_PATTERN,
-    super::kinds::projection_annotations::PRICE_RANGE,
-    super::kinds::projection_annotations::DATE_RANGE,
-    super::kinds::projection_annotations::DATE_AND_PRICE_RANGE,
-    super::kinds::projection_annotations::PROJECTION,
-    super::kinds::projection_annotations::ANCHORED_TEXT,
-    super::kinds::projection_annotations::NOTE,
-    super::kinds::projection_annotations::PRICE_NOTE,
-    super::kinds::projection_annotations::CALLOUT,
-    super::kinds::projection_annotations::COMMENT,
-    super::kinds::projection_annotations::PRICE_LABEL,
-    super::kinds::projection_annotations::SIGNPOST,
-    super::kinds::projection_annotations::FLAG_MARK,
-    super::kinds::projection_annotations::ARROW_MARK_UP,
-    super::kinds::projection_annotations::ARROW_MARK_DOWN,
-    super::kinds::projection_annotations::ARROW_MARK_LEFT,
-    super::kinds::projection_annotations::ARROW_MARK_RIGHT,
-    super::kinds::projection_annotations::ICON,
     super::kinds::projection_annotations::SIMPLE_TAG,
     super::kinds::projection_annotations::SIMPLE_ANNOTATION,
-    // B8: projection_annotations — end
-    // B8: patterns_elliott_cycles — begin
-    super::kinds::patterns_elliott_cycles::XABCD_PATTERN,
-    super::kinds::patterns_elliott_cycles::CYPHER_PATTERN,
-    super::kinds::patterns_elliott_cycles::ABCD_PATTERN,
-    super::kinds::patterns_elliott_cycles::HEAD_AND_SHOULDERS,
-    super::kinds::patterns_elliott_cycles::TRIANGLE_PATTERN,
-    super::kinds::patterns_elliott_cycles::THREE_DRIVES_PATTERN,
-    super::kinds::patterns_elliott_cycles::ELLIOTT_IMPULSE_WAVE,
-    super::kinds::patterns_elliott_cycles::ELLIOTT_CORRECTION_WAVE,
-    super::kinds::patterns_elliott_cycles::ELLIOTT_TRIANGLE_WAVE,
-    super::kinds::patterns_elliott_cycles::ELLIOTT_DOUBLE_COMBO,
-    super::kinds::patterns_elliott_cycles::ELLIOTT_TRIPLE_COMBO,
-    super::kinds::patterns_elliott_cycles::CYCLIC_LINES,
-    super::kinds::patterns_elliott_cycles::TIME_CYCLES,
-    super::kinds::patterns_elliott_cycles::SINE_LINE,
-    // B8: patterns_elliott_cycles — end
-    // B8: shapes — begin
-    super::kinds::shapes::ROTATED_RECTANGLE,
-    super::kinds::shapes::ELLIPSE,
-    super::kinds::shapes::CIRCLE,
-    super::kinds::shapes::TRIANGLE,
-    super::kinds::shapes::ARC,
-    super::kinds::shapes::CURVE,
-    super::kinds::shapes::DOUBLE_CURVE,
-    super::kinds::shapes::POLYLINE,
-    super::kinds::shapes::HIGHLIGHTER,
-    // B8: shapes — end
 ];
 
 impl DrawingKind {
@@ -586,7 +930,7 @@ impl DrawingKind {
     pub(crate) const fn is_measure(self) -> bool {
         matches!(
             self,
-            Self::PriceRange | Self::DateRange | Self::DateAndPriceRange
+            Self::PriceRange | Self::DateRange | Self::DatePriceRange
         )
     }
 
@@ -605,112 +949,149 @@ impl DrawingKind {
             Self::FixedRangeVolumeProfile => &FIXED_RANGE_VOLUME_PROFILE,
             Self::AnchoredVolumeProfile => &ANCHORED_VOLUME_PROFILE,
             Self::AnchoredVwap => &ANCHORED_VWAP,
-            // B8: lines — begin
-            Self::Ray => &super::kinds::lines::RAY,
-            Self::ExtendedLine => &super::kinds::lines::EXTENDED_LINE,
-            Self::InfoLine => &super::kinds::lines::INFO_LINE,
-            Self::TrendAngle => &super::kinds::lines::TREND_ANGLE,
-            Self::CrossLine => &super::kinds::lines::CROSS_LINE,
-            Self::ArrowLine => &super::kinds::lines::ARROW_LINE,
+            Self::PriceRange => &super::kinds::projection_annotations::PRICE_RANGE,
+            Self::DateRange => &super::kinds::projection_annotations::DATE_RANGE,
+            Self::DatePriceRange => &super::kinds::projection_annotations::DATE_PRICE_RANGE,
+            Self::Ray => &RAY,
+            Self::ExtendedLine => &EXTENDED_LINE,
+            Self::InfoLine => &INFO_LINE,
+            Self::TrendAngle => &TREND_ANGLE,
+            Self::CrossLine => &CROSS_LINE,
+            Self::ArrowLine => &ARROW_LINE,
+            Self::ParallelChannel => &PARALLEL_CHANNEL,
+            Self::RegressionTrend => &REGRESSION_TREND,
+            Self::FlatTopChannel => &FLAT_TOP_CHANNEL,
+            Self::FlatBottomChannel => &FLAT_BOTTOM_CHANNEL,
+            Self::DisjointChannel => &DISJOINT_CHANNEL,
+            Self::Polyline => &POLYLINE,
+            Self::Highlighter => &HIGHLIGHTER,
+            Self::RotatedRectangle => &ROTATED_RECTANGLE,
+            Self::Ellipse => &ELLIPSE,
+            Self::Circle => &CIRCLE,
+            Self::Triangle => &TRIANGLE,
+            Self::Arc => &ARC,
+            Self::Curve => &CURVE,
+            Self::DoubleCurve => &DOUBLE_CURVE,
+            Self::FibonacciRetracement => &FIBONACCI_RETRACEMENT,
+            Self::FibonacciExtension => &FIBONACCI_EXTENSION,
+            Self::FibonacciChannel => &FIBONACCI_CHANNEL,
+            Self::FibonacciTimeZones => &FIBONACCI_TIME_ZONES,
+            Self::FibonacciTrendTime => &FIBONACCI_TREND_TIME,
+            Self::FibonacciSpeedFan => &FIBONACCI_SPEED_FAN,
+            Self::FibonacciSpeedArcs => &FIBONACCI_SPEED_ARCS,
+            Self::FibonacciCircles => &FIBONACCI_CIRCLES,
+            Self::FibonacciSpiral => &FIBONACCI_SPIRAL,
+            Self::FibonacciWedge => &FIBONACCI_WEDGE,
+            Self::AndrewsPitchfork => &ANDREWS_PITCHFORK,
+            Self::SchiffPitchfork => &SCHIFF_PITCHFORK,
+            Self::ModifiedSchiffPitchfork => &MODIFIED_SCHIFF_PITCHFORK,
+            Self::InsidePitchfork => &INSIDE_PITCHFORK,
+            Self::Pitchfan => &PITCHFAN,
+            Self::PatternXabcd => &PATTERN_XABCD,
+            Self::PatternCypher => &PATTERN_CYPHER,
+            Self::PatternAbcd => &PATTERN_ABCD,
+            Self::PatternHeadShoulders => &PATTERN_HEAD_SHOULDERS,
+            Self::PatternTriangle => &PATTERN_TRIANGLE,
+            Self::PatternThreeDrives => &PATTERN_THREE_DRIVES,
+            Self::ElliottImpulse => &ELLIOTT_IMPULSE,
+            Self::ElliottCorrection => &ELLIOTT_CORRECTION,
+            Self::ElliottTriangle => &ELLIOTT_TRIANGLE,
+            Self::ElliottDoubleCombination => &ELLIOTT_DOUBLE_COMBINATION,
+            Self::ElliottTripleCombination => &ELLIOTT_TRIPLE_COMBINATION,
+            Self::CyclicLines => &CYCLIC_LINES,
+            Self::TimeCycles => &TIME_CYCLES,
+            Self::SineLine => &SINE_LINE,
+            Self::ArrowMarkerUp => &ARROW_MARKER_UP,
+            Self::ArrowMarkerDown => &ARROW_MARKER_DOWN,
+            Self::ArrowMarkerLeft => &ARROW_MARKER_LEFT,
+            Self::ArrowMarkerRight => &ARROW_MARKER_RIGHT,
+            Self::FlagMark => &FLAG_MARK,
+            Self::Signpost => &SIGNPOST,
+            Self::Note => &NOTE,
+            Self::Comment => &COMMENT,
+            Self::Callout => &CALLOUT,
+            Self::PriceNote => &PRICE_NOTE,
+            Self::PriceLabel => &PRICE_LABEL,
+            Self::AnchoredText => &ANCHORED_TEXT,
+            Self::IconStamp => &ICON_STAMP,
+            Self::GannBox => &GANN_BOX,
+            Self::GannSquare => &GANN_SQUARE,
+            Self::GannSquareFixed => &GANN_SQUARE_FIXED,
+            Self::GannFan => &GANN_FAN,
+            Self::Projection => &PROJECTION,
+            Self::Forecast => &FORECAST,
+            Self::BarsPattern => &BARS_PATTERN,
             Self::HorizontalSegment => &super::kinds::lines::HORIZONTAL_SEGMENT,
             Self::VerticalRay => &super::kinds::lines::VERTICAL_RAY,
             Self::VerticalSegment => &super::kinds::lines::VERTICAL_SEGMENT,
             Self::PriceLine => &super::kinds::lines::PRICE_LINE,
-            // B8: lines — end
-            // B8: channels — begin
-            Self::ParallelChannel => &super::kinds::channels::PARALLEL_CHANNEL,
-            Self::RegressionTrend => &super::kinds::channels::REGRESSION_TREND,
-            Self::FlatTopBottom => &super::kinds::channels::FLAT_TOP_BOTTOM,
-            Self::DisjointChannel => &super::kinds::channels::DISJOINT_CHANNEL,
             Self::PriceChannel => &super::kinds::channels::PRICE_CHANNEL,
-            // B8: channels — end
-            // B8: fibonacci — begin
-            Self::FibRetracement => &super::kinds::fibonacci::FIB_RETRACEMENT,
-            Self::TrendBasedFibExtension => &super::kinds::fibonacci::TREND_BASED_FIB_EXTENSION,
-            Self::FibChannel => &super::kinds::fibonacci::FIB_CHANNEL,
-            Self::FibTimeZone => &super::kinds::fibonacci::FIB_TIME_ZONE,
-            Self::TrendBasedFibTime => &super::kinds::fibonacci::TREND_BASED_FIB_TIME,
-            Self::FibSpeedResistanceFan => &super::kinds::fibonacci::FIB_SPEED_RESISTANCE_FAN,
-            Self::FibSpeedResistanceArcs => &super::kinds::fibonacci::FIB_SPEED_RESISTANCE_ARCS,
-            Self::FibCircles => &super::kinds::fibonacci::FIB_CIRCLES,
-            Self::FibSpiral => &super::kinds::fibonacci::FIB_SPIRAL,
-            Self::FibWedge => &super::kinds::fibonacci::FIB_WEDGE,
-            // B8: fibonacci — end
-            // B8: pitchforks_gann — begin
-            Self::AndrewsPitchfork => &super::kinds::pitchforks_gann::ANDREWS_PITCHFORK,
-            Self::SchiffPitchfork => &super::kinds::pitchforks_gann::SCHIFF_PITCHFORK,
-            Self::ModifiedSchiffPitchfork => {
-                &super::kinds::pitchforks_gann::MODIFIED_SCHIFF_PITCHFORK
-            }
-            Self::InsidePitchfork => &super::kinds::pitchforks_gann::INSIDE_PITCHFORK,
-            Self::Pitchfan => &super::kinds::pitchforks_gann::PITCHFAN,
-            Self::GannBox => &super::kinds::pitchforks_gann::GANN_BOX,
-            Self::GannSquare => &super::kinds::pitchforks_gann::GANN_SQUARE,
-            Self::GannSquareFixed => &super::kinds::pitchforks_gann::GANN_SQUARE_FIXED,
-            Self::GannFan => &super::kinds::pitchforks_gann::GANN_FAN,
-            // B8: pitchforks_gann — end
-            // B8: projection_annotations — begin
-            Self::Forecast => &super::kinds::projection_annotations::FORECAST,
-            Self::BarsPattern => &super::kinds::projection_annotations::BARS_PATTERN,
-            Self::PriceRange => &super::kinds::projection_annotations::PRICE_RANGE,
-            Self::DateRange => &super::kinds::projection_annotations::DATE_RANGE,
-            Self::DateAndPriceRange => &super::kinds::projection_annotations::DATE_AND_PRICE_RANGE,
-            Self::Projection => &super::kinds::projection_annotations::PROJECTION,
-            Self::AnchoredText => &super::kinds::projection_annotations::ANCHORED_TEXT,
-            Self::Note => &super::kinds::projection_annotations::NOTE,
-            Self::PriceNote => &super::kinds::projection_annotations::PRICE_NOTE,
-            Self::Callout => &super::kinds::projection_annotations::CALLOUT,
-            Self::Comment => &super::kinds::projection_annotations::COMMENT,
-            Self::PriceLabel => &super::kinds::projection_annotations::PRICE_LABEL,
-            Self::Signpost => &super::kinds::projection_annotations::SIGNPOST,
-            Self::FlagMark => &super::kinds::projection_annotations::FLAG_MARK,
-            Self::ArrowMarkUp => &super::kinds::projection_annotations::ARROW_MARK_UP,
-            Self::ArrowMarkDown => &super::kinds::projection_annotations::ARROW_MARK_DOWN,
-            Self::ArrowMarkLeft => &super::kinds::projection_annotations::ARROW_MARK_LEFT,
-            Self::ArrowMarkRight => &super::kinds::projection_annotations::ARROW_MARK_RIGHT,
-            Self::Icon => &super::kinds::projection_annotations::ICON,
             Self::SimpleTag => &super::kinds::projection_annotations::SIMPLE_TAG,
             Self::SimpleAnnotation => &super::kinds::projection_annotations::SIMPLE_ANNOTATION,
-            // B8: projection_annotations — end
-            // B8: patterns_elliott_cycles — begin
-            Self::XabcdPattern => &super::kinds::patterns_elliott_cycles::XABCD_PATTERN,
-            Self::CypherPattern => &super::kinds::patterns_elliott_cycles::CYPHER_PATTERN,
-            Self::AbcdPattern => &super::kinds::patterns_elliott_cycles::ABCD_PATTERN,
-            Self::HeadAndShoulders => &super::kinds::patterns_elliott_cycles::HEAD_AND_SHOULDERS,
-            Self::TrianglePattern => &super::kinds::patterns_elliott_cycles::TRIANGLE_PATTERN,
-            Self::ThreeDrivesPattern => {
-                &super::kinds::patterns_elliott_cycles::THREE_DRIVES_PATTERN
-            }
-            Self::ElliottImpulseWave => {
-                &super::kinds::patterns_elliott_cycles::ELLIOTT_IMPULSE_WAVE
-            }
-            Self::ElliottCorrectionWave => {
-                &super::kinds::patterns_elliott_cycles::ELLIOTT_CORRECTION_WAVE
-            }
-            Self::ElliottTriangleWave => {
-                &super::kinds::patterns_elliott_cycles::ELLIOTT_TRIANGLE_WAVE
-            }
-            Self::ElliottDoubleCombo => {
-                &super::kinds::patterns_elliott_cycles::ELLIOTT_DOUBLE_COMBO
-            }
-            Self::ElliottTripleCombo => {
-                &super::kinds::patterns_elliott_cycles::ELLIOTT_TRIPLE_COMBO
-            }
-            Self::CyclicLines => &super::kinds::patterns_elliott_cycles::CYCLIC_LINES,
-            Self::TimeCycles => &super::kinds::patterns_elliott_cycles::TIME_CYCLES,
-            Self::SineLine => &super::kinds::patterns_elliott_cycles::SINE_LINE,
-            // B8: patterns_elliott_cycles — end
-            // B8: shapes — begin
-            Self::RotatedRectangle => &super::kinds::shapes::ROTATED_RECTANGLE,
-            Self::Ellipse => &super::kinds::shapes::ELLIPSE,
-            Self::Circle => &super::kinds::shapes::CIRCLE,
-            Self::Triangle => &super::kinds::shapes::TRIANGLE,
-            Self::Arc => &super::kinds::shapes::ARC,
-            Self::Curve => &super::kinds::shapes::CURVE,
-            Self::DoubleCurve => &super::kinds::shapes::DOUBLE_CURVE,
-            Self::Polyline => &super::kinds::shapes::POLYLINE,
-            Self::Highlighter => &super::kinds::shapes::HIGHLIGHTER,
-            // B8: shapes — end
         }
+    }
+
+    pub(crate) const fn vertex_labels(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::PatternXabcd | Self::PatternCypher => Some(&["X", "A", "B", "C", "D"]),
+            Self::PatternAbcd => Some(&["A", "B", "C", "D"]),
+            Self::PatternHeadShoulders => Some(&["N", "LS", "N", "H", "N", "RS", "N"]),
+            Self::PatternTriangle => Some(&["A", "B", "C", "D", "E"]),
+            Self::PatternThreeDrives => Some(&["0", "1", "A", "2", "B", "3"]),
+            Self::ElliottImpulse => Some(&["0", "1", "2", "3", "4", "5"]),
+            Self::ElliottCorrection => Some(&["0", "A", "B", "C"]),
+            Self::ElliottTriangle => Some(&["0", "A", "B", "C", "D", "E"]),
+            Self::ElliottDoubleCombination => Some(&["0", "W", "X", "Y"]),
+            Self::ElliottTripleCombination => Some(&["0", "W", "X", "Y", "X", "Z"]),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn is_elliott(self) -> bool {
+        matches!(
+            self,
+            Self::ElliottImpulse
+                | Self::ElliottCorrection
+                | Self::ElliottTriangle
+                | Self::ElliottDoubleCombination
+                | Self::ElliottTripleCombination
+        )
+    }
+
+    pub(crate) const fn is_marker(self) -> bool {
+        matches!(
+            self,
+            Self::ArrowMarkerUp
+                | Self::ArrowMarkerDown
+                | Self::ArrowMarkerLeft
+                | Self::ArrowMarkerRight
+                | Self::FlagMark
+                | Self::Signpost
+        )
+    }
+
+    pub(crate) const fn is_text_annotation(self) -> bool {
+        matches!(
+            self,
+            Self::Note | Self::Comment | Self::Callout | Self::PriceNote | Self::AnchoredText
+        )
+    }
+
+    pub(crate) fn valid_wave_degree(name: &str) -> bool {
+        matches!(
+            name,
+            "subminuette"
+                | "minuette"
+                | "minute"
+                | "minor"
+                | "intermediate"
+                | "primary"
+                | "cycle"
+                | "supercycle"
+                | "grand_supercycle"
+                | "submillennium"
+                | "millennium"
+                | "supermillennium"
+        )
     }
 }

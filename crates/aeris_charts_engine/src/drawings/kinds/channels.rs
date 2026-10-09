@@ -1,38 +1,27 @@
-//! B8 Channels family (wire ids 48..=63): parallel channel, regression trend, flat top/bottom,
-//! and disjoint channel.
+//! B8 Channels family, own-line tool (wire id 244): the KLineChart price channel, plus the
+//! regression memo that upstream's regression trend reads.
 //!
-//! The three click-placed channels share one construction. The first two anchors define the
-//! base line; the second boundary line spans the same bars (so the channel's sides are vertical)
-//! and lies on the line through the third anchor, whichever bar that anchor sits on:
+//! The price channel's first two anchors define its centre line; the line through the third
+//! anchor parallel to it (translated vertically on screen, so it stays parallel on every
+//! price-scale mode) and that line's mirror on the other side bound it. `extend_left` extends
+//! every line (and the fill) beyond the first anchor, `extend_right` beyond the second, each to
+//! the pane edge; both are on by default, like KLineChart's bare lines across the pane. The fill
+//! between the outer lines (common `fill_enabled`, off by default; `fill_color`, default the
+//! stroke color at 20% alpha) is clipped to the pane. The optional dashed middle line
+//! (`tool_options.channel.middle_line`, off by default) runs halfway between the centre and the
+//! third anchor's line. With the base line vertical (both anchors on one bar) the second line is
+//! the base moved sideways through the third anchor and nothing is filled.
 //!
-//! - parallel channel: the base line translated vertically on screen, so it stays parallel on
-//!   every price-scale mode;
-//! - flat top/bottom: a horizontal line at the third anchor's price;
-//! - disjoint channel: the base line's slope mirrored, so the two lines converge or diverge.
+//! Every line is a body target; a fill is a drag surface only while the drawing is selected,
+//! like the rectangle's. The third anchor's handle sits on its line's midpoint.
 //!
-//! `extend_left` extends both lines (and the fill) beyond the first anchor, `extend_right` beyond
-//! the second, each to the pane edge. The fill between the lines (common `fill_enabled`, on by
-//! default; `fill_color`, default the stroke color at 20% alpha) splits where the lines cross so
-//! every piece stays convex, and is clipped to the pane. The optional dashed middle line
-//! (`tool_options.channel.middle_line`, on by default for the parallel channel) runs halfway
-//! between the boundaries. With the base line vertical (both anchors on one bar) the second line
-//! is the base moved sideways through the third anchor and nothing is filled.
-//!
-//! The regression trend fits a least-squares line to the source series' bars between its two
-//! anchors (bar positions rounded), and draws it with lines `upper_deviation` and
-//! `lower_deviation` residual standard deviations (sample, `n − 1`) away, the zones between them
-//! filled, and Pearson's R (signed correlation of bar position and source value) below the start.
-//! The anchors fix only the bar range: the body and handles move horizontally, and the lines'
-//! prices come from the data, which the frame follows through the family's
-//! `reads_series_data` hook. A fit is one allocation-free pass over the source's canonical rows
-//! in the range, memoized by everything it reads, so frames and pointer hit tests repeat it only
-//! after the range, the source, or the axis positions change; a live replacement of the latest
-//! bar or appended bars extend it by the changed rows.
-//!
-//! Every boundary and middle line is a body target; a fill is a drag surface only while the
-//! drawing is selected, like the rectangle's. Channel lines carry no end caps. Handles sit on the
-//! painted lines: the base line's ends, the second line's midpoint for the third anchor (whose
-//! bar is otherwise free along that line), and the regression line's ends.
+//! Upstream's regression trend fits its line through [`regression_stats`]: a least-squares fit
+//! of the source series' bars between its two anchors (upstream's window, `ceil` of the earlier
+//! anchor through `floor` of the later one), one
+//! allocation-free pass over the source's canonical rows in the range, memoized by everything it
+//! reads, so frames and pointer hit tests repeat it only after the range, the source, or the axis
+//! positions change; a live replacement of the latest bar or appended bars extend it by the
+//! changed rows.
 
 use std::collections::HashMap;
 
@@ -42,15 +31,13 @@ use aeris_charts_render::draw_list::LineStyle;
 use aeris_charts_render::shape::{self, Point, Rect};
 
 use super::super::handles::DrawingHandle;
-use super::super::parts::{DrawingParts, PartContext, PartLabel, PartStroke};
+use super::super::parts::{DrawingParts, PartContext, PartStroke};
 use super::super::tools::{
     DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
     DrawingPlacement, DrawingPriceExtent, DrawingStraightenMode, DrawingTextLayout,
     DrawingToolSpec,
 };
-use super::super::{
-    Drawing, DrawingPoint, DrawingSourceRows, DrawingTextHAlign, DrawingTextVAlign,
-};
+use super::super::{Drawing, DrawingSourceRows};
 use super::DrawingFamily;
 use crate::{
     ChartEngine, DrawingDragPart, DrawingId, DrawingKind, DrawingKindOptions,
@@ -59,8 +46,10 @@ use crate::{
 
 /// Channels-family options (`tool_options.channel`). Every field is optional: an absent field
 /// takes the tool's own default, so deep-merged patches, templates, and `null` resets never
-/// depend on which channel tool a block came from. The deviation, source, and Pearson fields
-/// apply to the regression trend only.
+/// depend on which channel tool a block came from. The price channel reads `middle_line` and
+/// `middle_color`. The deviation fields are input aliases of upstream's regression trend
+/// `regression_deviations` (see `drawing_contract::take_legacy_flat_options`); the source and
+/// Pearson fields are stored but no longer rendered.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct ChannelToolOptions {
@@ -107,22 +96,13 @@ impl ChannelToolOptions {
                 .is_none_or(|color| color.len() <= MAX_COLOR_BYTES)
     }
 
-    fn resolve(&self, kind: DrawingKind) -> Resolved<'_> {
+    fn resolve(&self) -> Resolved<'_> {
         Resolved {
-            middle_line: self.middle_line.unwrap_or(matches!(
-                kind,
-                DrawingKind::ParallelChannel | DrawingKind::RegressionTrend
-            )),
+            middle_line: self.middle_line.unwrap_or(false),
             middle_color: self
                 .middle_color
                 .as_deref()
                 .filter(|color| !color.is_empty()),
-            upper_deviation: self.upper_deviation.unwrap_or(2.0),
-            lower_deviation: self.lower_deviation.unwrap_or(-2.0),
-            use_upper_deviation: self.use_upper_deviation.unwrap_or(true),
-            use_lower_deviation: self.use_lower_deviation.unwrap_or(true),
-            source: self.source.unwrap_or_default(),
-            show_pearsons: self.show_pearsons.unwrap_or(true),
         }
     }
 }
@@ -132,12 +112,6 @@ impl ChannelToolOptions {
 struct Resolved<'a> {
     middle_line: bool,
     middle_color: Option<&'a str>,
-    upper_deviation: f64,
-    lower_deviation: f64,
-    use_upper_deviation: bool,
-    use_lower_deviation: bool,
-    source: IndicatorInputSource,
-    show_pearsons: bool,
 }
 
 fn options(drawing: &Drawing) -> Resolved<'_> {
@@ -152,8 +126,8 @@ fn options(drawing: &Drawing) -> Resolved<'_> {
         show_pearsons: None,
     };
     match &drawing.tool_options.channel {
-        Some(block) => block.resolve(drawing.kind),
-        None => DEFAULTS.resolve(drawing.kind),
+        Some(block) => block.resolve(),
+        None => DEFAULTS.resolve(),
     }
 }
 
@@ -161,23 +135,19 @@ fn options(drawing: &Drawing) -> Resolved<'_> {
 const MIDDLE_WIDTH: f64 = 1.0;
 /// Default fill alpha over the stroke color (20%, the rectangle's wash).
 const FILL_ALPHA: u8 = 51;
-/// Gap between the lowest regression line and Pearson's R, in CSS px.
-const PEARSON_GAP: f64 = 4.0;
-/// Widest Pearson's R text, measured for the culling pad.
-const PEARSON_SAMPLE: &str = "-0.0000";
 
-/// Shared three-anchor channel behavior; every spec below overrides its identity.
-const CHANNEL_TOOL: DrawingToolSpec = DrawingToolSpec {
-    kind: DrawingKind::ParallelChannel,
-    wire_id: 48,
-    name: "parallel_channel",
+// The base line is the channel's centre: its parallel through the third anchor and the mirror of
+// that parallel on the other side bound it. The lines span the base line's bars through the third
+// anchor, so their ends can leave the anchors' price box; only the bar range bounds the channel.
+pub(crate) const PRICE_CHANNEL: DrawingToolSpec = DrawingToolSpec {
+    kind: DrawingKind::PriceChannel,
+    wire_id: 244,
+    name: "price_channel",
     placement: DrawingPlacement::ClickAnchors { count: 3 },
     handles: DrawingHandleMode::Anchors,
     movement_axis: DrawingMovementAxis::Both,
     straighten: DrawingStraightenMode::Segment45,
     logical_extent: DrawingLogicalExtent::Finite,
-    // The second line spans the base line's bars through the third anchor, so its ends can leave
-    // the anchors' price box; only the bar range bounds the channel.
     price_extent: DrawingPriceExtent::Full,
     bounds_padding_ratio: 0.0,
     default_width: 2.0,
@@ -190,53 +160,11 @@ const CHANNEL_TOOL: DrawingToolSpec = DrawingToolSpec {
     axis_tag_text: false,
 };
 
-pub(crate) const PARALLEL_CHANNEL: DrawingToolSpec = CHANNEL_TOOL;
-
-pub(crate) const REGRESSION_TREND: DrawingToolSpec = DrawingToolSpec {
-    kind: DrawingKind::RegressionTrend,
-    wire_id: 49,
-    name: "regression_trend",
-    placement: DrawingPlacement::ClickAnchors { count: 2 },
-    // The anchors choose bars; prices come from the data.
-    movement_axis: DrawingMovementAxis::HorizontalOnly,
-    straighten: DrawingStraightenMode::None,
-    default_width: 1.0,
-    text_layout: DrawingTextLayout::Box,
-    ..CHANNEL_TOOL
-};
-
-pub(crate) const FLAT_TOP_BOTTOM: DrawingToolSpec = DrawingToolSpec {
-    kind: DrawingKind::FlatTopBottom,
-    wire_id: 50,
-    name: "flat_top_bottom",
-    // Both lines' ends sit inside the anchors' box.
-    price_extent: DrawingPriceExtent::Finite,
-    ..CHANNEL_TOOL
-};
-
-pub(crate) const DISJOINT_CHANNEL: DrawingToolSpec = DrawingToolSpec {
-    kind: DrawingKind::DisjointChannel,
-    wire_id: 51,
-    name: "disjoint_channel",
-    ..CHANNEL_TOOL
-};
-
-// The base line is the channel's centre: its parallel through the third anchor and the mirror of
-// that parallel on the other side bound it.
-pub(crate) const PRICE_CHANNEL: DrawingToolSpec = DrawingToolSpec {
-    kind: DrawingKind::PriceChannel,
-    wire_id: 52,
-    name: "price_channel",
-    ..CHANNEL_TOOL
-};
-
 pub(crate) static FAMILY: DrawingFamily = {
     let mut family = DrawingFamily::new(build_parts, kind_options);
     family.apply_defaults = apply_defaults;
-    family.decoration_extent = decoration_extent;
     family.extend_schema = extend_schema;
-    family.reads_series_data = |drawing| drawing.kind == DrawingKind::RegressionTrend;
-    family.handles = |engine, drawing, px, handles| move_handles(engine, drawing, px, handles);
+    family.handles = |_, _, px, handles| move_handles(px, handles);
     // Placing the second anchor previews the base line alone.
     family.partial_preview = true;
     family
@@ -244,18 +172,28 @@ pub(crate) static FAMILY: DrawingFamily = {
 
 fn apply_defaults(drawing: &mut Drawing) {
     // KLineChart's price channel is three bare lines across the pane.
-    let price_channel = drawing.kind == DrawingKind::PriceChannel;
-    drawing.fill_enabled = !price_channel;
-    drawing.extend_left = price_channel;
-    drawing.extend_right = price_channel;
+    drawing.fill_enabled = false;
+    drawing.extend_left = true;
+    drawing.extend_right = true;
+}
+
+/// The fork's pre-merge defaults of the upstream channel tools it rendered (see
+/// [`super::apply_legacy_fork_defaults`]): every one filled between its lines.
+pub(super) fn legacy_defaults(drawing: &mut Drawing) {
+    if matches!(
+        drawing.kind,
+        DrawingKind::ParallelChannel
+            | DrawingKind::RegressionTrend
+            | DrawingKind::FlatTopChannel
+            | DrawingKind::FlatBottomChannel
+            | DrawingKind::DisjointChannel
+    ) {
+        drawing.fill_enabled = true;
+    }
 }
 
 fn build_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
-    if ctx.drawing.kind == DrawingKind::RegressionTrend {
-        regression_parts(ctx, parts);
-    } else {
-        channel_parts(ctx, parts);
-    }
+    channel_parts(ctx, parts);
 }
 
 type Line = (Point, Point);
@@ -270,16 +208,14 @@ fn channel_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
         stroke_line(ctx, parts, base, PartStroke::default(), true);
         return;
     };
-    let other = second_line(drawing.kind, a, b, c);
+    let other = second_line(a, b, c);
     let resolved = options(drawing);
-    // A price channel is symmetric about its base line: the third line mirrors `other`.
-    let mirror = (drawing.kind == DrawingKind::PriceChannel).then(|| {
-        let reflect = |p: Point, q: Point| (2.0 * p.0 - q.0, 2.0 * p.1 - q.1);
-        (reflect(a, other.0), reflect(b, other.1))
-    });
+    // The channel is symmetric about its base line: the third line mirrors `other`.
+    let reflect = |p: Point, q: Point| (2.0 * p.0 - q.0, 2.0 * p.1 - q.1);
+    let mirror = (reflect(a, other.0), reflect(b, other.1));
     if drawing.fill_enabled && (b.0 - a.0).abs() > f64::EPSILON {
         let span = extended_span(ctx.pane, base, drawing);
-        fill_between(ctx, parts, mirror.unwrap_or(base), other, span);
+        fill_between(ctx, parts, mirror, other, span);
     }
     if resolved.middle_line {
         let middle = (shape::midpoint(a, other.0), shape::midpoint(b, other.1));
@@ -287,66 +223,33 @@ fn channel_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
     }
     stroke_line(ctx, parts, base, PartStroke::default(), true);
     stroke_line(ctx, parts, other, PartStroke::default(), false);
-    if let Some(mirror) = mirror {
-        stroke_line(ctx, parts, mirror, PartStroke::default(), false);
-    }
+    stroke_line(ctx, parts, mirror, PartStroke::default(), false);
 }
 
-/// The channel's second boundary through `c`, spanning the base line's x range.
-fn second_line(kind: DrawingKind, a: Point, b: Point, c: Point) -> Line {
+/// The channel's second boundary through `c`: the base line translated vertically on screen,
+/// spanning the base line's x range (moved sideways through `c` when the base is vertical).
+fn second_line(a: Point, b: Point, c: Point) -> Line {
     let dx = b.0 - a.0;
     if dx.abs() <= f64::EPSILON {
         return ((c.0, a.1), (c.0, b.1));
     }
     let slope = (b.1 - a.1) / dx;
-    match kind {
-        DrawingKind::FlatTopBottom => ((a.0, c.1), (b.0, c.1)),
-        DrawingKind::DisjointChannel => (
-            (a.0, c.1 - slope * (a.0 - c.0)),
-            (b.0, c.1 - slope * (b.0 - c.0)),
-        ),
-        _ => {
-            let offset = c.1 - (a.1 + slope * (c.0 - a.0));
-            ((a.0, a.1 + offset), (b.0, b.1 + offset))
-        }
-    }
+    let offset = c.1 - (a.1 + slope * (c.0 - a.0));
+    ((a.0, a.1 + offset), (b.0, b.1 + offset))
 }
 
-/// Handles on the painted lines: a channel's third handle at its second line's midpoint (the
-/// third anchor's bar is free along that line), and a regression's two on the regression line's
-/// ends. Each still drives its own anchor by pointer deltas.
-fn move_handles(
-    engine: &ChartEngine,
-    drawing: &Drawing,
-    px: &[Point],
-    handles: &mut [DrawingHandle],
-) {
-    let mut moved = |index: usize, point: Point| {
-        if let Some(handle) = handles
-            .iter_mut()
-            .find(|handle| handle.part == DrawingDragPart::Anchor(index))
-        {
-            handle.point = point;
-        }
+/// The third handle sits at the second line's midpoint (the third anchor's bar is otherwise free
+/// along that line); it still drives its own anchor by pointer deltas.
+fn move_handles(px: &[Point], handles: &mut [DrawingHandle]) {
+    let [a, b, c] = *px else {
+        return;
     };
-    if drawing.kind == DrawingKind::RegressionTrend {
-        let Some(stats) = regression_stats(engine, drawing, options(drawing).source) else {
-            return;
-        };
-        for (index, anchor) in drawing.points.iter().enumerate() {
-            let on_line = DrawingPoint {
-                logical: anchor.logical,
-                price: stats.price_at(anchor.logical),
-            };
-            if let Some(point) =
-                engine.drawing_to_px_for(drawing.pane_index, drawing.price_scale, on_line)
-            {
-                moved(index, point);
-            }
-        }
-    } else if let [a, b, c] = *px {
-        let (start, end) = second_line(drawing.kind, a, b, c);
-        moved(2, shape::midpoint(start, end));
+    let (start, end) = second_line(a, b, c);
+    if let Some(handle) = handles
+        .iter_mut()
+        .find(|handle| handle.part == DrawingDragPart::Anchor(2))
+    {
+        handle.point = shape::midpoint(start, end);
     }
 }
 
@@ -432,6 +335,9 @@ pub(crate) struct RegressionStats {
     pub(crate) slope: f64,
     /// Sample standard deviation of the residuals (`n − 1` denominator; 0 for one bar).
     pub(crate) deviation: f64,
+    /// Sum of squared bar-position deviations from their mean: 0 when every value sits on one
+    /// bar (one bar, or as-of rows collapsed onto one axis point), so no line is defined.
+    pub(crate) spread: f64,
     /// Pearson correlation of bar position and source value; `None` when either is constant.
     pub(crate) pearson: Option<f64>,
 }
@@ -536,6 +442,7 @@ impl RegressionSums {
             mean_price: shift + mean_y,
             slope,
             deviation,
+            spread: m2x,
             pearson,
         })
     }
@@ -598,9 +505,10 @@ impl RegressionMemo {
     }
 }
 
-/// Regression statistics of `drawing`'s source over the bars between its two anchors (rounded
-/// positions, inclusive), memoized per input. `None` without a source or without a finite source
-/// value in the range. The source's canonical rows are read once each (see
+/// Regression statistics of `drawing`'s source over the bars between its two anchors (`ceil` of
+/// the earlier anchor through `floor` of the later one, inclusive: the bars whose positions lie
+/// between the anchors, upstream's window), memoized per input. `None` without a source or
+/// without a finite source value in the range. The source's canonical rows are read once each (see
 /// [`ChartEngine::drawing_source_window`]).
 pub(crate) fn regression_stats(
     engine: &ChartEngine,
@@ -608,9 +516,9 @@ pub(crate) fn regression_stats(
     source: IndicatorInputSource,
 ) -> Option<RegressionStats> {
     let (first, second) = (drawing.points.first()?, drawing.points.get(1)?);
-    let low = first.logical.min(second.logical).round();
-    let high = first.logical.max(second.logical).round();
-    if !low.is_finite() || !high.is_finite() {
+    let low = first.logical.min(second.logical).ceil();
+    let high = first.logical.max(second.logical).floor();
+    if !low.is_finite() || !high.is_finite() || high < low {
         return None;
     }
     let rows = engine.drawing_source_window(drawing)?;
@@ -708,99 +616,6 @@ fn extend_fit(
     Some(stats)
 }
 
-fn regression_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
-    let drawing = ctx.drawing;
-    let (Some(&a), Some(&b)) = (ctx.px.first(), ctx.px.get(1)) else {
-        return;
-    };
-    let resolved = options(drawing);
-    let Some(stats) = regression_stats(ctx.engine, drawing, resolved.source) else {
-        // No source bars in range yet: the anchor segment keeps the drawing visible and
-        // selectable until data arrives.
-        parts.stroke(&[a, b], middle_stroke(resolved), false);
-        return;
-    };
-    let (first, second) = (drawing.points[0].logical, drawing.points[1].logical);
-    let line_at = |deviations: f64| -> Option<Line> {
-        let offset = deviations * stats.deviation;
-        let point = |logical: f64| {
-            ctx.point_px(DrawingPoint {
-                logical,
-                price: stats.price_at(logical) + offset,
-            })
-        };
-        Some((point(first)?, point(second)?))
-    };
-    let Some(center) = line_at(0.0) else {
-        return;
-    };
-    let upper = resolved
-        .use_upper_deviation
-        .then(|| line_at(resolved.upper_deviation))
-        .flatten();
-    let lower = resolved
-        .use_lower_deviation
-        .then(|| line_at(resolved.lower_deviation))
-        .flatten();
-    if drawing.fill_enabled && (b.0 - a.0).abs() > f64::EPSILON {
-        let span = extended_span(ctx.pane, center, drawing);
-        for band in [upper, lower].into_iter().flatten() {
-            fill_between(ctx, parts, center, band, span);
-        }
-    }
-    if resolved.middle_line {
-        stroke_line(ctx, parts, center, middle_stroke(resolved), false);
-    }
-    for band in [upper, lower].into_iter().flatten() {
-        stroke_line(ctx, parts, band, PartStroke::default(), false);
-    }
-    if let Some(pearson) = stats.pearson.filter(|_| resolved.show_pearsons) {
-        // Below the lowest line at the regression's start, reading into the channel.
-        let start = center.0;
-        let bottom = [Some(center), upper, lower]
-            .into_iter()
-            .flatten()
-            .map(|line| line.0 .1)
-            .fold(start.1, f64::max);
-        parts.label(PartLabel {
-            anchor: (start.0, bottom + PEARSON_GAP * ctx.scale),
-            h_align: if b.0 >= a.0 {
-                DrawingTextHAlign::Left
-            } else {
-                DrawingTextHAlign::Right
-            },
-            v_align: DrawingTextVAlign::Top,
-            lines: vec![format!("{pearson:.4}")],
-            size: ctx.engine.drawing_text_size(drawing) * ctx.scale,
-            weight: drawing.text_weight.unwrap_or(400),
-            italic: drawing.text_italic,
-            color: None,
-            background: None,
-            border: None,
-            padding: (0.0, 0.0),
-            hit: false,
-        });
-    }
-}
-
-/// Pearson's R reaches right of the regression's start by its width; everything else stays in
-/// the bar range (vertical culling is off for the family's data-driven and third-anchor lines).
-fn decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
-    if drawing.kind != DrawingKind::RegressionTrend || !options(drawing).show_pearsons {
-        return 0.0;
-    }
-    let size = engine.drawing_text_size(drawing);
-    let family = &engine.options.get().layout.font_family;
-    let width = engine.measure_text_run(
-        PEARSON_SAMPLE,
-        size,
-        family,
-        drawing.text_weight.unwrap_or(400),
-        drawing.text_italic,
-    );
-    PEARSON_GAP + width + size
-}
-
 fn descriptor(
     name: &str,
     property_type: DrawingPropertyType,
@@ -825,67 +640,13 @@ fn extend_schema(template: &Drawing, properties: &mut Vec<DrawingPropertyDescrip
         DrawingPropertyType::Color,
         serde_json::json!(resolved.middle_color.unwrap_or_default()),
     ));
-    if template.kind != DrawingKind::RegressionTrend {
-        return;
-    }
-    for (name, value) in [
-        ("upper_deviation", resolved.upper_deviation),
-        ("lower_deviation", resolved.lower_deviation),
-    ] {
-        properties.push(DrawingPropertyDescriptor {
-            min: Some(-MAX_DEVIATION),
-            max: Some(MAX_DEVIATION),
-            ..descriptor(name, DrawingPropertyType::Number, serde_json::json!(value))
-        });
-    }
-    for (name, value) in [
-        ("use_upper_deviation", resolved.use_upper_deviation),
-        ("use_lower_deviation", resolved.use_lower_deviation),
-    ] {
-        properties.push(descriptor(
-            name,
-            DrawingPropertyType::Boolean,
-            serde_json::json!(value),
-        ));
-    }
-    properties.push(DrawingPropertyDescriptor {
-        enum_values: IndicatorInputSource::ALL
-            .iter()
-            .filter_map(|source| serde_json::to_value(source).ok())
-            .filter_map(|value| value.as_str().map(str::to_string))
-            .collect(),
-        ..descriptor(
-            "source",
-            DrawingPropertyType::Enum,
-            serde_json::json!(resolved.source),
-        )
-    });
-    properties.push(descriptor(
-        "show_pearsons",
-        DrawingPropertyType::Boolean,
-        serde_json::json!(resolved.show_pearsons),
-    ));
 }
 
 fn kind_options(drawing: &Drawing) -> DrawingKindOptions {
     let resolved = options(drawing);
-    let middle_color = resolved.middle_color.map(str::to_string);
-    if drawing.kind == DrawingKind::RegressionTrend {
-        DrawingKindOptions::RegressionTrend {
-            middle_line: resolved.middle_line,
-            middle_color,
-            upper_deviation: resolved.upper_deviation,
-            lower_deviation: resolved.lower_deviation,
-            use_upper_deviation: resolved.use_upper_deviation,
-            use_lower_deviation: resolved.use_lower_deviation,
-            source: resolved.source,
-            show_pearsons: resolved.show_pearsons,
-        }
-    } else {
-        DrawingKindOptions::Channel {
-            middle_line: resolved.middle_line,
-            middle_color,
-        }
+    DrawingKindOptions::Channel {
+        middle_line: resolved.middle_line,
+        middle_color: resolved.middle_color.map(str::to_string),
     }
 }
 

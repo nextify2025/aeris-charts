@@ -17,10 +17,11 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use aeris_charts_core::model::data_validation::MAX_SAFE_VALUE;
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{LineStyle, LineType};
+use aeris_charts_render::draw_list::{LineStyle, LineType, RasterImage};
 
 use super::*;
 
@@ -33,8 +34,8 @@ pub(crate) mod time_anchor;
 mod tools;
 
 pub(crate) use geometry::{
-    resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions, MeasureAxes,
-    PositionGeometry, PositionZone,
+    resolve_drawing_geometry, DrawingBodyGeometry, DrawingGeometryOptions, FibonacciGeometry,
+    MeasureAxes, PositionGeometry, PositionZone,
 };
 pub(crate) use parts::{cap_radius, DrawingPart, DrawingParts, PartContext};
 pub(crate) use tools::{
@@ -46,6 +47,198 @@ pub(crate) use tools::{
 pub type DrawingId = u32;
 /// Hard cap shared by live drawing APIs and persistence so variable-point tools remain bounded.
 pub(crate) const MAX_DRAWING_POINTS: usize = 100_000;
+pub const MAX_DRAWING_ICONS: usize = 32;
+pub const MAX_DRAWING_ICON_SIZE: u32 = 96;
+pub const MAX_DRAWING_ICON_NAME_BYTES: usize = 64;
+pub const MAX_BARS_PATTERN_BARS: usize = 512;
+
+/// Frozen source bar stored with a bars-pattern drawing. Offsets preserve whitespace gaps.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BarsPatternBar {
+    pub offset: u16,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+}
+
+impl BarsPatternBar {
+    pub(crate) fn valid(self) -> bool {
+        [self.open, self.high, self.low, self.close]
+            .iter()
+            .all(|value| value.is_finite())
+            && self.high >= self.low
+            && self.high >= self.open.max(self.close)
+            && self.low <= self.open.min(self.close)
+    }
+
+    pub(crate) fn project(self, drawing: &Drawing) -> [DrawingPoint; 4] {
+        let first = drawing.bars_pattern.first().copied().unwrap_or(self);
+        let last = drawing.bars_pattern.last().copied().unwrap_or(self);
+        let base = if drawing.bars_pattern_mirror_x {
+            last.close
+        } else {
+            first.close
+        };
+        let logical_offset = if drawing.bars_pattern_mirror_x {
+            last.offset.saturating_sub(self.offset)
+        } else {
+            self.offset
+        };
+        let target = drawing.points[2];
+        let map_price = |price: f64| {
+            target.price
+                + (price - base)
+                    * if drawing.bars_pattern_mirror_y {
+                        -1.0
+                    } else {
+                        1.0
+                    }
+        };
+        let logical = target.logical + f64::from(logical_offset);
+        let open = if drawing.bars_pattern_mirror_x {
+            self.close
+        } else {
+            self.open
+        };
+        let close = if drawing.bars_pattern_mirror_x {
+            self.open
+        } else {
+            self.close
+        };
+        [open, self.high, self.low, close].map(|price| DrawingPoint {
+            logical,
+            price: map_price(price),
+        })
+    }
+}
+
+fn valid_bars_pattern(bars: &[BarsPatternBar]) -> bool {
+    !bars.is_empty()
+        && bars.len() <= MAX_BARS_PATTERN_BARS
+        && bars.iter().all(|bar| bar.valid())
+        && bars.windows(2).all(|pair| pair[0].offset < pair[1].offset)
+        && bars
+            .last()
+            .is_some_and(|bar| usize::from(bar.offset) < MAX_BARS_PATTERN_BARS)
+}
+
+pub(crate) struct DrawingIconRegistry {
+    images: HashMap<String, RasterImage>,
+    next_key: u64,
+}
+
+impl Default for DrawingIconRegistry {
+    fn default() -> Self {
+        Self {
+            images: HashMap::new(),
+            next_key: 1_u64 << 62,
+        }
+    }
+}
+
+impl DrawingIconRegistry {
+    pub(crate) fn get(&self, name: &str) -> Option<&RasterImage> {
+        self.images.get(name)
+    }
+
+    fn set(&mut self, name: &str, width: u32, height: u32, pixels: Arc<[u8]>) -> bool {
+        let expected = usize::try_from(width)
+            .ok()
+            .and_then(|value| value.checked_mul(height as usize))
+            .and_then(|value| value.checked_mul(4));
+        if name.is_empty()
+            || name.len() > MAX_DRAWING_ICON_NAME_BYTES
+            || width == 0
+            || height == 0
+            || width > MAX_DRAWING_ICON_SIZE
+            || height > MAX_DRAWING_ICON_SIZE
+            || expected != Some(pixels.len())
+            || (self.images.len() >= MAX_DRAWING_ICONS && !self.images.contains_key(name))
+        {
+            return false;
+        }
+        let Some(next_key) = self.next_key.checked_add(1) else {
+            return false;
+        };
+        self.images.insert(
+            name.to_string(),
+            RasterImage {
+                key: self.next_key,
+                width,
+                height,
+                pixels,
+            },
+        );
+        self.next_key = next_key;
+        true
+    }
+
+    fn remove(&mut self, name: &str) -> bool {
+        self.images.remove(name).is_some()
+    }
+}
+
+impl ChartEngine {
+    pub(crate) fn drawing_fibonacci_level_segment(
+        &self,
+        drawing: &Drawing,
+        fib: FibonacciGeometry,
+        value: f64,
+        vpr: f64,
+    ) -> ((f64, f64), (f64, f64)) {
+        let effective = drawing.level_value(value);
+        let mut segment = fib.segment(effective);
+        if !drawing.level_log_scale || !drawing.kind.supports_log_levels() {
+            return segment;
+        }
+        let Some(scale) = self.drawing_scale_for(drawing.pane_index, drawing.price_scale) else {
+            return segment;
+        };
+        let base = self.drawing_scale_base_for(drawing.pane_index, drawing.price_scale);
+        let zero = fib.segment(0.0);
+        let one = fib.segment(1.0);
+        for (index, point) in [&mut segment.0, &mut segment.1].into_iter().enumerate() {
+            let (start, end) = if index == 0 {
+                (zero.0, one.0)
+            } else {
+                (zero.1, one.1)
+            };
+            let p0 = scale.coordinate_to_price(start.1 / vpr, base);
+            let p1 = scale.coordinate_to_price(end.1 / vpr, base);
+            if p0 > 0.0 && p1 > 0.0 {
+                let price = p0 * (p1 / p0).powf(effective);
+                let y = scale.price_to_coordinate(price, base) * vpr;
+                if y.is_finite() {
+                    point.1 = y;
+                }
+            }
+        }
+        segment
+    }
+    /// Register an immutable RGBA8 image under a chart-local name. Replacements use fresh keys.
+    pub fn set_drawing_icon(
+        &mut self,
+        name: &str,
+        width: u32,
+        height: u32,
+        pixels: Arc<[u8]>,
+    ) -> bool {
+        if !self.drawing_icons.set(name, width, height, pixels) {
+            return false;
+        }
+        self.invalidate_frame_drawings();
+        true
+    }
+
+    pub fn remove_drawing_icon(&mut self, name: &str) -> bool {
+        if !self.drawing_icons.remove(name) {
+            return false;
+        }
+        self.invalidate_frame_drawings();
+        true
+    }
+}
 
 /// Open terminal chevron for the multi-click Path, ordered wing-tip-wing. `px` and `scale` are in
 /// the caller's coordinate space, allowing hit testing to use media px and frame emission to use
@@ -96,6 +289,7 @@ pub struct DrawingWorkStats {
 enum LogicalBounds {
     Full,
     From(f64),
+    Ray { start: f64, towards_right: bool },
     Finite { min: f64, max: f64 },
 }
 
@@ -118,6 +312,86 @@ impl DrawingBounds {
             min_price = min_price.min(point.price);
             max_price = max_price.max(point.price);
         }
+        if drawing.kind == DrawingKind::BarsPattern {
+            for &bar in &drawing.bars_pattern {
+                for projected in bar.project(drawing) {
+                    min_logical = min_logical.min(projected.logical);
+                    max_logical = max_logical.max(projected.logical);
+                    min_price = min_price.min(projected.price);
+                    max_price = max_price.max(projected.price);
+                }
+            }
+        }
+        if matches!(
+            drawing.kind,
+            DrawingKind::FibonacciRetracement | DrawingKind::FibonacciExtension
+        ) && drawing.points.len() == drawing.kind.anchor_count()
+        {
+            let (start, end) = if drawing.kind == DrawingKind::FibonacciRetracement {
+                (drawing.points[0].price, drawing.points[1].price)
+            } else {
+                (
+                    drawing.points[2].price,
+                    drawing.points[2].price + drawing.points[1].price - drawing.points[0].price,
+                )
+            };
+            for level in drawing.levels.iter().filter(|level| level.visible) {
+                let value = drawing.level_value(level.value);
+                let price = if drawing.level_log_scale && start > 0.0 && end > 0.0 {
+                    start * (end / start).powf(value)
+                } else {
+                    start + (end - start) * value
+                };
+                if price.is_finite() {
+                    min_price = min_price.min(price);
+                    max_price = max_price.max(price);
+                }
+            }
+        }
+        if matches!(
+            drawing.kind,
+            DrawingKind::GannBox | DrawingKind::GannSquare | DrawingKind::GannSquareFixed
+        ) && drawing.points.len() == 2
+        {
+            for level in drawing.levels.iter().filter(|level| level.visible) {
+                let value = drawing.level_value(level.value);
+                let logical = drawing.points[0].logical
+                    + (drawing.points[1].logical - drawing.points[0].logical) * value;
+                let price = drawing.points[0].price
+                    + (drawing.points[1].price - drawing.points[0].price) * value;
+                if logical.is_finite() && price.is_finite() {
+                    min_logical = min_logical.min(logical);
+                    max_logical = max_logical.max(logical);
+                    min_price = min_price.min(price);
+                    max_price = max_price.max(price);
+                }
+            }
+        }
+        if drawing.kind == DrawingKind::FibonacciExtension && drawing.points.len() == 3 {
+            let projected =
+                drawing.points[2].logical + (drawing.points[1].logical - drawing.points[0].logical);
+            min_logical = min_logical.min(projected);
+            max_logical = max_logical.max(projected);
+        }
+        if matches!(
+            drawing.kind,
+            DrawingKind::FibonacciTimeZones | DrawingKind::FibonacciTrendTime
+        ) && drawing.points.len() == drawing.kind.anchor_count()
+        {
+            let zero = if drawing.kind == DrawingKind::FibonacciTimeZones {
+                drawing.points[0].logical
+            } else {
+                drawing.points[2].logical
+            };
+            let step = drawing.points[1].logical - drawing.points[0].logical;
+            for level in drawing.levels.iter().filter(|level| level.visible) {
+                let projected = zero + step * drawing.level_value(level.value);
+                if projected.is_finite() {
+                    min_logical = min_logical.min(projected);
+                    max_logical = max_logical.max(projected);
+                }
+            }
+        }
         let spec = drawing.kind.spec();
         if spec.bounds_padding_ratio > 0.0 {
             let logical_pad = (max_logical - min_logical).abs() * spec.bounds_padding_ratio;
@@ -127,9 +401,24 @@ impl DrawingBounds {
             min_price -= price_pad;
             max_price += price_pad;
         }
+        let line_extension = matches!(
+            drawing.kind,
+            DrawingKind::TrendLine
+                | DrawingKind::InfoLine
+                | DrawingKind::TrendAngle
+                | DrawingKind::ArrowLine
+                | DrawingKind::FibonacciRetracement
+                | DrawingKind::FibonacciExtension
+                | DrawingKind::FibonacciChannel
+        ) && (drawing.extend_left || drawing.extend_right);
         let logical = match spec.logical_extent {
             DrawingLogicalExtent::Full => LogicalBounds::Full,
             DrawingLogicalExtent::FromFirst => LogicalBounds::From(min_logical),
+            DrawingLogicalExtent::Ray => LogicalBounds::Ray {
+                start: drawing.points[0].logical,
+                towards_right: drawing.points[1].logical >= drawing.points[0].logical,
+            },
+            DrawingLogicalExtent::Finite if line_extension => LogicalBounds::Full,
             DrawingLogicalExtent::Finite => LogicalBounds::Finite {
                 min: min_logical,
                 max: max_logical,
@@ -137,22 +426,8 @@ impl DrawingBounds {
         };
         let (min_price, max_price) = match spec.price_extent {
             DrawingPriceExtent::Full => (None, None),
+            DrawingPriceExtent::Finite if line_extension => (None, None),
             DrawingPriceExtent::Finite => (Some(min_price), Some(max_price)),
-        };
-        // A family whose geometry reaches beyond its anchors reports its complete reach.
-        let reach = spec.family.and_then(|family| (family.bounds)(drawing));
-        let (logical, min_price, max_price) = match reach {
-            Some(reach) => (
-                reach
-                    .logical
-                    .map_or(LogicalBounds::Full, |(min, max)| LogicalBounds::Finite {
-                        min,
-                        max,
-                    }),
-                reach.price.map(|(min, _)| min),
-                reach.price.map(|(_, max)| max),
-            ),
-            None => (logical, min_price, max_price),
         };
         // An extended body reaches the pane edge in its own direction, which the anchors'
         // box cannot bound; stay conservative instead of culling the visible extension.
@@ -410,19 +685,179 @@ pub enum DrawingKind {
     AnchoredVolumeProfile,
     /// One-anchor VWAP with optional deviation bands through the latest source row.
     AnchoredVwap,
-    // B8: lines — begin
-    /// Two-anchor ray from the first anchor through the second to the pane edge.
+    /// Two-anchor price measurement: signed price change, percentage, and ticks.
+    PriceRange,
+    /// Two-anchor time measurement: signed bar count and elapsed time.
+    DateRange,
+    /// Two-anchor combined price and time measurement (also the Shift-click quick measure).
+    #[serde(alias = "date_and_price_range")]
+    DatePriceRange,
+    /// Two-anchor line projected from its first anchor through the second.
     Ray,
-    /// Two-anchor line extended through both anchors to the pane edges.
+    /// Two-anchor line projected to both pane edges.
     ExtendedLine,
-    /// Two-anchor segment with a measurement box (price/percent/bars/time/angle stats).
+    /// Two-anchor segment carrying price and time measurements.
     InfoLine,
-    /// Two-anchor segment with a horizontal reference, arc, and the screen angle.
+    /// Two-anchor segment carrying its visual angle.
     TrendAngle,
-    /// One-anchor horizontal plus vertical line crossing at the anchor.
+    /// One-anchor horizontal and vertical reference lines.
     CrossLine,
-    /// Two-anchor segment ending in an arrowhead.
+    /// Two-anchor segment with an arrow at its end.
     ArrowLine,
+    /// Three-anchor channel with a parallel second boundary.
+    ParallelChannel,
+    /// Three-anchor channel with a horizontal upper boundary.
+    #[serde(alias = "flat_top_bottom")]
+    FlatTopChannel,
+    /// Three-anchor channel with a horizontal lower boundary.
+    FlatBottomChannel,
+    /// Four-anchor channel whose two boundaries are independently placed.
+    DisjointChannel,
+    /// Least-squares trend channel over the selected source's closes.
+    RegressionTrend,
+    /// Multi-click straight polyline without a terminal arrow.
+    Polyline,
+    /// Broad translucent freehand mark.
+    Highlighter,
+    /// Rectangle defined by one edge and an orthogonal depth handle.
+    RotatedRectangle,
+    /// Ellipse fitted inside two opposite corners.
+    Ellipse,
+    /// Circle from center to perimeter.
+    Circle,
+    /// Three-anchor filled triangle.
+    Triangle,
+    /// Circular arc through three anchors.
+    Arc,
+    /// Three-anchor quadratic curve.
+    Curve,
+    /// Four-anchor cubic curve.
+    DoubleCurve,
+    /// Two-anchor Fibonacci price retracement with editable per-level styling.
+    #[serde(alias = "fib_retracement")]
+    FibonacciRetracement,
+    /// Three-anchor Fibonacci projection of a prior price and time swing.
+    #[serde(alias = "trend_based_fib_extension")]
+    FibonacciExtension,
+    /// Three-anchor sloped Fibonacci channel with editable parallel levels.
+    #[serde(alias = "fib_channel")]
+    FibonacciChannel,
+    /// Vertical Fibonacci time zones projected from a two-anchor interval.
+    #[serde(alias = "fib_time_zone")]
+    FibonacciTimeZones,
+    /// Vertical Fibonacci time projection from a third anchor.
+    #[serde(alias = "trend_based_fib_time")]
+    FibonacciTrendTime,
+    /// Sloped speed resistance levels fanning from the first anchor.
+    #[serde(alias = "fib_speed_resistance_fan")]
+    FibonacciSpeedFan,
+    /// Concentric speed resistance arcs centered on the second anchor.
+    #[serde(alias = "fib_speed_resistance_arcs")]
+    FibonacciSpeedArcs,
+    /// Full concentric Fibonacci circles centered on the second anchor.
+    #[serde(alias = "fib_circles")]
+    FibonacciCircles,
+    /// Two-turn spiral scaled from the first anchor toward the second.
+    #[serde(alias = "fib_spiral")]
+    FibonacciSpiral,
+    /// Three-anchor wedge with rays interpolated between its two edges.
+    #[serde(alias = "fib_wedge")]
+    FibonacciWedge,
+    /// Andrews median line with parallel outer tines.
+    AndrewsPitchfork,
+    /// Pitchfork with the median pivot shifted halfway in price.
+    SchiffPitchfork,
+    /// Pitchfork with the median pivot shifted halfway in time and price.
+    ModifiedSchiffPitchfork,
+    /// Pitchfork with a median from the first two anchors' midpoint through the third.
+    InsidePitchfork,
+    /// Rays fanning from the first anchor through levels on the other two anchors.
+    Pitchfan,
+    /// Five-point harmonic XABCD path.
+    #[serde(alias = "xabcd_pattern")]
+    PatternXabcd,
+    /// Five-point cypher harmonic path.
+    #[serde(alias = "cypher_pattern")]
+    PatternCypher,
+    /// Four-point AB=CD path.
+    #[serde(alias = "abcd_pattern")]
+    PatternAbcd,
+    /// Left shoulder, head, right shoulder and neckline path.
+    #[serde(alias = "head_and_shoulders")]
+    PatternHeadShoulders,
+    /// Five-point converging triangle path.
+    #[serde(alias = "triangle_pattern")]
+    PatternTriangle,
+    /// Three-drive reversal path.
+    #[serde(alias = "three_drives_pattern")]
+    PatternThreeDrives,
+    /// Elliott impulse path, start through waves one to five.
+    #[serde(alias = "elliott_impulse_wave")]
+    ElliottImpulse,
+    /// Elliott correction path, start through waves A to C.
+    #[serde(alias = "elliott_correction_wave")]
+    ElliottCorrection,
+    /// Elliott triangle path, start through waves A to E.
+    #[serde(alias = "elliott_triangle_wave")]
+    ElliottTriangle,
+    /// Elliott double combination path.
+    #[serde(alias = "elliott_double_combo")]
+    ElliottDoubleCombination,
+    /// Elliott triple combination path.
+    #[serde(alias = "elliott_triple_combo")]
+    ElliottTripleCombination,
+    /// Repeated vertical lines at the interval between two anchors.
+    CyclicLines,
+    /// Forward time-cycle markers and alternating cycle bands.
+    TimeCycles,
+    /// Repeating sine wave with the second anchor as its first quarter-cycle peak.
+    SineLine,
+    /// Directional chart marker pointing up.
+    #[serde(alias = "arrow_mark_up")]
+    ArrowMarkerUp,
+    /// Directional chart marker pointing down.
+    #[serde(alias = "arrow_mark_down")]
+    ArrowMarkerDown,
+    /// Directional chart marker pointing left.
+    #[serde(alias = "arrow_mark_left")]
+    ArrowMarkerLeft,
+    /// Directional chart marker pointing right.
+    #[serde(alias = "arrow_mark_right")]
+    ArrowMarkerRight,
+    /// Flag marker at one chart anchor.
+    FlagMark,
+    /// Two-anchor signpost with a stem and marker head.
+    Signpost,
+    /// One-anchor boxed note.
+    Note,
+    /// One-anchor boxed comment.
+    Comment,
+    /// Two-anchor callout leader and editable text.
+    Callout,
+    /// Horizontal price guide with editable note.
+    PriceNote,
+    /// One-anchor price badge at the pane edge.
+    PriceLabel,
+    /// Text fixed to a normalized position in the pane viewport.
+    AnchoredText,
+    /// Host supplied bounded raster icon at one chart anchor.
+    #[serde(alias = "icon")]
+    IconStamp,
+    /// Price and time partition grid between two anchors.
+    GannBox,
+    /// Gann square with grid, fan and arc geometry.
+    GannSquare,
+    /// Gann square whose display box remains square in media pixels.
+    GannSquareFixed,
+    /// Nine proportionate Gann angle rays from a pivot.
+    GannFan,
+    /// Three-anchor future price sector: apex, time horizon, projected price.
+    Projection,
+    /// Trade target projection with a data-derived result after its time horizon.
+    Forecast,
+    /// Frozen, movable copy of a bounded source OHLC range.
+    BarsPattern,
+    // Own-line tools (not in AerisTerminal upstream).
     /// Two-anchor segment whose anchors share one price (KLineChart `horizontalSegment`).
     HorizontalSegment,
     /// Two-anchor vertical line from the first anchor through the second to the pane edge; both
@@ -433,177 +868,49 @@ pub enum DrawingKind {
     /// One-anchor line from the anchor to the pane's right edge with its price printed on the
     /// line and tagged on the price axis (KLineChart `priceLine`).
     PriceLine,
-    // B8: lines — end
-    // B8: channels — begin
-    /// Three-anchor channel: the first two anchors define the base line and the parallel line
-    /// passes through the third.
-    ParallelChannel,
-    /// Two-anchor least-squares regression of the source series over the anchored bar range,
-    /// with standard-deviation lines above and below.
-    RegressionTrend,
-    /// Three-anchor channel between the trend line through the first two anchors and a
-    /// horizontal line at the third anchor's price.
-    FlatTopBottom,
-    /// Three-anchor channel whose second line passes through the third anchor with the first
-    /// line's slope mirrored.
-    DisjointChannel,
     /// Three-anchor channel: the base line through the first two anchors, its parallel through
     /// the third, and the base line mirrored on the other side (KLineChart `priceChannelLine`).
     PriceChannel,
-    // B8: channels — end
-    // B8: fibonacci — begin
-    /// Two-anchor Fibonacci retracement: horizontal ratio levels between the anchors' prices.
-    FibRetracement,
-    /// Three-anchor trend-based Fibonacci extension: the first leg's move projected from the
-    /// third anchor at ratio levels.
-    TrendBasedFibExtension,
-    /// Three-anchor Fibonacci channel: ratio lines parallel to the first two anchors, offset
-    /// toward the third.
-    FibChannel,
-    /// Two-anchor Fibonacci time zones: vertical lines at Fibonacci multiples of the anchors'
-    /// time distance.
-    FibTimeZone,
-    /// Three-anchor trend-based Fibonacci time: the first leg's duration projected from the
-    /// third anchor at ratio levels.
-    TrendBasedFibTime,
-    /// Two-anchor Fibonacci speed resistance fan: price and time ratio rays from the first anchor.
-    FibSpeedResistanceFan,
-    /// Two-anchor Fibonacci speed resistance arcs: ratio arcs around the first anchor.
-    FibSpeedResistanceArcs,
-    /// Two-anchor Fibonacci circles: concentric ratio circles around the anchors' midpoint.
-    FibCircles,
-    /// Two-anchor golden spiral around the first anchor through the second.
-    FibSpiral,
-    /// Three-anchor Fibonacci wedge: ratio arcs between two edges from the first anchor.
-    FibWedge,
-    // B8: fibonacci — end
-    // B8: pitchforks_gann — begin
-    /// Three-anchor Andrews pitchfork: a median from the first anchor through the midpoint of
-    /// the other two, with parallel level lines (tines) through them.
-    AndrewsPitchfork,
-    /// Andrews pitchfork whose median starts halfway between the first two anchors' prices at the
-    /// first anchor's time.
-    SchiffPitchfork,
-    /// Andrews pitchfork whose median starts at the midpoint of the first two anchors.
-    ModifiedSchiffPitchfork,
-    /// Pitchfork whose median runs from the midpoint of the first two anchors through the third,
-    /// with tines through the second anchor and its reflection about the third.
-    InsidePitchfork,
-    /// Three-anchor fan of lines from the first anchor through the pitchfork levels on the
-    /// segment between the other two.
-    Pitchfan,
-    /// Two-corner box of price and time levels with zone fills and optional Gann angles.
-    GannBox,
-    /// Two-corner Gann square: grid, angle fan, and arcs from its first corner.
-    GannSquare,
-    /// One-anchor Gann square of a fixed size in bars and a fixed price-per-bar scale ratio.
-    GannSquareFixed,
-    /// Two-anchor Gann fan: 1×8 … 8×1 angle lines from the first anchor, the 1×1 through the
-    /// second anchor or at a price-per-bar scale ratio.
-    GannFan,
-    // B8: pitchforks_gann — end
-    // B8: projection_annotations — begin
-    /// Two-anchor forecast (source, target) with engine-evaluated success or failure.
-    Forecast,
-    /// Two-anchor ghost copy of the bars between its anchors, captured at creation.
-    BarsPattern,
-    /// Two-anchor price measurement: range lines, arrow, fill, and change stats.
-    PriceRange,
-    /// Two-anchor time measurement: range lines, arrow, fill, and bar/duration stats.
-    DateRange,
-    /// Two-anchor price and time measurement (also the Shift-click quick measure). The
-    /// pre-merge spelling `date_price_range` is still read, never written.
-    #[serde(alias = "date_price_range")]
-    DateAndPriceRange,
-    /// Three-anchor sector projection: apex, radius point, and price point.
-    Projection,
-    /// One-anchor text pinned to a pane position (the anchor is a pane fraction).
-    AnchoredText,
-    /// One-anchor pin marker with a note.
-    Note,
-    /// Two-anchor price note: a leader from the priced point to its price label.
-    PriceNote,
-    /// Two-anchor callout: a text box with a pointer to the annotated point.
-    Callout,
-    /// One-anchor speech bubble whose tail points at the anchor.
-    Comment,
-    /// One-anchor price tag whose tail points at the anchor.
-    PriceLabel,
-    /// One-anchor signpost: a pole from the anchor up to a text plate.
-    Signpost,
-    /// One-anchor flag marker.
-    FlagMark,
-    /// One-anchor up arrow whose tip sits on the anchor.
-    ArrowMarkUp,
-    /// One-anchor down arrow whose tip sits on the anchor.
-    ArrowMarkDown,
-    /// One-anchor left arrow whose tip sits on the anchor.
-    ArrowMarkLeft,
-    /// One-anchor right arrow whose tip sits on the anchor.
-    ArrowMarkRight,
-    /// One-anchor icon from the bounded built-in icon set.
-    Icon,
     /// One-anchor dashed line across the pane tagged on the price axis with the drawing's text,
     /// or its price when it has none (KLineChart `simpleTag`).
     SimpleTag,
     /// One-anchor annotation: a dashed stem above the anchor ending in a downward head under a
     /// boxed text (KLineChart `simpleAnnotation`).
     SimpleAnnotation,
-    // B8: projection_annotations — end
-    // B8: patterns_elliott_cycles — begin
-    /// Five-anchor harmonic XABCD pattern with ratio connectors and shaded triangles.
-    XabcdPattern,
-    /// Five-anchor cypher harmonic pattern (C extends XA, D retraces XC).
-    CypherPattern,
-    /// Four-anchor ABCD pattern with ratio connectors.
-    AbcdPattern,
-    /// Seven-anchor head and shoulders with its neckline.
-    HeadAndShoulders,
-    /// Four-anchor triangle pattern whose sides converge to their apex.
-    TrianglePattern,
-    /// Seven-anchor three drives pattern with ratio connectors.
-    ThreeDrivesPattern,
-    /// Six-anchor Elliott impulse wave (0-1-2-3-4-5).
-    ElliottImpulseWave,
-    /// Four-anchor Elliott correction wave (0-A-B-C).
-    ElliottCorrectionWave,
-    /// Six-anchor Elliott triangle wave (0-A-B-C-D-E).
-    ElliottTriangleWave,
-    /// Four-anchor Elliott double combination (0-W-X-Y).
-    ElliottDoubleCombo,
-    /// Six-anchor Elliott triple combination (0-W-X-Y-X-Z).
-    ElliottTripleCombo,
-    /// Two-anchor cyclic lines: vertical lines every anchor interval to the right.
-    CyclicLines,
-    /// Two-anchor time cycles: repeated half-ellipse arches.
-    TimeCycles,
-    /// Two-anchor sine line through a peak and the following trough.
-    SineLine,
-    // B8: patterns_elliott_cycles — end
-    // B8: shapes — begin
-    /// Three-anchor rectangle at any angle: the first two anchors are the midpoints of its short
-    /// sides, the third lies on a long side.
-    RotatedRectangle,
-    /// Two-corner ellipse inscribed in the corners' box.
-    Ellipse,
-    /// Two-anchor screen circle: center and a point on the rim.
-    Circle,
-    /// Three-vertex triangle.
-    Triangle,
-    /// Three-anchor circular arc from the first anchor to the second through the third.
-    Arc,
-    /// Three-anchor quadratic curve from the first anchor to the second through the third.
-    Curve,
-    /// Four-anchor cubic curve from the first anchor to the second through the third and fourth.
-    DoubleCurve,
-    /// Multi-click polyline, open or closed.
-    Polyline,
-    /// Freehand wide translucent stroke.
-    Highlighter,
-    // B8: shapes — end
 }
 
 impl DrawingKind {
+    pub(crate) const fn has_levels(self) -> bool {
+        matches!(
+            self,
+            Self::FibonacciRetracement
+                | Self::FibonacciExtension
+                | Self::FibonacciChannel
+                | Self::FibonacciTimeZones
+                | Self::FibonacciTrendTime
+                | Self::FibonacciSpeedFan
+                | Self::FibonacciSpeedArcs
+                | Self::FibonacciCircles
+                | Self::FibonacciSpiral
+                | Self::FibonacciWedge
+                | Self::AndrewsPitchfork
+                | Self::SchiffPitchfork
+                | Self::ModifiedSchiffPitchfork
+                | Self::InsidePitchfork
+                | Self::Pitchfan
+                | Self::GannBox
+                | Self::GannSquare
+                | Self::GannSquareFixed
+                | Self::GannFan
+        )
+    }
+
+    pub(crate) const fn supports_log_levels(self) -> bool {
+        matches!(
+            self,
+            Self::FibonacciRetracement | Self::FibonacciExtension | Self::FibonacciChannel
+        )
+    }
     pub fn from_u8(kind: u8) -> Option<Self> {
         DRAWING_TOOL_SPECS
             .iter()
@@ -620,14 +927,19 @@ impl DrawingKind {
         self.spec().name
     }
 
+    /// The kind written under `name`: a catalog name first, then an input-only legacy fork
+    /// spelling ([`LEGACY_DRAWING_KIND_NAMES`]). Legacy spellings are never written back.
     pub fn from_name(name: &str) -> Option<Self> {
         DRAWING_TOOL_SPECS
             .iter()
             .find(|spec| spec.name == name)
             .map(|spec| spec.kind)
-            // Input-only alias of the spelling documents, templates, and clipboard payloads carried
-            // before the measuring tools became catalog entries of the projection family.
-            .or((name == "date_price_range").then_some(Self::DateAndPriceRange))
+            .or_else(|| {
+                LEGACY_DRAWING_KIND_NAMES
+                    .iter()
+                    .find(|(legacy, _)| *legacy == name)
+                    .map(|&(_, kind)| kind)
+            })
     }
 
     /// The number of defining anchors the kind is placed with (and its handles show). Brush and
@@ -648,6 +960,49 @@ impl DrawingKind {
         self.spec().family.is_none_or(|family| !family.owns_text)
     }
 }
+
+/// Tool names the fork wrote before it adopted AerisTerminal upstream's B8 catalog, mapped to the
+/// upstream kind that is the same tool. Input only: documents, templates, clipboard payloads, and
+/// hosts that still use these spellings keep loading, and every output writes the catalog name
+/// ([`DrawingKind::name`]). The same pairs are `#[serde(alias)]`es on the variants.
+/// `flat_top_bottom` resolves to [`DrawingKind::FlatTopChannel`] wherever no anchors decide;
+/// persistence picks the flat-top or flat-bottom channel from the stored anchors.
+pub(crate) const LEGACY_DRAWING_KIND_NAMES: [(&str, DrawingKind); 28] = [
+    ("date_and_price_range", DrawingKind::DatePriceRange),
+    ("flat_top_bottom", DrawingKind::FlatTopChannel),
+    ("fib_retracement", DrawingKind::FibonacciRetracement),
+    ("trend_based_fib_extension", DrawingKind::FibonacciExtension),
+    ("fib_channel", DrawingKind::FibonacciChannel),
+    ("fib_time_zone", DrawingKind::FibonacciTimeZones),
+    ("trend_based_fib_time", DrawingKind::FibonacciTrendTime),
+    ("fib_speed_resistance_fan", DrawingKind::FibonacciSpeedFan),
+    ("fib_speed_resistance_arcs", DrawingKind::FibonacciSpeedArcs),
+    ("fib_circles", DrawingKind::FibonacciCircles),
+    ("fib_spiral", DrawingKind::FibonacciSpiral),
+    ("fib_wedge", DrawingKind::FibonacciWedge),
+    ("xabcd_pattern", DrawingKind::PatternXabcd),
+    ("cypher_pattern", DrawingKind::PatternCypher),
+    ("abcd_pattern", DrawingKind::PatternAbcd),
+    ("head_and_shoulders", DrawingKind::PatternHeadShoulders),
+    ("triangle_pattern", DrawingKind::PatternTriangle),
+    ("three_drives_pattern", DrawingKind::PatternThreeDrives),
+    ("elliott_impulse_wave", DrawingKind::ElliottImpulse),
+    ("elliott_correction_wave", DrawingKind::ElliottCorrection),
+    ("elliott_triangle_wave", DrawingKind::ElliottTriangle),
+    (
+        "elliott_double_combo",
+        DrawingKind::ElliottDoubleCombination,
+    ),
+    (
+        "elliott_triple_combo",
+        DrawingKind::ElliottTripleCombination,
+    ),
+    ("arrow_mark_up", DrawingKind::ArrowMarkerUp),
+    ("arrow_mark_down", DrawingKind::ArrowMarkerDown),
+    ("arrow_mark_left", DrawingKind::ArrowMarkerLeft),
+    ("arrow_mark_right", DrawingKind::ArrowMarkerRight),
+    ("icon", DrawingKind::IconStamp),
+];
 
 /// One defining anchor of a drawing: a fractional logical bar index (integer values sit at bar
 /// centers — the time scale's `logical_to_coordinate` space) plus a price. The unused
@@ -836,6 +1191,31 @@ pub struct Drawing {
     pub magnet: crate::DrawingMagnetMode,
     pub labels: Vec<crate::DrawingLabelOptions>,
     pub levels: Vec<crate::DrawingLevel>,
+    /// Independently styled angle rays and quarter arcs on Gann squares.
+    pub gann_fans: Vec<crate::DrawingLevel>,
+    pub gann_arcs: Vec<crate::DrawingLevel>,
+    pub level_reverse: bool,
+    pub level_log_scale: bool,
+    pub level_show_prices: bool,
+    pub level_show_values: bool,
+    pub level_show_percents: bool,
+    /// `left`, `center`, or `right`.
+    pub level_label_align: String,
+    /// Elliott wave label degree; used only by the five Elliott tools.
+    pub wave_degree: String,
+    /// Normalized pane position of screen anchored text, independent of time and price scales.
+    pub screen_x: f64,
+    pub screen_y: f64,
+    /// Stable host asset key for an icon stamp; pixels are chart-local and never serialized.
+    pub icon_name: Option<String>,
+    /// Icon stamp destination size in CSS pixels.
+    pub icon_size: f64,
+    /// Source OHLC snapshot for a movable bars-pattern ghost copy.
+    pub bars_pattern: Vec<BarsPatternBar>,
+    pub bars_pattern_mirror_x: bool,
+    pub bars_pattern_mirror_y: bool,
+    /// `bars`, `line_open`, `line_high`, `line_low`, or `line_close`.
+    pub bars_pattern_mode: String,
     pub price_scale: DrawingPriceScale,
     /// Optional engine-data binding for volume-profile and anchored-VWAP drawings.
     pub profile: Option<crate::ProfileDrawingOptions>,
@@ -845,6 +1225,10 @@ pub struct Drawing {
     pub position_account_size: f64,
     /// Percentage of the hypothetical balance risked at the stop (0..=100).
     pub position_risk_percent: f64,
+    /// Optional explicit source for regression trend; `None` follows the pane's primary series.
+    pub regression_source_id: Option<u32>,
+    /// Number of residual standard deviations on each side of the regression center.
+    pub regression_deviations: f64,
     /// Line/border color CSS string (default [`DRAWING_DEFAULT_COLOR`]).
     pub color: String,
     /// Stroke width in CSS px (default 2; 1 for a rectangle's border).
@@ -871,9 +1255,11 @@ pub struct Drawing {
     /// `MouseEventParams.time` placement instead of retaining a fractional x coordinate.
     pub snap_time_to_data: bool,
     /// The tool's text label (`""` = none), at most `MAX_DRAWING_TEXT_BYTES` bytes. Every tool that
-    /// paints text edits it in place (the nine tools that paint none keep it unpainted). An empty
-    /// label paints nothing and keeps its drawing, except for the text tool, whose empty state is
-    /// the host typing-mode editor: leaving that editor without typed text removes the drawing.
+    /// paints text edits it in place (the four that paint none, the measuring tools and the simple
+    /// tag, keep it unpainted or on the axis). An empty label paints nothing and keeps its
+    /// drawing, except for the text tool and the text annotations (note, comment, callout, price
+    /// note, anchored text), whose empty state is the typing-mode editor: leaving that editor
+    /// without typed text removes the drawing.
     pub text: String,
     /// Label color CSS string. `None` follows the drawing stroke for a label that follows a
     /// segment (trend lines, rays, channels, ...) and the chart's `layout.textColor` otherwise.
@@ -910,6 +1296,30 @@ pub const TEXT_TOOL_DEFAULT_SIZE: f64 = 14.0;
 pub(crate) const TEXT_CHROME_PAD: f64 = TEXT_PAD + 2.0;
 pub(crate) const TREND_TEXT_PLACEHOLDER: &str = "+ Add text";
 
+fn default_gann_level(value: f64) -> crate::DrawingLevel {
+    crate::DrawingLevel {
+        value,
+        color: String::new(),
+        visible: true,
+        style: "solid".to_string(),
+        fill_between: false,
+        fill_color: None,
+        label_visible: false,
+    }
+}
+
+pub(crate) fn valid_gann_family(levels: &[crate::DrawingLevel], fan: bool) -> bool {
+    levels.len() <= crate::MAX_DRAWING_LEVELS
+        && levels.iter().all(|level| {
+            level.validate()
+                && if fan {
+                    (0.01..=100.0).contains(&level.value)
+                } else {
+                    (0.0..=1.0).contains(&level.value)
+                }
+        })
+}
+
 impl Drawing {
     pub(crate) fn new(
         id: DrawingId,
@@ -918,8 +1328,12 @@ impl Drawing {
         mut points: Vec<DrawingPoint>,
     ) -> Self {
         Self::normalize_points(kind, &mut points);
-        // Segment labels default to the top-right slot along the line.
-        let (text_h_align, text_v_align) = if kind.spec().text_layout == DrawingTextLayout::Segment
+        // Upstream's top-right kinds, plus the family tools whose label runs along a segment.
+        let (text_h_align, text_v_align) = if matches!(
+            kind,
+            DrawingKind::TrendLine | DrawingKind::Callout | DrawingKind::PriceNote
+        ) || (kind.spec().family.is_some()
+            && kind.spec().text_layout == DrawingTextLayout::Segment)
         {
             (DrawingTextHAlign::Right, DrawingTextVAlign::Top)
         } else {
@@ -937,18 +1351,213 @@ impl Drawing {
             locked: false,
             z_order: id as i32,
             interval_visibility: Default::default(),
-            stroke_start: Default::default(),
-            stroke_end: Default::default(),
+            stroke_start: if kind == DrawingKind::Callout {
+                crate::DrawingLineCap::Arrow
+            } else {
+                Default::default()
+            },
+            stroke_end: if kind == DrawingKind::ArrowLine {
+                crate::DrawingLineCap::Arrow
+            } else {
+                Default::default()
+            },
             extend_left: false,
             extend_right: false,
-            fill_enabled: kind == DrawingKind::Rectangle,
+            fill_enabled: kind == DrawingKind::Rectangle
+                || kind.is_measure()
+                || matches!(
+                    kind,
+                    DrawingKind::ParallelChannel
+                        | DrawingKind::RegressionTrend
+                        | DrawingKind::FlatTopChannel
+                        | DrawingKind::FlatBottomChannel
+                        | DrawingKind::DisjointChannel
+                        | DrawingKind::RotatedRectangle
+                        | DrawingKind::Ellipse
+                        | DrawingKind::Circle
+                        | DrawingKind::Triangle
+                        | DrawingKind::FibonacciRetracement
+                        | DrawingKind::FibonacciExtension
+                        | DrawingKind::FibonacciChannel
+                        | DrawingKind::FibonacciTimeZones
+                        | DrawingKind::FibonacciTrendTime
+                        | DrawingKind::FibonacciSpeedFan
+                        | DrawingKind::FibonacciSpeedArcs
+                        | DrawingKind::FibonacciCircles
+                        | DrawingKind::FibonacciSpiral
+                        | DrawingKind::FibonacciWedge
+                        | DrawingKind::AndrewsPitchfork
+                        | DrawingKind::SchiffPitchfork
+                        | DrawingKind::ModifiedSchiffPitchfork
+                        | DrawingKind::InsidePitchfork
+                        | DrawingKind::Pitchfan
+                        | DrawingKind::TimeCycles
+                        | DrawingKind::GannBox
+                        | DrawingKind::GannSquare
+                        | DrawingKind::GannSquareFixed
+                        | DrawingKind::GannFan
+                        | DrawingKind::Projection
+                ),
             magnet: Default::default(),
-            labels: Vec::new(),
-            levels: Vec::new(),
+            labels: match kind {
+                DrawingKind::InfoLine => [
+                    crate::DrawingLabelMetric::PriceChange,
+                    crate::DrawingLabelMetric::PercentChange,
+                    crate::DrawingLabelMetric::BarCount,
+                    crate::DrawingLabelMetric::Angle,
+                ]
+                .into_iter()
+                .map(|metric| crate::DrawingLabelOptions {
+                    metric,
+                    visible: true,
+                    position: crate::DrawingLabelPosition::Above,
+                    text: None,
+                })
+                .collect(),
+                DrawingKind::TrendAngle => vec![crate::DrawingLabelOptions {
+                    metric: crate::DrawingLabelMetric::Angle,
+                    visible: true,
+                    position: crate::DrawingLabelPosition::Above,
+                    text: None,
+                }],
+                _ => Vec::new(),
+            },
+            levels: if matches!(
+                kind,
+                DrawingKind::FibonacciRetracement
+                    | DrawingKind::FibonacciExtension
+                    | DrawingKind::FibonacciChannel
+                    | DrawingKind::FibonacciTimeZones
+                    | DrawingKind::FibonacciTrendTime
+                    | DrawingKind::FibonacciSpeedFan
+                    | DrawingKind::FibonacciSpeedArcs
+                    | DrawingKind::FibonacciCircles
+                    | DrawingKind::FibonacciSpiral
+                    | DrawingKind::FibonacciWedge
+                    | DrawingKind::AndrewsPitchfork
+                    | DrawingKind::SchiffPitchfork
+                    | DrawingKind::ModifiedSchiffPitchfork
+                    | DrawingKind::InsidePitchfork
+                    | DrawingKind::Pitchfan
+                    | DrawingKind::GannBox
+                    | DrawingKind::GannSquare
+                    | DrawingKind::GannSquareFixed
+                    | DrawingKind::GannFan
+            ) {
+                let values: &[f64] = if matches!(
+                    kind,
+                    DrawingKind::FibonacciTimeZones | DrawingKind::FibonacciTrendTime
+                ) {
+                    &[0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0]
+                } else if kind == DrawingKind::FibonacciExtension {
+                    &[0.0, 0.618, 1.0, 1.618, 2.0, 2.618]
+                } else if kind == DrawingKind::GannFan {
+                    &[0.125, 0.25, 0.333333333333, 0.5, 1.0, 2.0, 3.0, 4.0, 8.0]
+                } else if matches!(
+                    kind,
+                    DrawingKind::GannBox | DrawingKind::GannSquare | DrawingKind::GannSquareFixed
+                ) {
+                    &[0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0]
+                } else if matches!(
+                    kind,
+                    DrawingKind::AndrewsPitchfork
+                        | DrawingKind::SchiffPitchfork
+                        | DrawingKind::ModifiedSchiffPitchfork
+                        | DrawingKind::InsidePitchfork
+                ) {
+                    &[0.0, 0.5, 1.0]
+                } else if kind == DrawingKind::Pitchfan {
+                    &[0.0, 0.25, 0.5, 0.75, 1.0]
+                } else {
+                    &[0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
+                };
+                values
+                    .iter()
+                    .map(|&value| crate::DrawingLevel {
+                        value,
+                        color: String::new(),
+                        visible: true,
+                        style: "solid".to_string(),
+                        fill_between: false,
+                        fill_color: None,
+                        label_visible: true,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            gann_fans: if matches!(kind, DrawingKind::GannSquare | DrawingKind::GannSquareFixed) {
+                [0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+                    .into_iter()
+                    .map(default_gann_level)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            gann_arcs: if matches!(kind, DrawingKind::GannSquare | DrawingKind::GannSquareFixed) {
+                [0.25, 0.5, 0.75, 1.0]
+                    .into_iter()
+                    .map(default_gann_level)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            wave_degree: "minor".to_string(),
+            level_reverse: false,
+            level_log_scale: false,
+            level_show_prices: matches!(
+                kind,
+                DrawingKind::FibonacciRetracement
+                    | DrawingKind::FibonacciExtension
+                    | DrawingKind::FibonacciChannel
+            ),
+            level_show_values: matches!(
+                kind,
+                DrawingKind::FibonacciTimeZones | DrawingKind::FibonacciTrendTime
+            ),
+            level_show_percents: !matches!(
+                kind,
+                DrawingKind::FibonacciTimeZones | DrawingKind::FibonacciTrendTime
+            ),
+            level_label_align: if matches!(
+                kind,
+                DrawingKind::FibonacciTimeZones | DrawingKind::FibonacciTrendTime
+            ) {
+                "left"
+            } else if matches!(
+                kind,
+                DrawingKind::FibonacciSpeedArcs
+                    | DrawingKind::FibonacciCircles
+                    | DrawingKind::FibonacciSpiral
+                    | DrawingKind::FibonacciWedge
+                    | DrawingKind::AndrewsPitchfork
+                    | DrawingKind::SchiffPitchfork
+                    | DrawingKind::ModifiedSchiffPitchfork
+                    | DrawingKind::InsidePitchfork
+                    | DrawingKind::Pitchfan
+                    | DrawingKind::GannBox
+                    | DrawingKind::GannSquare
+                    | DrawingKind::GannSquareFixed
+            ) {
+                "center"
+            } else {
+                "right"
+            }
+            .to_string(),
+            screen_x: 0.5,
+            screen_y: 0.5,
+            icon_name: None,
+            icon_size: 24.0,
+            bars_pattern: Vec::new(),
+            bars_pattern_mirror_x: false,
+            bars_pattern_mirror_y: false,
+            bars_pattern_mode: "bars".to_string(),
             price_scale: DrawingPriceScale::Right,
             profile: None,
             position_account_size: 1000.0,
             position_risk_percent: 25.0,
+            regression_source_id: None,
+            regression_deviations: 2.0,
             color: DRAWING_DEFAULT_COLOR.to_string(),
             width: kind.spec().default_width,
             style: LineStyle::Solid,
@@ -967,8 +1576,18 @@ impl Drawing {
             text_italic: false,
             text_h_align,
             text_v_align,
-            box_color: None,
-            box_border_color: None,
+            box_color: match kind {
+                DrawingKind::Note => Some("#facc1533".to_string()),
+                DrawingKind::Comment | DrawingKind::Callout => Some("#2962ff22".to_string()),
+                _ => None,
+            },
+            box_border_color: match kind {
+                DrawingKind::Note => Some("#eab308".to_string()),
+                DrawingKind::Comment | DrawingKind::Callout => {
+                    Some(DRAWING_DEFAULT_COLOR.to_string())
+                }
+                _ => None,
+            },
             box_border_width: aeris_charts_core::style::BORDER_WIDTH,
             tool_options: Default::default(),
             pending_times: Vec::new(),
@@ -990,11 +1609,7 @@ impl Drawing {
         {
             pending[2] = pending[0];
         }
-        // Pane-anchored anchors are pane fractions with no time identity.
-        if pending.len() != self.points.len()
-            || pending.iter().all(Option::is_none)
-            || self.kind.pane_anchored()
-        {
+        if pending.len() != self.points.len() || pending.iter().all(Option::is_none) {
             pending.clear();
         }
         self.pending_times = pending;
@@ -1055,7 +1670,7 @@ impl Drawing {
     /// resolve through this so they never disagree.
     pub fn resolved_text_size(&self, layout_font_size: f64) -> f64 {
         self.text_size.unwrap_or(match self.kind {
-            DrawingKind::Text => TEXT_TOOL_DEFAULT_SIZE,
+            DrawingKind::Text | DrawingKind::AnchoredText => TEXT_TOOL_DEFAULT_SIZE,
             _ => layout_font_size,
         })
     }
@@ -1123,10 +1738,31 @@ impl Drawing {
                 label_text_color: self.label_text_color.clone(),
                 snap_time_to_data: self.snap_time_to_data,
             },
-            DrawingKind::Text => crate::DrawingKindOptions::Text {
+            DrawingKind::Text
+            | DrawingKind::Note
+            | DrawingKind::Comment
+            | DrawingKind::Callout
+            | DrawingKind::PriceNote => crate::DrawingKindOptions::Text {
                 box_color: self.box_color.clone(),
                 box_border_color: self.box_border_color.clone(),
                 box_border_width: self.box_border_width,
+            },
+            DrawingKind::AnchoredText => crate::DrawingKindOptions::AnchoredText {
+                screen_x: self.screen_x,
+                screen_y: self.screen_y,
+                box_color: self.box_color.clone(),
+                box_border_color: self.box_border_color.clone(),
+                box_border_width: self.box_border_width,
+            },
+            DrawingKind::IconStamp => crate::DrawingKindOptions::IconStamp {
+                icon_name: self.icon_name.clone(),
+                icon_size: self.icon_size,
+            },
+            DrawingKind::BarsPattern => crate::DrawingKindOptions::BarsPattern {
+                mirror_x: self.bars_pattern_mirror_x,
+                mirror_y: self.bars_pattern_mirror_y,
+                mode: self.bars_pattern_mode.clone(),
+                bar_count: self.bars_pattern.len(),
             },
             DrawingKind::LongPosition | DrawingKind::ShortPosition => {
                 crate::DrawingKindOptions::Position {
@@ -1135,6 +1771,34 @@ impl Drawing {
                     risk_percent: self.position_risk_percent,
                 }
             }
+            DrawingKind::RegressionTrend => crate::DrawingKindOptions::RegressionTrend {
+                source_id: self.regression_source_id,
+                deviations: self.regression_deviations,
+            },
+            kind if kind.is_elliott() => crate::DrawingKindOptions::Elliott {
+                wave_degree: self.wave_degree.clone(),
+            },
+            DrawingKind::GannSquare | DrawingKind::GannSquareFixed => {
+                crate::DrawingKindOptions::GannSquare {
+                    levels: self.levels.clone(),
+                    fans: self.gann_fans.clone(),
+                    arcs: self.gann_arcs.clone(),
+                    reverse: self.level_reverse,
+                    show_prices: self.level_show_prices,
+                    show_values: self.level_show_values,
+                    show_percents: self.level_show_percents,
+                    label_align: self.level_label_align.clone(),
+                }
+            }
+            kind if kind.has_levels() => crate::DrawingKindOptions::Levels {
+                levels: self.levels.clone(),
+                reverse: self.level_reverse,
+                log_scale: self.level_log_scale,
+                show_prices: self.level_show_prices,
+                show_values: self.level_show_values,
+                show_percents: self.level_show_percents,
+                label_align: self.level_label_align.clone(),
+            },
             _ => crate::DrawingKindOptions::Generic,
         }
     }
@@ -1143,8 +1807,7 @@ impl Drawing {
     where
         F: Fn(f64) -> f64 + Copy,
     {
-        // Pane fractions do not follow the time axis.
-        !self.kind.pane_anchored() && rebase_points_with(&mut self.points, map)
+        rebase_points_with(&mut self.points, map)
     }
 }
 
@@ -1163,9 +1826,10 @@ where
 
 /// The part of a drawing a hit/drag landed on: the whole shape (a move drag), one handle of the
 /// drawing's handle mode (a defining anchor, or a rectangle's bounds handle and a Long/Short
-/// Position's control by their handle index), or a derived handle its drawing family places on
-/// its geometry (a rotated rectangle's width handles, a pitchfork's base midpoint, a fixed Gann
-/// square's corner), numbered in the family's derived-handle order.
+/// Position's control by their handle index), or a derived handle a drawing family would place
+/// on its geometry, numbered in the family's derived-handle order. No family derives one since
+/// the upstream B8 sync (see the `ponytail:` note on the drag code), so `Handle` is never
+/// produced today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrawingDragPart {
     Body,
@@ -1231,9 +1895,14 @@ pub(crate) struct DrawingDrag {
     pub(crate) handle_px: (f64, f64),
     /// Original semantic snapshot retained for cancellation and the one committed history entry.
     pub(crate) history_points: Vec<DrawingPoint>,
-    /// Family options at the press: a family drag may edit them (a fixed square's size), and
-    /// cancellation and the history entry restore them with the anchors.
+    /// Family options at the press: a family drag may edit them, and cancellation and the
+    /// history entry restore them with the anchors.
     pub(crate) history_tool_options: crate::DrawingToolOptions,
+    /// Anchored text's `(screen_x, screen_y)` at the press, restored with the anchors.
+    pub(crate) history_screen_position: (f64, f64),
+    /// A bars pattern's frozen snapshot at the press: a source-anchor drag recaptures it on
+    /// commit, and cancellation and the history entry restore it.
+    pub(crate) history_bars_pattern: Vec<BarsPatternBar>,
     /// A keyboard nudge's media-px step; `None` for a pointer drag.
     pub(crate) keyboard_step: Option<(f64, f64)>,
 }
@@ -1564,6 +2233,21 @@ pub(crate) const TEXT_PAD: f64 = 4.0;
 /// A press-release farther than the shared 5 px Manhattan click slop is a drag-measure.
 const MEASURE_DRAG_SLOP: f64 = 5.0;
 
+/// Screen pad `(x, y)` in CSS px a kind's own glyphs reach beyond its anchors: a marker's head,
+/// an icon stamp's half size, a forecast's result box. Screen culling and the semantic
+/// intersection test share it so they cannot drift.
+fn drawing_kind_pad(drawing: &Drawing) -> (f64, f64) {
+    if drawing.kind.is_marker() {
+        (16.0, 16.0)
+    } else if drawing.kind == DrawingKind::IconStamp {
+        (drawing.icon_size / 2.0, drawing.icon_size / 2.0)
+    } else if drawing.kind == DrawingKind::Forecast {
+        (160.0, 24.0)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
 /// reference `distanceToSegment` (renderers/hit-test-common.ts), duplicated from hit_test.rs so
 /// the drawing geometry stays self-contained.
 fn distance_to_segment(x: f64, y: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
@@ -1575,6 +2259,20 @@ fn distance_to_segment(x: f64, y: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f6
     let projection = ((x - x1) * dx + (y - y1) * dy) / (dx * dx + dy * dy);
     let clamped = projection.clamp(0.0, 1.0);
     (x - (x1 + dx * clamped)).hypot(y - (y1 + dy * clamped))
+}
+
+fn point_in_polygon(point: (f64, f64), vertices: &[(f64, f64)]) -> bool {
+    let mut inside = false;
+    for index in 0..vertices.len() {
+        let a = vertices[index];
+        let b = vertices[(index + 1) % vertices.len()];
+        if (a.1 > point.1) != (b.1 > point.1)
+            && point.0 < (b.0 - a.0) * (point.1 - a.1) / (b.1 - a.1) + a.0
+        {
+            inside = !inside;
+        }
+    }
+    inside
 }
 
 /// JSON patch accepted by [`ChartEngine::drawing_apply_options`] and carried by
@@ -1606,6 +2304,36 @@ pub(crate) struct DrawingPatch {
     magnet: Option<crate::DrawingMagnetMode>,
     labels: Option<Vec<crate::DrawingLabelOptions>>,
     levels: Option<Vec<crate::DrawingLevel>>,
+    gann_fans: Option<Vec<crate::DrawingLevel>>,
+    gann_arcs: Option<Vec<crate::DrawingLevel>>,
+    #[serde(alias = "levelReverse")]
+    level_reverse: Option<bool>,
+    #[serde(alias = "levelLogScale")]
+    level_log_scale: Option<bool>,
+    #[serde(alias = "levelShowPrices")]
+    level_show_prices: Option<bool>,
+    #[serde(alias = "levelShowValues")]
+    level_show_values: Option<bool>,
+    #[serde(alias = "levelShowPercents")]
+    level_show_percents: Option<bool>,
+    #[serde(alias = "levelLabelAlign")]
+    level_label_align: Option<String>,
+    #[serde(alias = "waveDegree")]
+    wave_degree: Option<String>,
+    #[serde(alias = "screenX")]
+    screen_x: Option<f64>,
+    #[serde(alias = "screenY")]
+    screen_y: Option<f64>,
+    #[serde(alias = "iconName")]
+    icon_name: Option<String>,
+    #[serde(alias = "iconSize")]
+    icon_size: Option<f64>,
+    #[serde(alias = "barsPatternMirrorX")]
+    bars_pattern_mirror_x: Option<bool>,
+    #[serde(alias = "barsPatternMirrorY")]
+    bars_pattern_mirror_y: Option<bool>,
+    #[serde(alias = "barsPatternMode")]
+    bars_pattern_mode: Option<String>,
     #[serde(alias = "priceScaleId")]
     price_scale_id: Option<String>,
     color: Option<String>,
@@ -1667,6 +2395,23 @@ pub(crate) struct DrawingPatch {
     position_account_size: Option<f64>,
     #[serde(alias = "positionRiskPercent")]
     position_risk_percent: Option<f64>,
+    #[serde(
+        default,
+        alias = "regressionSourceId",
+        deserialize_with = "deserialize_regression_source_patch"
+    )]
+    regression_source_id: Option<Option<u32>>,
+    #[serde(alias = "regressionDeviations")]
+    regression_deviations: Option<f64>,
+}
+
+fn deserialize_regression_source_patch<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<u32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Option<u32> as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 /// A drawing style name (`solid`/`dotted`/`dashed`) as a line style: the retired names fold into
@@ -1728,7 +2473,47 @@ pub(crate) fn collapse_line_breaks(text: &str) -> String {
     collapsed
 }
 
+/// The bars-pattern display modes: upstream's `bars` and `line_*` modes plus the fork's
+/// `oc_bars` (one open-close stick per bar) and `hl_bars` (an input alias of `bars`).
+pub(crate) fn valid_bars_pattern_mode(mode: &str) -> bool {
+    matches!(
+        mode,
+        "bars" | "oc_bars" | "hl_bars" | "line_open" | "line_high" | "line_low" | "line_close"
+    )
+}
+
+/// A flat option's effective patch value: the patch's own key (already validated), else a legacy
+/// fork key when the kind takes it. `Err` when that legacy value fails the field's check.
+fn with_legacy<T>(
+    own: Option<T>,
+    legacy: Option<T>,
+    takes: bool,
+    valid: impl FnOnce(&T) -> bool,
+) -> Result<Option<T>, ()> {
+    match (own, legacy) {
+        (Some(value), _) => Ok(Some(value)),
+        (None, Some(value)) if takes => {
+            if valid(&value) {
+                Ok(Some(value))
+            } else {
+                Err(())
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 impl Drawing {
+    pub(crate) fn level_value(&self, value: f64) -> f64 {
+        if !self.level_reverse {
+            return value;
+        }
+        match self.kind {
+            DrawingKind::GannFan if value > 0.0 => 1.0 / value,
+            DrawingKind::FibonacciTimeZones | DrawingKind::FibonacciTrendTime => -value,
+            _ => 1.0 - value,
+        }
+    }
     fn apply_patch(&mut self, patch: DrawingPatch) -> bool {
         // Every rejection sits before the first mutation, so a refused patch applies nothing
         // (several callers ignore the result and patch live values).
@@ -1742,6 +2527,9 @@ impl Drawing {
             || patch
                 .position_risk_percent
                 .is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
+            || patch
+                .regression_deviations
+                .is_some_and(|value| !value.is_finite() || !(0.0..=10.0).contains(&value))
         {
             return false;
         }
@@ -1774,13 +2562,202 @@ impl Drawing {
                 return false;
             }
         }
-        let tool_options = match patch.tool_options.as_ref() {
+        for (family, fan) in [(&patch.gann_fans, true), (&patch.gann_arcs, false)] {
+            if let Some(levels) = family {
+                if !matches!(
+                    self.kind,
+                    DrawingKind::GannSquare | DrawingKind::GannSquareFixed
+                ) || !valid_gann_family(levels, fan)
+                {
+                    return false;
+                }
+            }
+        }
+        if (patch.level_reverse.is_some()
+            || patch.level_log_scale.is_some()
+            || patch.level_show_prices.is_some()
+            || patch.level_show_values.is_some()
+            || patch.level_show_percents.is_some()
+            || patch.level_label_align.is_some())
+            && (!self.kind.has_levels()
+                || (patch.level_log_scale == Some(true) && !self.kind.supports_log_levels())
+                || patch
+                    .level_label_align
+                    .as_deref()
+                    .is_some_and(|align| !matches!(align, "left" | "center" | "right")))
+        {
+            return false;
+        }
+        if let Some(degree) = patch.wave_degree.as_deref() {
+            if !self.kind.is_elliott() || !DrawingKind::valid_wave_degree(degree) {
+                return false;
+            }
+        }
+        if (patch.screen_x.is_some() || patch.screen_y.is_some())
+            && (self.kind != DrawingKind::AnchoredText
+                || patch
+                    .screen_x
+                    .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+                || patch
+                    .screen_y
+                    .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)))
+        {
+            return false;
+        }
+        if (patch.icon_name.is_some() || patch.icon_size.is_some())
+            && (self.kind != DrawingKind::IconStamp
+                || patch
+                    .icon_name
+                    .as_ref()
+                    .is_some_and(|name| name.len() > MAX_DRAWING_ICON_NAME_BYTES)
+                || patch
+                    .icon_size
+                    .is_some_and(|size| !size.is_finite() || !(8.0..=96.0).contains(&size)))
+        {
+            return false;
+        }
+        if (patch.bars_pattern_mirror_x.is_some()
+            || patch.bars_pattern_mirror_y.is_some()
+            || patch.bars_pattern_mode.is_some())
+            && (self.kind != DrawingKind::BarsPattern
+                || patch
+                    .bars_pattern_mode
+                    .as_deref()
+                    .is_some_and(|mode| !valid_bars_pattern_mode(mode)))
+        {
+            return false;
+        }
+        // Fork option keys inside `tool_options` that overlap an upstream flat field move onto
+        // that field (`take_legacy_flat_options`, by key presence). The patch's own flat key always
+        // wins, a legacy key the kind cannot take is dropped, and a legacy value that fails the
+        // flat field's check rejects the patch like the flat key would.
+        let mut tool_patch = patch.tool_options.clone();
+        let legacy = tool_patch
+            .as_mut()
+            .map(|value| crate::drawing_contract::take_legacy_flat_options(self.kind, value, false))
+            .unwrap_or_default();
+        let kind = self.kind;
+        let gann_kind = matches!(kind, DrawingKind::GannSquare | DrawingKind::GannSquareFixed);
+        let levels_kind = kind.has_levels();
+        let valid_align = |align: &String| matches!(align.as_str(), "left" | "center" | "right");
+        let Ok(gann_fans) = with_legacy(patch.gann_fans, legacy.gann_fans, gann_kind, |levels| {
+            valid_gann_family(levels, true)
+        }) else {
+            return false;
+        };
+        let Ok(gann_arcs) = with_legacy(patch.gann_arcs, legacy.gann_arcs, gann_kind, |levels| {
+            valid_gann_family(levels, false)
+        }) else {
+            return false;
+        };
+        let Ok(level_reverse) = with_legacy(
+            patch.level_reverse,
+            legacy.level_reverse,
+            levels_kind,
+            |_| true,
+        ) else {
+            return false;
+        };
+        let Ok(level_log_scale) = with_legacy(
+            patch.level_log_scale,
+            legacy.level_log_scale,
+            levels_kind && (kind.supports_log_levels() || legacy.level_log_scale != Some(true)),
+            |_| true,
+        ) else {
+            return false;
+        };
+        let Ok(level_show_prices) = with_legacy(
+            patch.level_show_prices,
+            legacy.level_show_prices,
+            levels_kind,
+            |_| true,
+        ) else {
+            return false;
+        };
+        let Ok(level_show_percents) = with_legacy(
+            patch.level_show_percents,
+            legacy.level_show_percents,
+            levels_kind,
+            |_| true,
+        ) else {
+            return false;
+        };
+        let Ok(level_label_align) = with_legacy(
+            patch.level_label_align,
+            legacy.level_label_align,
+            levels_kind,
+            valid_align,
+        ) else {
+            return false;
+        };
+        let Ok(wave_degree) = with_legacy(
+            patch.wave_degree,
+            legacy.wave_degree,
+            kind.is_elliott(),
+            |degree| DrawingKind::valid_wave_degree(degree),
+        ) else {
+            return false;
+        };
+        let icon_kind = kind == DrawingKind::IconStamp;
+        let Ok(icon_name) = with_legacy(patch.icon_name, legacy.icon_name, icon_kind, |name| {
+            name.len() <= MAX_DRAWING_ICON_NAME_BYTES
+        }) else {
+            return false;
+        };
+        let Ok(icon_size) = with_legacy(patch.icon_size, legacy.icon_size, icon_kind, |size| {
+            size.is_finite() && (8.0..=96.0).contains(size)
+        }) else {
+            return false;
+        };
+        let bars_kind = kind == DrawingKind::BarsPattern;
+        let Ok(bars_pattern_mirror_x) = with_legacy(
+            patch.bars_pattern_mirror_x,
+            legacy.bars_pattern_mirror_x,
+            bars_kind,
+            |_| true,
+        ) else {
+            return false;
+        };
+        let Ok(bars_pattern_mirror_y) = with_legacy(
+            patch.bars_pattern_mirror_y,
+            legacy.bars_pattern_mirror_y,
+            bars_kind,
+            |_| true,
+        ) else {
+            return false;
+        };
+        let Ok(bars_pattern_mode) = with_legacy(
+            patch.bars_pattern_mode,
+            legacy.bars_pattern_mode,
+            bars_kind,
+            |mode| valid_bars_pattern_mode(mode),
+        ) else {
+            return false;
+        };
+        // `hl_bars` is the fork's spelling of the high-low bars mode.
+        let bars_pattern_mode = bars_pattern_mode.map(|mode| {
+            if mode == "hl_bars" {
+                "bars".to_string()
+            } else {
+                mode
+            }
+        });
+        let Ok(regression_deviations) = with_legacy(
+            patch.regression_deviations,
+            legacy.regression_deviations,
+            kind == DrawingKind::RegressionTrend,
+            |value| value.is_finite() && (0.0..=10.0).contains(value),
+        ) else {
+            return false;
+        };
+        let tool_options = match tool_patch.as_ref() {
             Some(value) => match self.tool_options.merged(value) {
                 Some(merged) => Some(merged),
                 None => return false,
             },
             None => None,
         };
+        // Every check passed: apply. Nothing above mutated the drawing.
         if let Some(tool_options) = tool_options {
             self.tool_options = tool_options;
         }
@@ -1828,6 +2805,54 @@ impl Drawing {
         }
         if let Some(levels) = patch.levels {
             self.levels = levels;
+        }
+        if let Some(levels) = gann_fans {
+            self.gann_fans = levels;
+        }
+        if let Some(levels) = gann_arcs {
+            self.gann_arcs = levels;
+        }
+        if let Some(value) = level_reverse {
+            self.level_reverse = value;
+        }
+        if let Some(value) = level_log_scale {
+            self.level_log_scale = value;
+        }
+        if let Some(value) = level_show_prices {
+            self.level_show_prices = value;
+        }
+        if let Some(value) = patch.level_show_values {
+            self.level_show_values = value;
+        }
+        if let Some(value) = level_show_percents {
+            self.level_show_percents = value;
+        }
+        if let Some(value) = level_label_align {
+            self.level_label_align = value;
+        }
+        if let Some(degree) = wave_degree {
+            self.wave_degree = degree;
+        }
+        if let Some(value) = patch.screen_x {
+            self.screen_x = value;
+        }
+        if let Some(value) = patch.screen_y {
+            self.screen_y = value;
+        }
+        if let Some(name) = icon_name {
+            self.icon_name = (!name.is_empty()).then_some(name);
+        }
+        if let Some(size) = icon_size {
+            self.icon_size = size;
+        }
+        if let Some(value) = bars_pattern_mirror_x {
+            self.bars_pattern_mirror_x = value;
+        }
+        if let Some(value) = bars_pattern_mirror_y {
+            self.bars_pattern_mirror_y = value;
+        }
+        if let Some(mode) = bars_pattern_mode {
+            self.bars_pattern_mode = mode;
         }
         if let Some(scale) = patch
             .price_scale_id
@@ -1927,6 +2952,12 @@ impl Drawing {
         if let Some(value) = patch.position_risk_percent {
             self.position_risk_percent = value;
         }
+        if let Some(source_id) = patch.regression_source_id {
+            self.regression_source_id = source_id;
+        }
+        if let Some(deviations) = regression_deviations {
+            self.regression_deviations = deviations;
+        }
         if let Some(profile) = patch.profile {
             self.profile = Some(profile);
         }
@@ -1934,7 +2965,7 @@ impl Drawing {
     }
 
     fn options_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut options = serde_json::json!({
             "name": self.name,
             "group_id": self.group_id.as_deref().unwrap_or(""),
             "revision": self.revision,
@@ -1977,7 +3008,43 @@ impl Drawing {
             "box_border_color": self.box_border_color.as_deref().unwrap_or(""),
             "box_border_width": self.box_border_width,
             "tool_options": self.tool_options,
-        })
+        });
+        if self.kind == DrawingKind::RegressionTrend {
+            options["regression_source_id"] = serde_json::json!(self.regression_source_id);
+            options["regression_deviations"] = serde_json::json!(self.regression_deviations);
+        }
+        if self.kind.has_levels() {
+            options["level_reverse"] = serde_json::json!(self.level_reverse);
+            options["level_log_scale"] = serde_json::json!(self.level_log_scale);
+            options["level_show_prices"] = serde_json::json!(self.level_show_prices);
+            options["level_show_values"] = serde_json::json!(self.level_show_values);
+            options["level_show_percents"] = serde_json::json!(self.level_show_percents);
+            options["level_label_align"] = serde_json::json!(self.level_label_align);
+        }
+        if matches!(
+            self.kind,
+            DrawingKind::GannSquare | DrawingKind::GannSquareFixed
+        ) {
+            options["gann_fans"] = serde_json::json!(self.gann_fans);
+            options["gann_arcs"] = serde_json::json!(self.gann_arcs);
+        }
+        if self.kind.is_elliott() {
+            options["wave_degree"] = serde_json::json!(self.wave_degree);
+        }
+        if self.kind == DrawingKind::AnchoredText {
+            options["screen_x"] = serde_json::json!(self.screen_x);
+            options["screen_y"] = serde_json::json!(self.screen_y);
+        }
+        if self.kind == DrawingKind::IconStamp {
+            options["icon_name"] = serde_json::json!(self.icon_name);
+            options["icon_size"] = serde_json::json!(self.icon_size);
+        }
+        if self.kind == DrawingKind::BarsPattern {
+            options["bars_pattern_mirror_x"] = serde_json::json!(self.bars_pattern_mirror_x);
+            options["bars_pattern_mirror_y"] = serde_json::json!(self.bars_pattern_mirror_y);
+            options["bars_pattern_mode"] = serde_json::json!(self.bars_pattern_mode);
+        }
+        options
     }
 }
 
@@ -2093,14 +3160,13 @@ impl ChartEngine {
     /// forward-adjusted and unadjusted history). Each anchor whose time falls inside a segment
     /// `[from_time, to_time)` has its price multiplied by that segment's factor (on non-time bar
     /// charts an anchor's time is the open time of the bar it sits on); Long/Short
-    /// Position anchors all use the entry anchor's segment so their levels stay consistent, and
-    /// tool options measured in price units (a Gann fan's or fixed square's `scale_ratio`) scale
-    /// by their first anchor's segment. This is a data-basis change, not a user edit: it applies
-    /// to locked drawings too, rewrites the undo and redo stacks and any in-flight creation/drag
-    /// in the same basis, records no undo step, and optionally sets the price-basis label in the
-    /// same transaction. It is atomic: invalid segments, or a factor that would move any
-    /// committed, historical, or in-flight price (or price-unit option) outside its valid range,
-    /// fail with nothing changed. Returns the number of committed drawings that changed.
+    /// Position anchors all use the entry anchor's segment so their levels stay consistent. This
+    /// is a data-basis change, not a user edit: it applies to locked drawings too, rewrites the
+    /// undo and redo stacks and any in-flight creation/drag in the same basis, records no undo
+    /// step, and optionally sets the price-basis label in the same transaction. It is atomic:
+    /// invalid segments, or a factor that would move any committed, historical, or in-flight
+    /// price outside its valid range, fail with nothing changed. Returns the number of committed
+    /// drawings that changed.
     pub fn rescale_drawing_prices(
         &mut self,
         segments: &[crate::DrawingPriceSegment],
@@ -2167,10 +3233,6 @@ impl ChartEngine {
                        pending: &[Option<f64>],
                        apply: bool|
          -> Option<bool> {
-            // Pane fractions are not prices.
-            if kind.pane_anchored() {
-                return Some(false);
-            }
             let position = points.len() == 3
                 && matches!(kind, DrawingKind::LongPosition | DrawingKind::ShortPosition);
             let entry_factor = position.then(|| factor_at(time_of(pending, 0, &points[0])));
@@ -2192,41 +3254,13 @@ impl ChartEngine {
             }
             Some(changed)
         };
-        // Tool options measured in price units (a Gann scale ratio) scale with the first anchor's
-        // segment, like the Position levels follow their entry.
-        let rescale_options = |kind: DrawingKind,
-                               options: &mut crate::DrawingToolOptions,
-                               first: Option<(&DrawingPoint, &[Option<f64>])>,
-                               apply: bool|
-         -> Option<bool> {
-            let (Some(family), Some((point, pending))) = (kind.spec().family, first) else {
-                return Some(false);
-            };
-            if kind.pane_anchored() {
-                return Some(false);
-            }
-            let factor = factor_at(time_of(pending, 0, point));
-            if factor == 1.0 {
-                return Some(false);
-            }
-            (family.rescale_price_options)(kind, options, factor, apply)
-        };
         let rescale_drawing = |drawing: &mut Drawing, apply: bool| -> Option<bool> {
-            let first = drawing.points.first().copied();
-            let options_changed = rescale_options(
-                drawing.kind,
-                &mut drawing.tool_options,
-                first
-                    .as_ref()
-                    .map(|point| (point, &drawing.pending_times[..])),
-                apply,
-            )?;
             let changed = rescale(
                 drawing.kind,
                 &mut drawing.points,
                 &drawing.pending_times,
                 apply,
-            )? || options_changed;
+            )?;
             if changed && apply {
                 drawing.revision = drawing.revision.saturating_add(1);
             }
@@ -2276,13 +3310,6 @@ impl ChartEngine {
                     visit(rescale(DrawingKind::Brush, &mut capture.points, &[], apply));
             }
             if let (Some(drag), Some(kind)) = (self.drawing_drag.as_mut(), drag_kind) {
-                let first = drag.history_points.first().copied();
-                transient_changed |= visit(rescale_options(
-                    kind,
-                    &mut drag.history_tool_options,
-                    first.as_ref().map(|point| (point, &[][..])),
-                    apply,
-                ));
                 transient_changed |= visit(rescale(kind, &mut drag.start_points, &[], apply));
                 transient_changed |= visit(rescale(kind, &mut drag.history_points, &[], apply));
             }
@@ -2345,9 +3372,7 @@ impl ChartEngine {
         if let Some(pending) = self.drawing_controller.pending.as_mut() {
             transient_changed |= pending.drawing.rebase_logical_with(map);
             if let Some(preview) = pending.preview.as_mut() {
-                if !pending.drawing.kind.pane_anchored() {
-                    transient_changed |= rebase_points_with(std::slice::from_mut(preview), map);
-                }
+                transient_changed |= rebase_points_with(std::slice::from_mut(preview), map);
             }
         }
         if let Some(capture) = self.drawing_controller.brush.as_mut() {
@@ -2357,12 +3382,7 @@ impl ChartEngine {
         if let Some(session) = self.drawing_controller.measure.as_mut() {
             transient_changed |= session.drawing.rebase_logical_with(map);
         }
-        let drag_pane_anchored = self.drawing_drag.as_ref().is_some_and(|drag| {
-            self.drawings
-                .iter()
-                .any(|drawing| drawing.id == drag.id && drawing.kind.pane_anchored())
-        });
-        if let Some(drag) = self.drawing_drag.as_mut().filter(|_| !drag_pane_anchored) {
+        if let Some(drag) = self.drawing_drag.as_mut() {
             transient_changed |= rebase_points_with(&mut drag.start_points, map);
             transient_changed |= rebase_points_with(&mut drag.history_points, map);
         }
@@ -2771,7 +3791,7 @@ impl ChartEngine {
         self.drawing_scale_for(pane_index, DrawingPriceScale::Right)
     }
 
-    fn drawing_scale_for(
+    pub(crate) fn drawing_scale_for(
         &self,
         pane_index: usize,
         target: DrawingPriceScale,
@@ -3102,11 +4122,158 @@ impl ChartEngine {
     /// The anchors of `drawing` in media px (`None` when any anchor fails to resolve), with the
     /// pending preview appended when `preview` holds (the interactive-creation geometry).
     pub(crate) fn drawing_px(&self, drawing: &Drawing) -> Option<Vec<(f64, f64)>> {
+        if drawing.kind == DrawingKind::AnchoredText {
+            let pane = self.panes.get(drawing.pane_index)?;
+            return Some(vec![(
+                drawing.screen_x * self.pane_w,
+                pane.top + drawing.screen_y * pane.height,
+            )]);
+        }
         drawing
             .points
             .iter()
             .map(|&point| self.drawing_point_px(drawing, point))
             .collect()
+    }
+
+    /// Forecast result from the source series between entry and the declared horizon
+    /// (`kinds::projection_annotations::forecast_status`: canonical source rows, whitespace
+    /// skipped, LOD-backed, memoized). `None` remains pending while the horizon is in the future
+    /// or source data is unavailable.
+    pub(crate) fn forecast_result(&self, drawing: &Drawing) -> Option<bool> {
+        if drawing.kind != DrawingKind::Forecast || drawing.points.len() != 2 {
+            return None;
+        }
+        kinds::projection_annotations::forecast_status(self, drawing)
+    }
+
+    /// Freeze the source bars between a bars pattern's first two anchors: the canonical source
+    /// rows from `ceil(min)` through `floor(max)` of their logicals (replay-visible and as-of
+    /// rows, whitespace skipped), each at its axis offset from the first index so gaps survive.
+    /// `None` for more than [`MAX_BARS_PATTERN_BARS`] slots or without a valid bar.
+    fn capture_bars_pattern(&self, drawing: &Drawing) -> Option<Vec<BarsPatternBar>> {
+        use aeris_charts_core::model::plot_list::PlotValueIndex as Field;
+        if drawing.kind != DrawingKind::BarsPattern || drawing.points.len() != 3 {
+            return None;
+        }
+        let (a, b) = (drawing.points[0].logical, drawing.points[1].logical);
+        let (first, last) = (a.min(b).ceil().max(0.0), a.max(b).floor());
+        if !first.is_finite()
+            || !last.is_finite()
+            || last < first
+            || last - first >= MAX_BARS_PATTERN_BARS as f64
+        {
+            return None;
+        }
+        // Both ends sit on the data axis (`last >= first >= 0`).
+        if last as usize >= self.data.merged_times().len() {
+            return None;
+        }
+        let (first, last) = (first as i64, last as i64);
+        let rows = self.drawing_source_window(drawing)?;
+        let mut bars: Vec<BarsPatternBar> = Vec::new();
+        for row in rows.rows_between(first, last) {
+            if rows.is_whitespace(row) {
+                continue;
+            }
+            let Some(offset) = rows
+                .index_of(row)
+                .and_then(|index| u16::try_from(index - first).ok())
+            else {
+                continue;
+            };
+            let bar = BarsPatternBar {
+                offset,
+                open: rows.value(row, Field::Open),
+                high: rows.value(row, Field::High),
+                low: rows.value(row, Field::Low),
+                close: rows.value(row, Field::Close),
+            };
+            if !bar.valid() {
+                continue;
+            }
+            // An as-of source collapses the rows between two axis points onto the later point's
+            // index; they merge into that slot's bar (first open, extremes, last close), so every
+            // row the forecast reads is also in the copy.
+            match bars.last_mut() {
+                Some(previous) if previous.offset == offset => {
+                    previous.high = previous.high.max(bar.high);
+                    previous.low = previous.low.min(bar.low);
+                    previous.close = bar.close;
+                }
+                Some(previous) if previous.offset > offset => {}
+                _ => bars.push(bar),
+            }
+        }
+        (!bars.is_empty()).then_some(bars)
+    }
+
+    /// Least-squares center and residual-deviation boundaries over the source's closes between
+    /// the two anchors (the memoized `kinds::channels::regression_stats` fit, which follows the
+    /// replay clock and as-of sources and extends incrementally on live bars). The band is
+    /// `regression_deviations` population residual deviations on each side; the two defining
+    /// anchors select the window and remain editable independently of computed prices. `None`
+    /// (no fit) with fewer than two finite closes on distinct bars in the window.
+    pub(crate) fn regression_points(&self, drawing: &Drawing) -> Option<[DrawingPoint; 6]> {
+        if drawing.kind != DrawingKind::RegressionTrend {
+            return None;
+        }
+        let [start, end] = drawing.points.as_slice() else {
+            return None;
+        };
+        let stats = kinds::channels::regression_stats(self, drawing, IndicatorInputSource::Close)?;
+        // Upstream's rule: no fit without two finite values on distinct bars.
+        if stats.count < 2 || stats.spread <= 0.0 {
+            return None;
+        }
+        let count = stats.count as f64;
+        // The fit's sample deviation, rescaled to the population form.
+        let deviation =
+            drawing.regression_deviations * stats.deviation * ((count - 1.0) / count).sqrt();
+        let make = |logical: f64, offset: f64| DrawingPoint {
+            logical,
+            price: stats.price_at(logical) + offset,
+        };
+        Some([
+            make(start.logical, 0.0),
+            make(end.logical, 0.0),
+            make(start.logical, deviation),
+            make(end.logical, deviation),
+            make(start.logical, -deviation),
+            make(end.logical, -deviation),
+        ])
+    }
+
+    /// The drawing's render geometry in media px: its anchors ([`ChartEngine::drawing_px`],
+    /// anchored text's screen point), then a regression trend's six fitted points while it has
+    /// a fit. The runtime cache holds exactly this, so culling, hit testing, and frames agree.
+    pub(crate) fn drawing_render_px(&self, drawing: &Drawing) -> Option<Vec<(f64, f64)>> {
+        let mut px = Vec::with_capacity(drawing.points.len());
+        self.extend_drawing_render_px(drawing, &mut px)?;
+        Some(px)
+    }
+
+    /// Append [`ChartEngine::drawing_render_px`] to `out`; `None` when an anchor cannot be placed.
+    fn extend_drawing_render_px(&self, drawing: &Drawing, out: &mut Vec<(f64, f64)>) -> Option<()> {
+        if drawing.kind == DrawingKind::AnchoredText {
+            let pane = self.panes.get(drawing.pane_index)?;
+            out.push((
+                drawing.screen_x * self.pane_w,
+                pane.top + drawing.screen_y * pane.height,
+            ));
+        } else {
+            for &point in &drawing.points {
+                out.push(self.drawing_point_px(drawing, point)?);
+            }
+        }
+        if drawing.kind == DrawingKind::RegressionTrend {
+            if let Some(derived) = self.regression_points(drawing) {
+                for point in derived {
+                    out.push(self.drawing_point_px(drawing, point)?);
+                }
+            }
+        }
+        Some(())
     }
 
     pub(crate) fn drawing_coordinate_key(&self, drawing: &Drawing) -> Option<[u64; 12]> {
@@ -3128,7 +4295,18 @@ impl ChartEngine {
             pane.height.to_bits(),
             self.pane_w.to_bits(),
             scale.price_to_coordinate(midpoint, base).to_bits(),
-            self.dpr.to_bits(),
+            self.dpr.to_bits()
+                ^ if drawing.kind == DrawingKind::RegressionTrend {
+                    self.drawing_source_series(drawing)
+                        .map(|source| {
+                            (u64::from(source) << 32)
+                                ^ self.data.series_generation(source).unwrap_or(0)
+                        })
+                        .unwrap_or(0)
+                        .rotate_left(17)
+                } else {
+                    0
+                },
             self.options.generation(),
         ])
     }
@@ -3144,54 +4322,112 @@ impl ChartEngine {
         if entry.screen_valid && entry.bounds_key == key {
             return true;
         }
-        let Some(scale) = self.drawing_scale_for(drawing.pane_index, drawing.price_scale) else {
-            return false;
-        };
-        if self.data.merged_times().is_empty() {
-            return false;
-        }
         let pane = &self.panes[drawing.pane_index];
-        let (left, right) = match entry.bounds.logical {
-            LogicalBounds::Full => (0.0, self.pane_w),
-            LogicalBounds::From(logical) => {
-                let start_x = self.time_scale.logical_to_coordinate(logical);
-                if start_x <= self.pane_w || !drawing.text.is_empty() {
-                    (start_x, self.pane_w)
-                } else {
-                    (start_x, start_x)
-                }
+        let (left, right, top, bottom);
+        if drawing.kind == DrawingKind::AnchoredText {
+            // A screen position needs neither a price scale nor data.
+            let x = drawing.screen_x * self.pane_w;
+            let y = pane.top + drawing.screen_y * pane.height;
+            (left, right, top, bottom) = (x, x, y, y);
+        } else {
+            let Some(scale) = self.drawing_scale_for(drawing.pane_index, drawing.price_scale)
+            else {
+                return false;
+            };
+            if self.data.merged_times().is_empty() {
+                return false;
             }
-            LogicalBounds::Finite { min, max } => (
-                self.time_scale.logical_to_coordinate(min),
-                self.time_scale.logical_to_coordinate(max),
-            ),
-        };
-        let (mut top, mut bottom) = match (entry.bounds.min_price, entry.bounds.max_price) {
-            (Some(min), Some(max)) => (
-                scale.price_to_coordinate(max, base),
-                scale.price_to_coordinate(min, base),
-            ),
-            _ => (pane.top, pane.top + pane.height),
-        };
-        let (mut left, mut right) = (left, right);
-        // A drawing no semantic box bounds (a tool whose reach is screen-derived, or an
-        // extension) takes its family's paint box when the family can bound it.
-        if matches!(entry.bounds.logical, LogicalBounds::Full) && entry.bounds.min_price.is_none() {
-            if let Some(family) = drawing.kind.spec().family {
-                if self.refresh_drawing_media_px(drawing, entry, key).is_none() {
+            let (mut box_left, mut box_right) = match entry.bounds.logical {
+                LogicalBounds::Full => (0.0, self.pane_w),
+                LogicalBounds::From(logical) => {
+                    let start_x = self.time_scale.logical_to_coordinate(logical);
+                    if start_x <= self.pane_w || !drawing.text.is_empty() {
+                        (start_x, self.pane_w)
+                    } else {
+                        (start_x, start_x)
+                    }
+                }
+                LogicalBounds::Ray {
+                    start,
+                    towards_right,
+                } => {
+                    let start_x = self.time_scale.logical_to_coordinate(start);
+                    if towards_right {
+                        (start_x, self.pane_w.max(start_x))
+                    } else {
+                        (0.0_f64.min(start_x), start_x)
+                    }
+                }
+                LogicalBounds::Finite { min, max } => (
+                    self.time_scale.logical_to_coordinate(min),
+                    self.time_scale.logical_to_coordinate(max),
+                ),
+            };
+            let (mut box_top, mut box_bottom) =
+                match (entry.bounds.min_price, entry.bounds.max_price) {
+                    (Some(min), Some(max)) => (
+                        scale.price_to_coordinate(max, base),
+                        scale.price_to_coordinate(min, base),
+                    ),
+                    _ => (pane.top, pane.top + pane.height),
+                };
+            if matches!(
+                drawing.kind,
+                DrawingKind::Circle
+                    | DrawingKind::Arc
+                    | DrawingKind::RotatedRectangle
+                    | DrawingKind::FibonacciSpeedArcs
+                    | DrawingKind::FibonacciCircles
+                    | DrawingKind::FibonacciSpiral
+                    | DrawingKind::FibonacciWedge
+            ) {
+                let mut px = [(0.0, 0.0); 4];
+                for (slot, &point) in px.iter_mut().zip(&drawing.points) {
+                    let Some(converted) =
+                        self.drawing_to_px_for(drawing.pane_index, drawing.price_scale, point)
+                    else {
+                        return false;
+                    };
+                    *slot = converted;
+                }
+                let Some(geometry) = resolve_drawing_geometry(
+                    drawing.kind,
+                    &px[..drawing.points.len().min(px.len())],
+                    self.pane_w,
+                    pane.top,
+                    pane.height,
+                    DrawingGeometryOptions::default(),
+                ) else {
                     return false;
-                }
-                if let Some(rect) = (family.paint_bounds)(self, drawing, &entry.media_px) {
-                    (left, right, top, bottom) = (rect.left, rect.right, rect.top, rect.bottom);
+                };
+                if let DrawingBodyGeometry::FibonacciArcs(arcs) = geometry.body {
+                    let radius = arcs.radius
+                        * drawing
+                            .levels
+                            .iter()
+                            .filter(|level| level.visible)
+                            .map(|level| drawing.level_value(level.value).max(0.0))
+                            .fold(0.0, f64::max);
+                    box_left = arcs.center.0 - radius;
+                    box_right = arcs.center.0 + radius;
+                    box_top = arcs.center.1 - radius;
+                    box_bottom = arcs.center.1 + radius;
+                } else {
+                    box_left = geometry.text_box.left;
+                    box_right = geometry.text_box.right;
+                    box_top = geometry.text_box.top;
+                    box_bottom = geometry.text_box.bottom;
                 }
             }
+            (left, right, top, bottom) = (box_left, box_right, box_top, box_bottom);
         }
         let mut extra_x = drawing.width / 2.0 + HitProfile::TOUCH.drawing_stroke_tolerance;
         let mut extra_y = extra_x;
         extra_x = extra_x.max(HitProfile::TOUCH.drawing_anchor_radius);
         extra_y = extra_y.max(HitProfile::TOUCH.drawing_anchor_radius);
-        extra_x = extra_x.max(label_pad.0);
-        extra_y = extra_y.max(label_pad.1);
+        let kind_pad = drawing_kind_pad(drawing);
+        extra_x = extra_x.max(label_pad.0).max(kind_pad.0);
+        extra_y = extra_y.max(label_pad.1).max(kind_pad.1);
         entry.screen_bounds = ScreenBounds {
             left: left.min(right) - extra_x,
             right: left.max(right) + extra_x,
@@ -3212,10 +4448,10 @@ impl ChartEngine {
         base: f64,
         label_pad: (f64, f64),
     ) -> bool {
-        let extra_x =
-            (drawing.width / 2.0 + HitProfile::TOUCH.drawing_anchor_radius).max(label_pad.0);
-        let extra_y =
-            (drawing.width / 2.0 + HitProfile::TOUCH.drawing_anchor_radius).max(label_pad.1);
+        let kind_pad = drawing_kind_pad(drawing);
+        let base_extra = drawing.width / 2.0 + HitProfile::TOUCH.drawing_anchor_radius;
+        let extra_x = base_extra.max(label_pad.0).max(kind_pad.0);
+        let extra_y = base_extra.max(label_pad.1).max(kind_pad.1);
         let logical_pad = extra_x / self.time_scale.bar_spacing().max(f64::MIN_POSITIVE);
         let logical_intersects = match bounds.logical {
             LogicalBounds::Full => true,
@@ -3223,6 +4459,16 @@ impl ChartEngine {
             // start sits beyond that edge, so keep it conservative.
             LogicalBounds::From(_) if !drawing.text.is_empty() => true,
             LogicalBounds::From(start) => start <= visible.1 + logical_pad,
+            LogicalBounds::Ray {
+                start,
+                towards_right,
+            } => {
+                if towards_right {
+                    start <= visible.1 + logical_pad
+                } else {
+                    start >= visible.0 - logical_pad
+                }
+            }
             LogicalBounds::Finite { min, max } => {
                 min <= visible.1 + logical_pad && max >= visible.0 - logical_pad
             }
@@ -3269,9 +4515,9 @@ impl ChartEngine {
         }
         entry.media_px.clear();
         entry.geometry_valid = false;
-        for &point in &drawing.points {
-            entry.media_px.push(self.drawing_point_px(drawing, point)?);
-        }
+        // Anchored text's screen point and a regression trend's fitted points included
+        // (`drawing_render_px`), so culling, hit testing, and frames read one geometry.
+        self.extend_drawing_render_px(drawing, &mut entry.media_px)?;
         entry.geometry_key = key;
         entry.geometry_valid = true;
         Some(true)
@@ -3303,6 +4549,7 @@ impl ChartEngine {
         if drawing.text.is_empty()
             && !editing
             && !matches!(drawing.kind, DrawingKind::Text | DrawingKind::TrendLine)
+            && !drawing.kind.is_text_annotation()
         {
             return None;
         }
@@ -3643,7 +4890,9 @@ impl ChartEngine {
     }
 
     fn measure_drawing_text_with_family(&self, drawing: &Drawing, size: f64, family: &str) -> f64 {
-        if drawing.kind == DrawingKind::Text && drawing.text.is_empty() {
+        if (drawing.kind == DrawingKind::Text || drawing.kind.is_text_annotation())
+            && drawing.text.is_empty()
+        {
             return size;
         }
         let text = drawing.display_text();
@@ -3782,6 +5031,20 @@ impl ChartEngine {
         anchors: &[DrawingAnchor],
         options_json: Option<&str>,
     ) -> Result<DrawingId, ChartError> {
+        self.add_drawing_anchors_inner(kind, pane_index, anchors, options_json, None)
+    }
+
+    /// [`ChartEngine::add_drawing_anchors`] with an optional frozen bars-pattern snapshot that
+    /// paste and duplicate install instead of capturing the source bars again (a pasted pattern
+    /// keeps the bars it was copied with, on any chart).
+    fn add_drawing_anchors_inner(
+        &mut self,
+        kind: DrawingKind,
+        pane_index: usize,
+        anchors: &[DrawingAnchor],
+        options_json: Option<&str>,
+        preset_bars: Option<Vec<BarsPatternBar>>,
+    ) -> Result<DrawingId, ChartError> {
         self.invalidate_frame_drawings();
         if pane_index >= self.panes.len() || !self.pane_uses_financial_time(pane_index) {
             return Err(ChartError::new(
@@ -3799,9 +5062,18 @@ impl ChartEngine {
                 ),
             ));
         }
-        let (points, pending) = self.resolve_drawing_anchors(kind, anchors)?;
+        let (points, pending) = self.resolve_drawing_anchors(anchors)?;
         let mut drawing = Drawing::new(0, kind, pane_index, points);
         drawing.set_pending_times(pending);
+        // Anchored text starts at its anchor's screen position; explicit options still win.
+        if kind == DrawingKind::AnchoredText {
+            if let Some((x, y)) = drawing.points.first().and_then(|&point| {
+                self.anchored_text_screen_position(pane_index, drawing.price_scale, point)
+            }) {
+                drawing.screen_x = x;
+                drawing.screen_y = y;
+            }
+        }
         let mut explicit_z_order = false;
         if let Some(json) = options_json {
             let patch = serde_json::from_str::<DrawingPatch>(json).map_err(|error| {
@@ -3818,8 +5090,17 @@ impl ChartEngine {
                 ));
             }
         }
-        if let Some(family) = kind.spec().family {
-            (family.on_create)(self, &mut drawing, false);
+        // A bars pattern freezes its source bars once, before an identity is consumed.
+        if kind == DrawingKind::BarsPattern {
+            drawing.bars_pattern = match preset_bars {
+                Some(bars) => bars,
+                None => self.capture_bars_pattern(&drawing).ok_or_else(|| {
+                    ChartError::new(
+                        ErrorCode::InvalidData,
+                        "a bars pattern needs source bars between its first two anchors",
+                    )
+                })?,
+            };
         }
         let id = self.take_drawing_id().ok_or_else(|| {
             ChartError::new(
@@ -3979,18 +5260,52 @@ impl ChartEngine {
                     ),
                 ));
             }
-            let (mut points, pending) = self.resolve_drawing_anchors(kind, anchors)?;
+            let (mut points, pending) = self.resolve_drawing_anchors(anchors)?;
             Drawing::normalize_points(kind, &mut points);
-            staged.push((index, points, pending));
+            let drawing = &self.drawings[index];
+            // A bars pattern recaptures its frozen bars when its source anchors move; a failed
+            // capture rejects the whole update before any drawing changes.
+            let bars = if kind == DrawingKind::BarsPattern && drawing.points[..2] != points[..2] {
+                let mut next = drawing.clone();
+                next.points = points.clone();
+                Some(self.capture_bars_pattern(&next).ok_or_else(|| {
+                    ChartError::new(
+                        ErrorCode::InvalidData,
+                        format!("bars pattern {id} has no source bars to freeze"),
+                    )
+                })?)
+            } else {
+                None
+            };
+            // Anchored text follows its new anchor's screen position.
+            let screen = if kind == DrawingKind::AnchoredText {
+                points.first().and_then(|&point| {
+                    self.anchored_text_screen_position(
+                        drawing.pane_index,
+                        drawing.price_scale,
+                        point,
+                    )
+                })
+            } else {
+                None
+            };
+            staged.push((index, points, pending, bars, screen));
         }
         let before_all = batch.then(|| self.drawings.clone());
         let mut changed = 0usize;
         let mut single = None;
-        for (index, points, pending) in staged {
+        for (index, points, pending, bars, screen) in staged {
             let before = self.drawings[index].clone();
             let drawing = &mut self.drawings[index];
             drawing.points = points;
             drawing.set_pending_times(pending);
+            if let Some(bars) = bars {
+                drawing.bars_pattern = bars;
+            }
+            if let Some((x, y)) = screen {
+                drawing.screen_x = x;
+                drawing.screen_y = y;
+            }
             let pending_now = drawing.has_pending_times();
             let id = drawing.id;
             let logical_changed = before.points.len() != drawing.points.len()
@@ -4034,16 +5349,12 @@ impl ChartEngine {
 
     /// Resolve host anchors into live logical/price points plus pending times. A `time` resolves
     /// on the current ordinary time axis (it wins over a disagreeing `logical`); without time
-    /// points it stays pending with `logical` (or zero) as the placeholder. A pane-anchored
-    /// `kind` takes its pane fractions from `logical` and `price`, clamped into `0..=1`, and
-    /// ignores `time`.
+    /// points it stays pending with `logical` (or zero) as the placeholder.
     fn resolve_drawing_anchors(
         &self,
-        kind: DrawingKind,
         anchors: &[DrawingAnchor],
     ) -> Result<(Vec<DrawingPoint>, Vec<Option<f64>>), ChartError> {
-        let pane_anchored = kind.pane_anchored();
-        let time_axis = self.drawing_time_axis() && !pane_anchored;
+        let time_axis = self.drawing_time_axis();
         let times = self.data.merged_times();
         let finite = |value: f64| value.is_finite() && value.abs() <= MAX_SAFE_VALUE;
         let mut points = Vec::with_capacity(anchors.len());
@@ -4072,15 +5383,6 @@ impl ChartEngine {
                     }
                 }
                 (Some(logical), _) => (logical, None),
-                (None, Some(_)) if pane_anchored => {
-                    return Err(ChartError::new(
-                        ErrorCode::InvalidData,
-                        format!(
-                            "drawing anchor {index} of a pane-anchored {} needs a logical pane fraction",
-                            kind.name()
-                        ),
-                    ))
-                }
                 (None, Some(_)) => {
                     return Err(ChartError::new(
                         ErrorCode::UnsupportedOperation,
@@ -4102,17 +5404,9 @@ impl ChartEngine {
             if let Some(slot) = pending.get_mut(index) {
                 *slot = pending_time;
             }
-            // Pane fractions clamp into the pane, like a drag, so the drawing stays reachable.
-            points.push(if pane_anchored {
-                DrawingPoint {
-                    logical: logical.clamp(0.0, 1.0),
-                    price: anchor.price.clamp(0.0, 1.0),
-                }
-            } else {
-                DrawingPoint {
-                    logical,
-                    price: anchor.price,
-                }
+            points.push(DrawingPoint {
+                logical,
+                price: anchor.price,
             });
         }
         Ok((points, pending))
@@ -4140,9 +5434,6 @@ impl ChartEngine {
     /// The time identity of one anchor of `drawing`: its pending time while unresolved, otherwise
     /// the time derived from its logical position on the current axis.
     pub(crate) fn drawing_anchor_time_of(&self, drawing: &Drawing, index: usize) -> Option<f64> {
-        if drawing.kind.pane_anchored() {
-            return None;
-        }
         if let Some(Some(time)) = drawing.pending_times.get(index) {
             return Some(*time);
         }
@@ -4310,6 +5601,8 @@ impl ChartEngine {
                 pane_index: drawing.pane_index,
                 points: self.drawing_anchors_of(drawing),
                 options: drawing.options_json(),
+                bars_pattern: (drawing.kind == DrawingKind::BarsPattern)
+                    .then(|| drawing.bars_pattern.clone()),
             })
             .collect()
     }
@@ -4356,21 +5649,18 @@ impl ChartEngine {
             return None;
         }
         let mut staged = Vec::with_capacity(items.len());
-        for item in items {
-            if item.points.len() > MAX_DRAWING_POINTS
-                || !item.kind.valid_point_count(item.points.len())
-            {
+        for mut item in items {
+            if item.points.len() > MAX_DRAWING_POINTS {
                 return None;
             }
-            let (mut points, mut pending) =
-                self.resolve_drawing_anchors(item.kind, &item.points).ok()?;
-            // Time and price offsets do not apply to pane fractions: a pane-anchored drawing
-            // pastes at its own pane position.
-            if !item.kind.pane_anchored() {
-                for point in &mut points {
-                    point.logical += logical_offset;
-                    point.price += price_offset;
-                }
+            crate::persistence::migrate_fork_payload_item(&mut item);
+            if !item.kind.valid_point_count(item.points.len()) {
+                return None;
+            }
+            let (mut points, mut pending) = self.resolve_drawing_anchors(&item.points).ok()?;
+            for point in &mut points {
+                point.logical += logical_offset;
+                point.price += price_offset;
             }
             if points
                 .iter()
@@ -4383,7 +5673,18 @@ impl ChartEngine {
                 // the shifted placeholder becomes the anchor.
                 pending.clear();
             }
-            let patch = serde_json::from_value::<DrawingPatch>(item.options.clone()).ok()?;
+            // A bars pattern carries its frozen bars; no other kind may carry any.
+            if item.kind == DrawingKind::BarsPattern {
+                if !item.bars_pattern.as_deref().is_some_and(valid_bars_pattern) {
+                    return None;
+                }
+            } else if item.bars_pattern.is_some() {
+                return None;
+            }
+            // Validate the exact text the drawing is created from; every patch input then shares one
+            // deserializer (a second, `Value`-based one cost the wasm module about 13 KB).
+            let options = serde_json::to_string(&item.options).ok()?;
+            let patch = serde_json::from_str::<DrawingPatch>(&options).ok()?;
             if !Drawing::new(0, item.kind, pane_index, Vec::new()).apply_patch(patch) {
                 return None;
             }
@@ -4396,16 +5697,20 @@ impl ChartEngine {
                     time: pending.get(index).copied().flatten(),
                 })
                 .collect::<Vec<_>>();
-            let options = serde_json::to_string(&item.options).ok()?;
-            staged.push((item.kind, anchors, options));
+            staged.push((item.kind, anchors, options, item.bars_pattern));
         }
+        // The whole paste fits the identity space before anything is created.
+        let final_id = self
+            .next_drawing_id
+            .checked_add(u32::try_from(staged.len()).ok()?)?;
         let mut ids = Vec::with_capacity(staged.len());
-        for (kind, anchors, options) in staged {
+        for (kind, anchors, options, bars) in staged {
             ids.push(
-                self.add_drawing_anchors(kind, pane_index, &anchors, Some(&options))
+                self.add_drawing_anchors_inner(kind, pane_index, &anchors, Some(&options), bars)
                     .ok()?,
             );
         }
+        debug_assert_eq!(self.next_drawing_id, final_id);
         Some(ids)
     }
 
@@ -4517,8 +5822,7 @@ impl ChartEngine {
             return 0;
         }
         self.update_group(group_id, |drawing| {
-            // Time and price deltas do not apply to pane fractions (like paste offsets).
-            if drawing.locked || drawing.kind.pane_anchored() {
+            if drawing.locked {
                 return;
             }
             for point in &mut drawing.points {
@@ -4639,6 +5943,8 @@ impl ChartEngine {
                 pane_index: drawing.pane_index,
                 points: self.drawing_anchors_of(drawing),
                 options: drawing.options_json(),
+                bars_pattern: (drawing.kind == DrawingKind::BarsPattern)
+                    .then(|| drawing.bars_pattern.clone()),
             })
             .collect();
         serde_json::to_string(&crate::DrawingSyncPayload {
@@ -4675,7 +5981,10 @@ impl ChartEngine {
         }
         let mut staged = Vec::with_capacity(payload.drawings.len());
         let mut ids = std::collections::HashSet::new();
-        for item in payload.drawings {
+        for mut item in payload.drawings {
+            if item.points.len() <= MAX_DRAWING_POINTS {
+                crate::persistence::migrate_fork_payload_item(&mut item);
+            }
             if item.pane_index >= self.panes.len()
                 || !self.pane_uses_financial_time(item.pane_index)
                 || !ids.insert(item.id.unwrap_or(0))
@@ -4688,8 +5997,7 @@ impl ChartEngine {
             if id == 0 {
                 return false;
             }
-            let Ok((points, pending)) = self.resolve_drawing_anchors(item.kind, &item.points)
-            else {
+            let Ok((points, pending)) = self.resolve_drawing_anchors(&item.points) else {
                 return false;
             };
             let mut drawing = Drawing::new(id, item.kind, item.pane_index, points);
@@ -4701,6 +6009,14 @@ impl ChartEngine {
                 return false;
             };
             if !drawing.apply_patch(patch) {
+                return false;
+            }
+            if item.kind == DrawingKind::BarsPattern {
+                let Some(bars) = item.bars_pattern.filter(|bars| valid_bars_pattern(bars)) else {
+                    return false;
+                };
+                drawing.bars_pattern = bars;
+            } else if item.bars_pattern.is_some() {
                 return false;
             }
             staged.push(drawing);
@@ -4770,14 +6086,14 @@ impl ChartEngine {
     /// The exact media-px text-run anchor shared by frame rendering and the host caret overlay.
     pub fn drawing_text_coordinate(&self, id: DrawingId) -> Option<(f64, f64)> {
         let drawing = self.drawing(id)?;
-        let run = self.drawing_text_run(drawing, &self.drawing_px(drawing)?)?;
+        let run = self.drawing_text_run(drawing, &self.drawing_render_px(drawing)?)?;
         Some((run.x, run.y))
     }
 
     /// Media-px text anchor plus clockwise radians, shared with the browser caret overlay.
     pub fn drawing_text_transform(&self, id: DrawingId) -> Option<(f64, f64, f64)> {
         let drawing = self.drawing(id)?;
-        let run = self.drawing_text_run(drawing, &self.drawing_px(drawing)?)?;
+        let run = self.drawing_text_run(drawing, &self.drawing_render_px(drawing)?)?;
         Some((run.x, run.y, run.angle))
     }
 
@@ -4787,16 +6103,17 @@ impl ChartEngine {
     /// - a family text box (`multiline`) is the label its parts mark with
     ///   [`DrawingParts::text_label`]: lines left-aligned at `x`, line `i` centered at
     ///   `y + i * line_height`, never rotated;
-    /// - every other drawing (the text tool, trend lines, lines, channels, Fibonacci tools,
-    ///   pitchforks, patterns, shapes) paints one run placed against its geometry: `x`, `y` are
-    ///   the run's start (left edge, vertical center) after rotation by `angle`, so a host rotates
-    ///   a single-line editor about its own left-middle.
+    /// - every other drawing (the text tool, the text annotations, trend lines, lines, channels,
+    ///   Fibonacci tools, pitchforks, patterns, shapes) paints one run placed against its
+    ///   geometry: `x`, `y` are the run's start (left edge, vertical center) after rotation by
+    ///   `angle`, so a host rotates a single-line editor about its own left-middle.
     ///
-    /// `None` for a drawing that paints no text of its own (the flag, the icon, and the
-    /// projection and measuring tools), for an unknown id, or when its anchors cannot convert.
+    /// `None` for a drawing that paints no text of its own on the chart (the measuring tools and
+    /// the simple tag), for an unknown id, or when its anchors cannot convert.
     pub fn drawing_text_edit_layout(&self, id: DrawingId) -> Option<DrawingTextEditLayout> {
         let drawing = self.drawing(id)?;
-        let px = self.drawing_px(drawing)?;
+        // The geometry the frame places text against (a regression's fitted box included).
+        let px = self.drawing_render_px(drawing)?;
         if drawing.kind.paints_generic_text() {
             self.run_text_edit_layout(drawing, &px)
         } else {
@@ -4884,12 +6201,13 @@ impl ChartEngine {
 
     /// The topmost drawing whose own text sits under a media-px point: the text of any drawing
     /// that paints a generic run (lines, channels, Fibonacci tools, pitchforks, patterns, shapes,
-    /// and the trend line), never the text tool or a family text box, whose bodies are ordinary
-    /// hits. A trend line with no text answers over its `+ Add text` prompt; any other drawing
-    /// needs text to have a region. Locked, hidden, and interval-hidden drawings never answer, and
-    /// a higher drawing's body or the selected drawing's anchor handle at the point wins over a
-    /// label beneath it, as it does for a click. This keeps the host from duplicating text
-    /// measurement or 3×3 placement when opening the inline editor.
+    /// the callout and price note, and the trend line), never the text tool, the note, comment,
+    /// and anchored text, or a family text box, whose bodies are ordinary hits. A trend line with
+    /// no text answers over its `+ Add text` prompt; any other drawing needs text to have a
+    /// region. Locked, hidden, and interval-hidden drawings never answer, and a higher drawing's
+    /// body or the selected drawing's anchor handle at the point wins over a label beneath it, as
+    /// it does for a click. This keeps the host from duplicating text measurement or 3×3
+    /// placement when opening the inline editor.
     pub fn drawing_text_hit_at(&self, x: f64, y: f64) -> Option<DrawingId> {
         self.drawing_text_hit(x, y, true)
     }
@@ -4965,7 +6283,7 @@ impl ChartEngine {
     ) -> Option<R> {
         let drawing = self.candidate_drawing(id, indexed)?;
         if !indexed {
-            return Some(f(drawing, &self.drawing_px(drawing)?, None));
+            return Some(f(drawing, &self.drawing_render_px(drawing)?, None));
         }
         let key = self.drawing_coordinate_key(drawing)?;
         let mut runtime = self.drawing_runtime.borrow_mut();
@@ -4984,10 +6302,17 @@ impl ChartEngine {
         let Some(drawing) = self.candidate_drawing(id, indexed) else {
             return false;
         };
+        // The text tool and the boxed text annotations are their text: their body hit is it.
         if !drawing.visible
             || drawing.locked
             || !drawing.interval_visibility.allows(self.drawing_interval)
-            || drawing.kind == DrawingKind::Text
+            || matches!(
+                drawing.kind,
+                DrawingKind::Text
+                    | DrawingKind::Note
+                    | DrawingKind::Comment
+                    | DrawingKind::AnchoredText
+            )
             || !drawing.kind.paints_generic_text()
         {
             return false;
@@ -5085,9 +6410,10 @@ impl ChartEngine {
     /// unlocked, visible, and shown on the current interval, and some part of its text box is
     /// inside its own pane's plot. A drawing is clipped to its pane, so text panned or scrolled
     /// wholly out of it paints nothing, and an editor opened there would be invisible and capture
-    /// the keys. Every tool but the eight that paint no text (the flag, the icon, and the
-    /// projection and measuring tools) qualifies. This is the one rule every host and every
-    /// path (double-click, Enter, F2, placement, a direct begin) shares.
+    /// the keys. Every tool but the four that paint no text on the chart (the three measuring
+    /// tools and the simple tag, whose text tags the price axis) qualifies, the text annotations
+    /// (note, comment, callout, price note, anchored text) included. This is the one rule every
+    /// host and every path (double-click, Enter, F2, placement, a direct begin) shares.
     pub fn drawing_text_editable(&self, id: DrawingId) -> bool {
         let Some(drawing) = self.drawing(id) else {
             return false;
@@ -5113,17 +6439,6 @@ impl ChartEngine {
         self.drawing_text_edit.as_ref().map(|session| session.id)
     }
 
-    /// Whether `id` paints parts only while focused (`DrawingFamily::reveals_on_focus`).
-    pub(crate) fn drawing_reveals_on_focus(&self, id: DrawingId) -> bool {
-        self.drawing(id).is_some_and(|drawing| {
-            drawing
-                .kind
-                .spec()
-                .family
-                .is_some_and(|family| (family.reveals_on_focus)(drawing))
-        })
-    }
-
     /// Mark a text drawing or trend line under the host pointer. Text drawings paint their
     /// hover ring; empty trend lines paint their inline `+ Add text` affordance. Any other
     /// drawing has no hover chrome, so its id (a label hit on a ray or a rectangle) is stored as
@@ -5131,7 +6446,9 @@ impl ChartEngine {
     pub fn set_hovered_text(&mut self, id: Option<DrawingId>) {
         let valid = id.filter(|&hid| {
             self.drawings.iter().any(|d| {
-                d.id == hid && matches!(d.kind, DrawingKind::Text | DrawingKind::TrendLine)
+                d.id == hid
+                    && (matches!(d.kind, DrawingKind::Text | DrawingKind::TrendLine)
+                        || d.kind.is_text_annotation())
             })
         });
         if valid != self.hovered_text {
@@ -5276,13 +6593,17 @@ impl ChartEngine {
         }
         if !indexed {
             for drawing in self.drawings.iter().rev() {
+                // Like the frame and the index, a drawing whose pane has no coordinate space
+                // yet (no price range) is neither painted nor hit, even when its own position
+                // needs none (an anchored text's screen point).
                 if drawing.pane_index != pane
                     || !drawing.visible
                     || !drawing.interval_visibility.allows(self.drawing_interval)
+                    || self.drawing_coordinate_key(drawing).is_none()
                 {
                     continue;
                 }
-                let Some(px) = self.drawing_px(drawing) else {
+                let Some(px) = self.drawing_render_px(drawing) else {
                     continue;
                 };
                 if self.drawing_body_hit(drawing, &px, x, y, profile) {
@@ -5343,6 +6664,77 @@ impl ChartEngine {
     ) -> bool {
         let hit_tolerance = profile.drawing_stroke_tolerance;
         let tolerance = drawing.width / 2.0 + hit_tolerance;
+        if drawing.kind == DrawingKind::BarsPattern && !drawing.bars_pattern.is_empty() {
+            let tick = (self.time_scale.bar_spacing() * 0.25).clamp(2.0, 6.0);
+            let mut previous = None;
+            for &bar in &drawing.bars_pattern {
+                let projected = bar.project(drawing);
+                let mut encoded = [(0.0, 0.0); 4];
+                let mut valid = true;
+                for (slot, point) in encoded.iter_mut().zip(projected) {
+                    if let Some(value) =
+                        self.drawing_to_px_for(drawing.pane_index, drawing.price_scale, point)
+                    {
+                        *slot = value;
+                    } else {
+                        valid = false;
+                        break;
+                    }
+                }
+                if !valid {
+                    continue;
+                }
+                // The same strokes the frame paints: `oc_bars` one open-close stick per bar,
+                // `bars` the high-low stick with its open and close ticks, the line modes one
+                // polyline through the chosen field.
+                if drawing.bars_pattern_mode == "oc_bars" {
+                    let bar_x = encoded[0].0;
+                    if distance_to_segment(x, y, bar_x, encoded[0].1, bar_x, encoded[3].1)
+                        <= tolerance
+                    {
+                        return true;
+                    }
+                } else if matches!(drawing.bars_pattern_mode.as_str(), "bars" | "hl_bars") {
+                    let bar_x = encoded[0].0;
+                    if distance_to_segment(x, y, bar_x, encoded[1].1, bar_x, encoded[2].1)
+                        <= tolerance
+                        || distance_to_segment(
+                            x,
+                            y,
+                            bar_x - tick,
+                            encoded[0].1,
+                            bar_x,
+                            encoded[0].1,
+                        ) <= tolerance
+                        || distance_to_segment(
+                            x,
+                            y,
+                            bar_x,
+                            encoded[3].1,
+                            bar_x + tick,
+                            encoded[3].1,
+                        ) <= tolerance
+                    {
+                        return true;
+                    }
+                } else {
+                    let index = match drawing.bars_pattern_mode.as_str() {
+                        "line_open" => 0,
+                        "line_high" => 1,
+                        "line_low" => 2,
+                        _ => 3,
+                    };
+                    let current = encoded[index];
+                    if previous.is_some_and(|(ax, ay)| {
+                        distance_to_segment(x, y, ax, ay, current.0, current.1) <= tolerance
+                    }) {
+                        return true;
+                    }
+                    previous = Some(current);
+                }
+            }
+            return false;
+        }
         let Some(pane) = self.panes.get(drawing.pane_index) else {
             return false;
         };
@@ -5367,6 +6759,7 @@ impl ChartEngine {
                 line_width: drawing.width,
                 device_scale: 1.0,
                 extend_left: drawing.extend_left,
+                icon_size: drawing.icon_size,
                 extend_right: drawing.extend_right,
             },
         ) else {
@@ -5387,6 +6780,261 @@ impl ChartEngine {
                     && y >= y0.min(y1) - hit_tolerance
                     && y <= y0.max(y1) + hit_tolerance
             }
+            DrawingBodyGeometry::Cross {
+                x: line_x,
+                y: line_y,
+                pane_w,
+                pane_top,
+                pane_bottom,
+            } => {
+                ((y - line_y).abs() <= tolerance
+                    && x >= -hit_tolerance
+                    && x <= pane_w + hit_tolerance)
+                    || ((x - line_x).abs() <= tolerance
+                        && y >= pane_top - hit_tolerance
+                        && y <= pane_bottom + hit_tolerance)
+            }
+            DrawingBodyGeometry::Channel { first, second } => {
+                (drawing.fill_enabled
+                    && self.selected_drawing == Some(drawing.id)
+                    && point_in_polygon((x, y), &[first[0], first[1], second[1], second[0]]))
+                    || distance_to_segment(x, y, first[0].0, first[0].1, first[1].0, first[1].1)
+                        <= tolerance
+                    || distance_to_segment(x, y, second[0].0, second[0].1, second[1].0, second[1].1)
+                        <= tolerance
+            }
+            DrawingBodyGeometry::Regression {
+                center,
+                upper,
+                lower,
+            } => [center, upper, lower].into_iter().any(|segment| {
+                distance_to_segment(x, y, segment[0].0, segment[0].1, segment[1].0, segment[1].1)
+                    <= tolerance
+            }),
+            DrawingBodyGeometry::RegressionWindow { a, b } => {
+                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+            }
+            DrawingBodyGeometry::Fibonacci(fib) => drawing.levels.iter().any(|level| {
+                if !level.visible {
+                    return false;
+                }
+                let (a, b) = self.drawing_fibonacci_level_segment(drawing, fib, level.value, 1.0);
+                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+            }),
+            DrawingBodyGeometry::TimeLevels(time) => {
+                y >= time.pane_top - hit_tolerance
+                    && y <= time.pane_bottom + hit_tolerance
+                    && drawing.levels.iter().any(|level| {
+                        level.visible
+                            && (x - time.x(drawing.level_value(level.value))).abs() <= tolerance
+                    })
+            }
+            DrawingBodyGeometry::FibonacciArcs(arcs) => {
+                (arcs.kind == DrawingKind::FibonacciWedge
+                    && px[1..3].iter().any(|side| {
+                        distance_to_segment(x, y, px[0].0, px[0].1, side.0, side.1) <= tolerance
+                    }))
+                    || drawing.levels.iter().any(|level| {
+                        level.visible
+                            && drawing.level_value(level.value) > 0.0
+                            && (0..arcs.segments()).any(|step| {
+                                let segments = f64::from(arcs.segments());
+                                let a = arcs.point(
+                                    drawing.level_value(level.value),
+                                    f64::from(step) / segments,
+                                );
+                                let b = arcs.point(
+                                    drawing.level_value(level.value),
+                                    f64::from(step + 1) / segments,
+                                );
+                                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                            })
+                    })
+            }
+            DrawingBodyGeometry::Pitchfork(fork) => drawing.levels.iter().any(|level| {
+                if !level.visible {
+                    return false;
+                }
+                let (a, b) = fork.segment(drawing.level_value(level.value));
+                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+            }),
+            DrawingBodyGeometry::Cycles(cycles) => {
+                y >= cycles.pane_top - hit_tolerance && y <= cycles.pane_bottom + hit_tolerance && {
+                    let mut hit = false;
+                    cycles.for_each_visible_line(|_, line_x| {
+                        hit |= (x - line_x).abs() <= tolerance;
+                    });
+                    hit
+                }
+            }
+            DrawingBodyGeometry::Sine(sine) => {
+                let Some((left, right)) = sine.visible_x() else {
+                    return false;
+                };
+                if x < left - tolerance || x > right + tolerance {
+                    return false;
+                }
+                let count = sine.sample_count();
+                let center = (((x - left) / (right - left) * f64::from(count)).floor() as u32)
+                    .min(count - 1);
+                (center.saturating_sub(1)..=(center + 1).min(count - 1)).any(|step| {
+                    let ax = left + (right - left) * f64::from(step) / f64::from(count);
+                    let bx = left + (right - left) * f64::from(step + 1) / f64::from(count);
+                    distance_to_segment(x, y, ax, sine.y(ax), bx, sine.y(bx)) <= tolerance
+                })
+            }
+            DrawingBodyGeometry::Marker(marker) => {
+                let triangle = marker.triangle();
+                point_in_polygon((x, y), &triangle)
+                    || (0..3).any(|index| {
+                        let a = triangle[index];
+                        let b = triangle[(index + 1) % 3];
+                        distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                    })
+                    || marker.stem().is_some_and(|(a, b)| {
+                        distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                    })
+            }
+            DrawingBodyGeometry::PriceLabel {
+                x: label_x,
+                y: label_y,
+            } => {
+                let label = if drawing.text.is_empty() {
+                    self.price_formatter.format(drawing.points[0].price)
+                } else {
+                    drawing.text.clone()
+                };
+                let layout = &self.options.get().layout;
+                let size = drawing.resolved_text_size(layout.font_size);
+                let width = self.measure_text_run(
+                    &label,
+                    size,
+                    &layout.font_family,
+                    drawing.text_weight.unwrap_or(400),
+                    drawing.text_italic,
+                );
+                x >= label_x - width - 8.0 - hit_tolerance
+                    && x <= label_x + hit_tolerance
+                    && y >= label_y - size * 0.6 - 4.0 - hit_tolerance
+                    && y <= label_y + size * 0.6 + 4.0 + hit_tolerance
+            }
+            DrawingBodyGeometry::IconStamp { center, size } => {
+                (x - center.0).abs() <= size / 2.0 + hit_tolerance
+                    && (y - center.1).abs() <= size / 2.0 + hit_tolerance
+            }
+            DrawingBodyGeometry::GannGrid(grid) => {
+                let bounds = grid.bounds();
+                let corners = [
+                    (bounds.left, bounds.top),
+                    (bounds.right, bounds.top),
+                    (bounds.right, bounds.bottom),
+                    (bounds.left, bounds.bottom),
+                ];
+                (drawing.fill_enabled
+                    && self.selected_drawing == Some(drawing.id)
+                    && x >= bounds.left
+                    && x <= bounds.right
+                    && y >= bounds.top
+                    && y <= bounds.bottom)
+                    || (0..4).any(|index| {
+                        let a = corners[index];
+                        let b = corners[(index + 1) % 4];
+                        distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                    })
+                    || drawing
+                        .levels
+                        .iter()
+                        .filter(|level| level.visible)
+                        .any(|level| {
+                            grid.level_lines(drawing.level_value(level.value))
+                                .iter()
+                                .any(|&(a, b)| {
+                                    distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                                })
+                        })
+                    || drawing
+                        .gann_fans
+                        .iter()
+                        .filter(|level| level.visible)
+                        .any(|level| {
+                            let (a, b) = grid.fan_segment(level.value, drawing.level_reverse);
+                            distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                        })
+                    || drawing
+                        .gann_arcs
+                        .iter()
+                        .filter(|level| level.visible)
+                        .any(|level| {
+                            (0..32).any(|step| {
+                                let a = grid.arc_point(
+                                    level.value,
+                                    f64::from(step) / 32.0,
+                                    drawing.level_reverse,
+                                );
+                                let b = grid.arc_point(
+                                    level.value,
+                                    f64::from(step + 1) / 32.0,
+                                    drawing.level_reverse,
+                                );
+                                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                            })
+                        })
+            }
+            DrawingBodyGeometry::Quad { corners } => {
+                (drawing.fill_enabled
+                    && self.selected_drawing == Some(drawing.id)
+                    && point_in_polygon((x, y), &corners))
+                    || (0..4).any(|index| {
+                        let a = corners[index];
+                        let b = corners[(index + 1) % 4];
+                        distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                    })
+            }
+            DrawingBodyGeometry::Ellipse { center, rx, ry } => {
+                if rx <= 0.0 || ry <= 0.0 {
+                    false
+                } else if drawing.fill_enabled
+                    && self.selected_drawing == Some(drawing.id)
+                    && ((x - center.0) / rx).powi(2) + ((y - center.1) / ry).powi(2) <= 1.0
+                {
+                    true
+                } else {
+                    (0..64).any(|step| {
+                        let theta0 = std::f64::consts::TAU * step as f64 / 64.0;
+                        let theta1 = std::f64::consts::TAU * (step + 1) as f64 / 64.0;
+                        let a = (center.0 + rx * theta0.cos(), center.1 + ry * theta0.sin());
+                        let b = (center.0 + rx * theta1.cos(), center.1 + ry * theta1.sin());
+                        distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                    })
+                }
+            }
+            DrawingBodyGeometry::Circle { center, radius } => {
+                let distance = (x - center.0).hypot(y - center.1);
+                (distance - radius).abs() <= tolerance
+                    || (drawing.fill_enabled
+                        && self.selected_drawing == Some(drawing.id)
+                        && distance <= radius)
+            }
+            DrawingBodyGeometry::Triangle { corners } => {
+                (drawing.fill_enabled
+                    && self.selected_drawing == Some(drawing.id)
+                    && point_in_polygon((x, y), &corners))
+                    || (0..3).any(|index| {
+                        let a = corners[index];
+                        let b = corners[(index + 1) % 3];
+                        distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                    })
+            }
+            DrawingBodyGeometry::Arc(arc) => (0..64).any(|step| {
+                let a = arc.point(step as f64 / 64.0);
+                let b = arc.point((step + 1) as f64 / 64.0);
+                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+            }),
+            DrawingBodyGeometry::Curve(curve) => (0..64).any(|step| {
+                let a = curve.point(step as f64 / 64.0);
+                let b = curve.point((step + 1) as f64 / 64.0);
+                distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+            }),
             DrawingBodyGeometry::Rectangle {
                 left,
                 right,
@@ -5449,6 +7097,9 @@ impl ChartEngine {
                 .is_some()
             }
             DrawingBodyGeometry::Empty => {
+                if drawing.kind != DrawingKind::Text && !drawing.kind.is_text_annotation() {
+                    return false;
+                }
                 // The click/hover target is the interaction-chrome box (the label run while
                 // non-empty, else a one-em caret box — empty text paints nothing on the chart)
                 // plus the editing chrome's border+padding, so the painted hover/focus border
@@ -5501,6 +7152,8 @@ impl ChartEngine {
             return false;
         }
         let start_points = drawing.points.clone();
+        let screen_position = (drawing.screen_x, drawing.screen_y);
+        let history_bars_pattern = drawing.bars_pattern.clone();
         let Some(start_px) = self.drawing_px(drawing) else {
             return false;
         };
@@ -5523,6 +7176,8 @@ impl ChartEngine {
             handle_px,
             history_points: start_points.clone(),
             history_tool_options,
+            history_screen_position: screen_position,
+            history_bars_pattern,
             start_points,
             start_px,
             keyboard_step: None,
@@ -5571,7 +7226,6 @@ impl ChartEngine {
         let (dx, dy) = (x - start_x, y - drag.start_y);
         let (id, part) = (drag.id, drag.part);
         let (start_points, start_px) = (drag.start_points.clone(), drag.start_px.clone());
-        let handle_px = drag.handle_px;
         let keyboard_step = drag.keyboard_step;
         let Some(drawing) = self.drawing(id) else {
             return;
@@ -5582,29 +7236,45 @@ impl ChartEngine {
             drawing.price_scale,
             drawing.snap_time_to_data,
         );
-        // Pane fractions never snap to bars or prices.
-        let pane_anchored = kind.pane_anchored();
-        let snap_time_to_data = snap_time_to_data && !pane_anchored;
-        let magnet = if pane_anchored {
-            crate::DrawingMagnetMode::Off
-        } else {
-            magnet
-        };
-        let modifiers = DrawingModifiers {
-            magnet: modifiers.magnet && !pane_anchored,
-            ..modifiers
-        };
+        if kind == DrawingKind::AnchoredText {
+            let (dx, dy) = if modifiers.straighten && part == DrawingDragPart::Body {
+                if dx.abs() >= dy.abs() {
+                    (dx, 0.0)
+                } else {
+                    (0.0, dy)
+                }
+            } else {
+                (dx, dy)
+            };
+            let Some(&(start_px_x, start_px_y)) = start_px.first() else {
+                return;
+            };
+            let Some(pane_bounds) = self.panes.get(pane) else {
+                return;
+            };
+            let (pane_top, pane_height) = (pane_bounds.top, pane_bounds.height);
+            let new_x = (start_px_x + dx).clamp(0.0, self.pane_w);
+            let new_y = (start_px_y + dy).clamp(pane_top, pane_top + pane_height);
+            let market_point = self.drawing_from_px_for(pane, price_scale, new_x, new_y);
+            if let Some(drawing) = self.drawings.iter_mut().find(|drawing| drawing.id == id) {
+                drawing.screen_x = (new_x / self.pane_w.max(1.0)).clamp(0.0, 1.0);
+                drawing.screen_y = ((new_y - pane_top) / pane_height.max(1.0)).clamp(0.0, 1.0);
+                if let Some(point) = market_point {
+                    drawing.points[0] = point;
+                }
+            }
+            self.update_drawing_runtime(id);
+            return;
+        }
         let mut points = start_points.clone();
         let convert = |index: usize, dx: f64, dy: f64| -> Option<DrawingPoint> {
             let (px, py) = start_px.get(index)?;
-            self.drawing_anchor_from_px(kind, pane, price_scale, px + dx, py + dy)
+            self.drawing_from_px_for(pane, price_scale, px + dx, py + dy)
         };
-        // The dragged point: a derived handle's baseline moved by the delta and snapped like an
-        // anchor (below), otherwise the pointer.
-        let Some(mut target) = self.drawing_anchor_from_px(kind, pane, price_scale, x, y) else {
+        // A pointer outside every coordinate mapping moves nothing.
+        if self.drawing_from_px_for(pane, price_scale, x, y).is_none() {
             return;
-        };
-        let mut target_px = (x, y);
+        }
         match part {
             DrawingDragPart::Anchor(index) => {
                 if kind.spec().handles == DrawingHandleMode::Position
@@ -5909,65 +7579,14 @@ impl ChartEngine {
                     *slot = point;
                 }
             }
-            DrawingDragPart::Handle(_) => {
-                // A derived handle moves from its own baseline like an anchor: along the spec's
-                // movement axis, time-snapped, then magnet-snapped. Its family's `drag` hook
-                // resolves what the handle drives.
-                let (dx, dy) = kind.spec().movement_axis.constrain(dx, dy);
-                let Some(mut point) = self.drawing_anchor_from_px(
-                    kind,
-                    pane,
-                    price_scale,
-                    handle_px.0 + dx,
-                    handle_px.1 + dy,
-                ) else {
-                    return;
-                };
-                if snap_time_to_data {
-                    let Some(snapped) = self.snap_drawing_time_to_data(point) else {
-                        return;
-                    };
-                    point = snapped;
-                }
-                if modifiers.magnet {
-                    if let Some(snapped) =
-                        self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
-                    {
-                        point = kind.spec().movement_axis.constrain_snap(point, snapped);
-                    }
-                }
-                let Some(point_px) = self.drawing_anchor_px(kind, pane, price_scale, point) else {
-                    return;
-                };
-                target = point;
-                target_px = point_px;
-            }
+            // ponytail: derived drag handles (a family `handles` hook appending a
+            // `DrawingDragPart::Handle` that a family hook resolves) have no surviving family since
+            // the upstream B8 sync retired the fork's pitchfork, fixed-square, and rotated-rectangle
+            // renderers; re-add the drag hook with the first family that derives one.
+            DrawingDragPart::Handle(_) => {}
         }
-        let tool_options = match kind.spec().family {
-            Some(family) => {
-                let (Some(drawing), Some(drag)) = (self.drawing(id), self.drawing_drag.as_ref())
-                else {
-                    return;
-                };
-                let sample = handles::HandleDrag {
-                    part,
-                    start_points: &start_points,
-                    start_px: &start_px,
-                    start_tool_options: &drag.history_tool_options,
-                    target,
-                    target_px,
-                    straighten: modifiers.straighten,
-                    keyboard_step: drag.keyboard_step,
-                };
-                (family.drag)(self, drawing, &sample, &mut points)
-            }
-            None => None,
-        };
         if let Some(drawing) = self.drawings.iter_mut().find(|d| d.id == id) {
             drawing.points = points;
-            if let Some(tool_options) = tool_options {
-                drawing.tool_options = tool_options;
-            }
         }
         if kind.spec().placement.is_freehand() {
             self.invalidate_brush_drag_runtime(id);
@@ -5990,6 +7609,23 @@ impl ChartEngine {
             return false;
         };
         let id = drag.id;
+        // A bars pattern whose source anchors moved freezes the bars now between them; when no
+        // source bar remains there, its anchors return to where the drag began.
+        if matches!(drag.part, DrawingDragPart::Anchor(0 | 1)) {
+            let captured = self
+                .drawing(id)
+                .filter(|drawing| drawing.kind == DrawingKind::BarsPattern)
+                .map(|drawing| self.capture_bars_pattern(drawing));
+            if let (Some(captured), Some(current)) = (
+                captured,
+                self.drawings.iter_mut().find(|drawing| drawing.id == id),
+            ) {
+                match captured {
+                    Some(bars) => current.bars_pattern = bars,
+                    None => current.points = drag.history_points.clone(),
+                }
+            }
+        }
         self.update_drawing_runtime(id);
         let Some(index) = self.drawings.iter().position(|drawing| drawing.id == id) else {
             return false;
@@ -5997,6 +7633,9 @@ impl ChartEngine {
         let mut before = self.drawings[index].clone();
         before.points = drag.history_points;
         before.tool_options = drag.history_tool_options;
+        before.screen_x = drag.history_screen_position.0;
+        before.screen_y = drag.history_screen_position.1;
+        before.bars_pattern = drag.history_bars_pattern;
         if before == self.drawings[index] {
             return false;
         }
@@ -6035,6 +7674,9 @@ impl ChartEngine {
         {
             drawing.points = drag.history_points;
             drawing.tool_options = drag.history_tool_options;
+            drawing.screen_x = drag.history_screen_position.0;
+            drawing.screen_y = drag.history_screen_position.1;
+            drawing.bars_pattern = drag.history_bars_pattern;
             self.update_drawing_runtime(drag.id);
             self.invalidate_frame_drawings();
         }
@@ -6101,6 +7743,8 @@ impl ChartEngine {
             },
         };
         let start_points = drawing.points.clone();
+        let screen_position = (drawing.screen_x, drawing.screen_y);
+        let history_bars_pattern = drawing.bars_pattern.clone();
         let Some(start_px) = self.drawing_px(drawing) else {
             return false;
         };
@@ -6115,6 +7759,8 @@ impl ChartEngine {
             handle_px: (start_x, start_y),
             history_points: start_points.clone(),
             history_tool_options,
+            history_screen_position: screen_position,
+            history_bars_pattern,
             start_points,
             start_px,
             keyboard_step: Some((dx_css, dy_css)),
@@ -6150,11 +7796,16 @@ impl ChartEngine {
         }
     }
 
-    /// Restore a drawing's anchors from `before` without recording history.
+    /// Restore what a drag session edits (anchors, anchored text's screen position, family
+    /// options, a bars pattern's snapshot) from `before` without recording history.
     pub(crate) fn restore_drawing_points(&mut self, before: Drawing) {
         let id = before.id;
         if let Some(drawing) = self.drawings.iter_mut().find(|drawing| drawing.id == id) {
             drawing.points = before.points;
+            drawing.screen_x = before.screen_x;
+            drawing.screen_y = before.screen_y;
+            drawing.tool_options = before.tool_options;
+            drawing.bars_pattern = before.bars_pattern;
             self.update_drawing_runtime(id);
             self.invalidate_frame_drawings();
         }
@@ -6519,7 +8170,7 @@ impl ChartEngine {
         let point = self.drawing_from_px_for(pane_index, price_scale, x, y)?;
         let magnet_point = self.magnet_snap_point_at(magnet, pane_index, price_scale, x, y);
         Some(self.grid_snap_point(
-            DrawingKind::DateAndPriceRange,
+            DrawingKind::DatePriceRange,
             pane_index,
             price_scale,
             x,
@@ -6580,7 +8231,7 @@ impl ChartEngine {
         let Some(start) = self.measure_point_at(pane, price_scale, x, y, magnet) else {
             return false;
         };
-        let mut drawing = Drawing::new(0, DrawingKind::DateAndPriceRange, pane, vec![start, start]);
+        let mut drawing = Drawing::new(0, DrawingKind::DatePriceRange, pane, vec![start, start]);
         drawing.price_scale = price_scale;
         self.drawing_controller.measure = Some(MeasureSession {
             drawing,
@@ -6817,23 +8468,6 @@ impl ChartEngine {
         if bound_pane.is_some() && self.pane_at_y(y) != Some(pane) {
             return -1;
         }
-        // A click on the first vertex of a closable multi-click drawing closes and commits it.
-        if self.pending_close_hit(x, y).is_some() {
-            let Some(mut pending) = self.drawing_controller.pending.take() else {
-                return -1;
-            };
-            if let Some(close) = pending
-                .drawing
-                .kind
-                .spec()
-                .family
-                .and_then(|family| family.close_placement)
-            {
-                close(&mut pending.drawing);
-            }
-            pending.preview = None;
-            return i64::from(self.commit_pending_drawing(pending));
-        }
         let (anchor_count, kind, fixed, snap_time_to_data, own_magnet) = {
             let Some(pending) = &self.drawing_controller.pending else {
                 return 0;
@@ -6846,28 +8480,21 @@ impl ChartEngine {
                 pending.drawing.magnet,
             )
         };
-        let Some(mut point) = self.drawing_anchor_from_px(kind, pane, price_scale, x, y) else {
+        let Some(mut point) = self.drawing_from_px_for(pane, price_scale, x, y) else {
             return -1;
         };
-        // Pane fractions never snap to bars or prices.
-        let pane_anchored = kind.pane_anchored();
-        let snap_time_to_data = snap_time_to_data && !pane_anchored;
         if snap_time_to_data {
             let Some(snapped) = self.snap_drawing_time_to_data(point) else {
                 return -1;
             };
             point = snapped;
         }
-        let magnet = if pane_anchored {
-            crate::DrawingMagnetMode::Off
-        } else {
-            self.effective_drawing_magnet(own_magnet, modifiers.magnet)
-        };
+        let magnet = self.effective_drawing_magnet(own_magnet, modifiers.magnet);
         let magnet_point = self.magnet_snap_point_at(magnet, pane, price_scale, x, y);
         if let Some(snapped) = magnet_point {
             point = snapped;
         }
-        if modifiers.straighten && !pane_anchored {
+        if modifiers.straighten {
             if let Some(fixed) = fixed {
                 if let Some(snapped) = self.straighten_point(pane, price_scale, kind, fixed, point)
                 {
@@ -6921,33 +8548,31 @@ impl ChartEngine {
         i64::from(self.commit_pending_drawing(pending))
     }
 
-    /// The first vertex of the pending drawing when media px `(x, y)` lies within the anchor hit
-    /// radius of it and a click there would close the drawing: its family closes placements
-    /// (`DrawingFamily::close_placement`), it is a multi-click sequence, and at least three
-    /// vertices are placed.
-    fn pending_close_hit(&self, x: f64, y: f64) -> Option<DrawingPoint> {
-        let drawing = &self.drawing_controller.pending.as_ref()?.drawing;
-        let spec = drawing.kind.spec();
-        spec.family?.close_placement?;
-        if !spec.placement.is_sequence() || drawing.points.len() < 3 {
-            return None;
-        }
-        let first = *drawing.points.first()?;
-        let (fx, fy) = self.drawing_point_px(drawing, first)?;
-        ((x - fx).hypot(y - fy) <= HitProfile::PRECISION.drawing_anchor_radius).then_some(first)
-    }
-
     fn commit_pending_drawing(&mut self, pending: PendingDrawing) -> DrawingId {
         self.invalidate_frame_overlay();
+        let mut drawing = pending.drawing;
+        Drawing::normalize_points(drawing.kind, &mut drawing.points);
+        // Anchored text starts at its anchor's screen position.
+        if drawing.kind == DrawingKind::AnchoredText {
+            if let Some((x, y)) = drawing.points.first().and_then(|&point| {
+                self.anchored_text_screen_position(drawing.pane_index, drawing.price_scale, point)
+            }) {
+                drawing.screen_x = x;
+                drawing.screen_y = y;
+            }
+        }
+        // A bars pattern freezes its source bars; without any it is not created, and no
+        // identity is consumed.
+        if drawing.kind == DrawingKind::BarsPattern {
+            let Some(bars) = self.capture_bars_pattern(&drawing) else {
+                return 0;
+            };
+            drawing.bars_pattern = bars;
+        }
         let Some(id) = self.take_drawing_id() else {
             return 0;
         };
-        let mut drawing = pending.drawing;
         drawing.id = id;
-        Drawing::normalize_points(drawing.kind, &mut drawing.points);
-        if let Some(family) = drawing.kind.spec().family {
-            (family.on_create)(self, &mut drawing, true);
-        }
         self.drawings.push(drawing);
         self.insert_drawing_runtime(id);
         self.selected_drawing = Some(id);
@@ -7030,36 +8655,22 @@ impl ChartEngine {
         if self.pane_at_y(y) != Some(pane) {
             return;
         }
-        // Over the first vertex of a closable drawing the preview closes the outline.
-        if let Some(first) = self.pending_close_hit(x, y) {
-            if let Some(pending) = self.drawing_controller.pending.as_mut() {
-                pending.preview = Some(first);
-            }
-            return;
-        }
-        let kind = pending.drawing.kind;
-        let Some(mut point) = self.drawing_anchor_from_px(kind, pane, price_scale, x, y) else {
+        let Some(mut point) = self.drawing_from_px_for(pane, price_scale, x, y) else {
             return;
         };
-        // Pane fractions never snap to bars or prices.
-        let pane_anchored = kind.pane_anchored();
         let own_magnet = pending.drawing.magnet;
-        if pending.drawing.snap_time_to_data && !pane_anchored {
+        if pending.drawing.snap_time_to_data {
             let Some(snapped) = self.snap_drawing_time_to_data(point) else {
                 return;
             };
             point = snapped;
         }
-        let magnet = if pane_anchored {
-            crate::DrawingMagnetMode::Off
-        } else {
-            self.effective_drawing_magnet(own_magnet, modifiers.magnet)
-        };
+        let magnet = self.effective_drawing_magnet(own_magnet, modifiers.magnet);
         let magnet_point = self.magnet_snap_point_at(magnet, pane, price_scale, x, y);
         if let Some(snapped) = magnet_point {
             point = snapped;
         }
-        if modifiers.straighten && !pane_anchored {
+        if modifiers.straighten {
             if let Some(pending) = &self.drawing_controller.pending {
                 if let Some(&fixed) = pending.drawing.points.last() {
                     if let Some(snapped) =
@@ -7261,106 +8872,69 @@ impl ChartEngine {
     }
 }
 
-// --- pane-anchored anchors (B8 family hook `DrawingFamily::pane_anchored`) ---------------------
-
-impl DrawingKind {
-    /// Whether this kind's anchors are pane fractions (`logical` = x / pane width, `price` = y /
-    /// pane height from the pane top) instead of time and price. Such a drawing stays put while
-    /// the chart scrolls or rescales, carries no anchor time, ignores magnets and paste offsets,
-    /// and is never rebased or price-rescaled.
-    pub(crate) fn pane_anchored(self) -> bool {
-        self.spec()
-            .family
-            .is_some_and(|family| (family.pane_anchored)(self))
-    }
-}
-
 impl ChartEngine {
-    /// Media px of one anchor of `drawing` (x pane-relative, y chart-top): time and price
-    /// through the drawing's scale, or the pane fraction of a pane-anchored kind. Both need the
-    /// same live pane, scale, and time points, so every drawing appears and hides together.
+    /// Media px of one anchor of `drawing` (x pane-relative, y chart-top), through the drawing's
+    /// pane and price scale ([`ChartEngine::drawing_to_px_for`]).
     pub(crate) fn drawing_point_px(
         &self,
         drawing: &Drawing,
         point: DrawingPoint,
     ) -> Option<(f64, f64)> {
-        self.drawing_anchor_px(drawing.kind, drawing.pane_index, drawing.price_scale, point)
+        self.drawing_to_px_for(drawing.pane_index, drawing.price_scale, point)
     }
 
-    /// [`ChartEngine::drawing_point_px`] for a drawing of `kind` on `pane_index` and `target`.
-    pub(crate) fn drawing_anchor_px(
+    /// Anchored text's `(screen_x, screen_y)` for an anchor at `point`: its media px as pane
+    /// fractions, clamped to the pane. Creation, commits, anchor edits, and the placement preview
+    /// all derive the screen position here. `None` when the anchor cannot be placed.
+    pub(crate) fn anchored_text_screen_position(
         &self,
-        kind: DrawingKind,
         pane_index: usize,
-        target: DrawingPriceScale,
+        price_scale: DrawingPriceScale,
         point: DrawingPoint,
     ) -> Option<(f64, f64)> {
-        if !kind.pane_anchored() {
-            return self.drawing_to_px_for(pane_index, target, point);
-        }
-        self.drawing_scale_for(pane_index, target)?;
-        if self.data.merged_times().is_empty() {
-            return None;
-        }
-        let pane = self.panes.get(pane_index)?;
-        Some((
-            point.logical * self.pane_w,
-            pane.top + point.price * pane.height,
-        ))
-    }
-
-    /// The anchor of a `kind` drawing under media px `(x, y)`: the inverse of
-    /// [`ChartEngine::drawing_anchor_px`]. Pane fractions clamp to the pane, so a dragged or
-    /// placed pane-anchored drawing always stays reachable.
-    pub(crate) fn drawing_anchor_from_px(
-        &self,
-        kind: DrawingKind,
-        pane_index: usize,
-        target: DrawingPriceScale,
-        x: f64,
-        y: f64,
-    ) -> Option<DrawingPoint> {
-        if !kind.pane_anchored() {
-            return self.drawing_from_px_for(pane_index, target, x, y);
-        }
-        if !x.is_finite() || !y.is_finite() {
-            return None;
-        }
-        self.drawing_scale_for(pane_index, target)?;
-        if self.data.merged_times().is_empty() {
-            return None;
-        }
+        let (x, y) = self.drawing_to_px_for(pane_index, price_scale, point)?;
         let pane = self.panes.get(pane_index)?;
         if self.pane_w <= 0.0 || pane.height <= 0.0 {
             return None;
         }
-        Some(DrawingPoint {
-            logical: (x / self.pane_w).clamp(0.0, 1.0),
-            price: ((y - pane.top) / pane.height).clamp(0.0, 1.0),
-        })
+        Some((
+            (x / self.pane_w).clamp(0.0, 1.0),
+            ((y - pane.top) / pane.height).clamp(0.0, 1.0),
+        ))
     }
 }
 
-// --- data-reading family drawings (B8 hook `DrawingFamily::reads_series_data`) ----------------
+// --- data-reading drawings (regression trend, forecast, bars pattern) ---------------------------
 
 impl ChartEngine {
-    /// The series a data-reading family drawing measures (a regression's fit, a forecast's
-    /// outcome, a bars pattern's copy): the first live ordinary series in creation order on the
-    /// drawing's pane and price scale, the series whose prices that scale shows. Creation order
-    /// is the smallest live [`SeriesId`] (identities are monotonic and never reused), not the
-    /// storage slot order, which reuses freed slots. Indicator outputs and custom series never
-    /// qualify; footprint and feature series do, through their OHLC projection. Hiding a series
-    /// does not move its drawings' source.
+    /// The series a data-reading drawing measures (a regression's fit, a forecast's outcome, a
+    /// bars pattern's copy), the single resolver frames, invalidation, and capture share. An
+    /// explicit `regression_source_id` wins while that series is live on the drawing's pane and
+    /// price scale; an explicit id that is not live resolves to `None` (the drawing waits for its
+    /// source instead of silently measuring another). Otherwise: the first live ordinary series
+    /// in creation order on the drawing's pane and price scale, the series whose prices that
+    /// scale shows. Creation order is the smallest live [`SeriesId`] (identities are monotonic and
+    /// never reused), not the storage slot order, which reuses freed slots. Indicator outputs and
+    /// custom series never qualify by default; footprint and feature series do, through their
+    /// OHLC projection. Hiding a series does not move its drawings' source.
     pub(crate) fn drawing_source_series(&self, drawing: &Drawing) -> Option<SeriesId> {
         let target = drawing.price_scale.target();
+        let explicit = drawing.regression_source_id;
         self.series
             .iter()
             .filter(|series| {
                 !series.removed
                     && series.pane_index == drawing.pane_index
                     && series.price_scale_target == target
-                    && series.kind != SeriesKind::Custom
-                    && self.indicator_binding_id(series.id).is_none()
+            })
+            .filter(|series| {
+                explicit.map_or_else(
+                    || {
+                        series.kind != SeriesKind::Custom
+                            && self.indicator_binding_id(series.id).is_none()
+                    },
+                    |id| series.id == id,
+                )
             })
             .map(|series| series.id)
             .min()

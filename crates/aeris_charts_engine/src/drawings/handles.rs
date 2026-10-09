@@ -1,10 +1,10 @@
 //! The one editable-handle set of a drawing. Selected-handle painting, handle hit testing, and
 //! keyboard handle cycling all iterate this set, so a handle can never be painted without being
 //! draggable, or reachable by keyboard without being painted. A family's `handles` hook edits
-//! the set (derived handles), and its `drag` hook completes every drag sample through
-//! [`HandleDrag`], so pointer drags, keyboard nudges, and magnet snapping share one path.
+//! the set (derived handles); pointer drags, keyboard nudges, and magnet snapping share the
+//! engine's one drag path.
 
-use super::{ChartEngine, Drawing, DrawingDragPart, DrawingHandleMode, DrawingPoint};
+use super::{ChartEngine, Drawing, DrawingDragPart, DrawingHandleMode};
 
 /// Painted form of a handle (sizes are the frame's shared anchor radius and border).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,33 +81,6 @@ pub(crate) fn handle_set(mode: DrawingHandleMode, px: &[(f64, f64)]) -> Vec<Draw
     }
 }
 
-/// One drag sample of a drawing, handed to its family's `drag` hook
-/// ([`super::kinds::DrawingFamily::drag`]). Pointer drags and keyboard nudges build the same
-/// sample; nudges never magnet-snap and carry their step in `keyboard_step`.
-pub(crate) struct HandleDrag<'a> {
-    /// The dragged part.
-    pub(crate) part: DrawingDragPart,
-    /// The anchors at the drag baseline (the press, or the last data-driven rebaseline) and
-    /// their media px.
-    pub(crate) start_points: &'a [DrawingPoint],
-    pub(crate) start_px: &'a [(f64, f64)],
-    /// The drawing's tool options at the press, the base of any option the hook edits (the live
-    /// options already carry the previous sample's edit).
-    pub(crate) start_tool_options: &'a crate::DrawingToolOptions,
-    /// Where the dragged point goes: the handle's baseline media px moved by the pointer delta
-    /// (constrained to the spec's movement axis), time-snapped and magnet-snapped like an anchor,
-    /// as an anchor point and back in media px. For an anchor part it is the generic drag's
-    /// result; for a body drag, the translated press point.
-    pub(crate) target: DrawingPoint,
-    pub(crate) target_px: (f64, f64),
-    /// Shift (straighten) is held.
-    pub(crate) straighten: bool,
-    /// A keyboard nudge's media-px step (`None` for a pointer drag). A hook that quantizes the
-    /// target (a fixed square's whole bars) steps at least one unit the way the key moved, so
-    /// repeated sub-unit nudges still edit the drawing.
-    pub(crate) keyboard_step: Option<(f64, f64)>,
-}
-
 impl ChartEngine {
     /// The editable handles of `drawing` whose anchors sit at media px `px`: the spec's handle
     /// mode, edited by the family's `handles` hook (derived handles). Callers scale the points
@@ -122,28 +95,6 @@ impl ChartEngine {
             (family.handles)(self, drawing, px, &mut handles);
         }
         handles
-    }
-
-    /// The anchor of `drawing` under media px `point`, time-snapped to a bar when the drawing
-    /// snaps its time to data: a family drag moving anchors with a derived handle converts
-    /// them like the generic drag does.
-    pub(crate) fn drawing_anchor_at(
-        &self,
-        drawing: &Drawing,
-        (x, y): (f64, f64),
-    ) -> Option<DrawingPoint> {
-        let point = self.drawing_anchor_from_px(
-            drawing.kind,
-            drawing.pane_index,
-            drawing.price_scale,
-            x,
-            y,
-        )?;
-        if drawing.snap_time_to_data && !drawing.kind.pane_anchored() {
-            self.snap_drawing_time_to_data(point)
-        } else {
-            Some(point)
-        }
     }
 
     /// The media px of the handle of `drawing` that drives `part`, when it has one.

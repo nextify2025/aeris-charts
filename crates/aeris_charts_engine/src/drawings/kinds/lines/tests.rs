@@ -11,8 +11,8 @@ use super::super::super::{
     DrawingTextVAlign,
 };
 use crate::{
-    ChartEngine, DrawingAnchor, DrawingDragPart, DrawingId, DrawingKind, DrawingLineCap,
-    DrawingMagnetMode, DrawingModifiers, DrawingPoint, DrawingStatsPosition,
+    ChartEngine, DrawingAnchor, DrawingId, DrawingKind, DrawingLineCap, DrawingMagnetMode,
+    DrawingModifiers, DrawingPoint, DrawingStatsPosition,
 };
 
 const LINE_KINDS: [DrawingKind; 6] = [
@@ -122,17 +122,15 @@ fn close(a: (f64, f64), b: (f64, f64), tolerance: f64) -> bool {
     (a.0 - b.0).abs() <= tolerance && (a.1 - b.1).abs() <= tolerance
 }
 
-fn collinear(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> bool {
-    let cross = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
-    cross.abs() <= 1e-3 * (b.0 - a.0).hypot(b.1 - a.1) * (c.0 - a.0).hypot(c.1 - a.1)
-}
-
+/// The fork's pre-merge defaults of the upstream line tools, which documents it wrote omitted,
+/// come back through `apply_legacy_fork_defaults` (upstream renders these tools now).
 #[test]
 fn catalog_defaults_follow_each_tool() {
     for kind in LINE_KINDS {
-        let drawing = crate::Drawing::new(1, kind, 0, Vec::new());
+        let mut drawing = crate::Drawing::new(1, kind, 0, Vec::new());
+        super::super::apply_legacy_fork_defaults(&mut drawing);
         let spec = kind.spec();
-        assert!(spec.family.is_some(), "{kind:?} is a family tool");
+        assert!(spec.family.is_none(), "{kind:?} is upstream-rendered");
         assert_eq!(spec.axis_price_label, kind == DrawingKind::CrossLine);
         if kind == DrawingKind::CrossLine {
             assert_eq!(spec.placement, DrawingPlacement::ClickAnchors { count: 1 });
@@ -141,6 +139,7 @@ fn catalog_defaults_follow_each_tool() {
         } else {
             assert_eq!(spec.placement, DrawingPlacement::ClickAnchors { count: 2 });
             assert_eq!(spec.text_layout, DrawingTextLayout::Segment);
+            assert_eq!(drawing.width, 2.0);
             assert_eq!(
                 (drawing.text_h_align, drawing.text_v_align),
                 (DrawingTextHAlign::Right, DrawingTextVAlign::Top),
@@ -195,240 +194,6 @@ fn armed_tools_place_every_lines_kind() {
         assert_eq!(chart.active_drawing_tool(), None, "one-shot tools disarm");
         assert_eq!(chart.selected_drawing(), Some(id));
     }
-}
-
-#[test]
-fn rays_and_extended_lines_reach_the_pane_edge_in_their_own_direction() {
-    let mut chart = chart();
-    let pane_right = chart.pane_w;
-    let (pane_top, pane_bottom) = (
-        chart.panes[0].top,
-        chart.panes[0].top + chart.panes[0].height,
-    );
-    let on_edge = |point: (f64, f64)| {
-        (point.0 - 0.0).abs() < 0.5
-            || (point.0 - pane_right).abs() < 0.5
-            || (point.1 - pane_top).abs() < 0.5
-            || (point.1 - pane_bottom).abs() < 0.5
-    };
-
-    let forward = add(
-        &mut chart,
-        DrawingKind::Ray,
-        vec![p(10.0, 101.0), p(20.0, 102.0)],
-        r##"{"color":"#123456"}"##,
-    );
-    let (a, b) = (anchor(&chart, forward, 0), anchor(&chart, forward, 1));
-    let lines = ink_polylines(&mut chart);
-    assert_eq!(lines.len(), 1);
-    let ray = &lines[0].0;
-    assert!(close(ray[0], a, 0.01), "the ray starts on its first anchor");
-    assert!(
-        on_edge(ray[1]) && ray[1].0 > b.0,
-        "and runs past the second to the edge"
-    );
-    assert!(collinear(a, b, ray[1]));
-    chart.remove_drawing(forward);
-
-    // Drawn right to left, the ray follows its own direction.
-    let backward = add(
-        &mut chart,
-        DrawingKind::Ray,
-        vec![p(20.0, 101.0), p(10.0, 102.0)],
-        r##"{"color":"#123456"}"##,
-    );
-    let b = anchor(&chart, backward, 1);
-    let ray = ink_polylines(&mut chart).remove(0).0;
-    assert!(on_edge(ray[1]) && ray[1].0 < b.0);
-    // Turning its extension off leaves the anchor segment.
-    assert!(chart.drawing_apply_options(backward, r#"{"extend_right":false}"#));
-    let segment = ink_polylines(&mut chart).remove(0).0;
-    assert!(close(segment[1], b, 0.01));
-    chart.remove_drawing(backward);
-
-    let extended = add(
-        &mut chart,
-        DrawingKind::ExtendedLine,
-        vec![p(10.0, 101.0), p(20.0, 102.0)],
-        r##"{"color":"#123456"}"##,
-    );
-    let (a, b) = (anchor(&chart, extended, 0), anchor(&chart, extended, 1));
-    let line = ink_polylines(&mut chart).remove(0).0;
-    assert!(on_edge(line[0]) && on_edge(line[1]));
-    assert!(line[0].0 < a.0 && line[1].0 > b.0);
-    assert!(collinear(a, b, line[0]) && collinear(a, b, line[1]));
-}
-
-#[test]
-fn arrow_lines_end_in_an_arrowhead_that_the_stroke_never_pokes_through() {
-    let mut chart = chart();
-    let id = add(
-        &mut chart,
-        DrawingKind::ArrowLine,
-        vec![p(10.0, 101.0), p(20.0, 101.0)],
-        r##"{"color":"#123456","width":2}"##,
-    );
-    let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
-    let frame = chart.build_frame();
-    let pane = &frame.panes[0];
-    let (upper_first, lower_first) = pane
-        .main
-        .iter()
-        .find_map(|prim| match prim {
-            Prim::BandFill {
-                upper_first,
-                lower_first,
-                fill,
-                ..
-            } if *fill == ink() => Some((*upper_first as usize, *lower_first as usize)),
-            _ => None,
-        })
-        .expect("arrowhead fill");
-    let tip = pane.points[upper_first];
-    assert!(close((f64::from(tip[0]), f64::from(tip[1])), b, 0.01));
-    assert_eq!(pane.points[upper_first], pane.points[lower_first]);
-    let stroke = ink_polylines(&mut chart).remove(0).0;
-    assert!(close(stroke[0], a, 0.01));
-    assert!(
-        (b.0 - stroke[1].0 - 2.0).abs() < 1e-3,
-        "trimmed by one stroke width"
-    );
-    assert!(
-        chart.hit_test_drawing(b.0 - 4.0, b.1 + 3.0).is_some(),
-        "the arrowhead is a body target"
-    );
-}
-
-#[test]
-fn info_lines_paint_engine_formatted_stats_in_a_hittable_box() {
-    let mut chart = chart();
-    let id = add(
-        &mut chart,
-        DrawingKind::InfoLine,
-        vec![p(10.0, 100.0), p(20.0, 105.0)],
-        r##"{"color":"#123456"}"##,
-    );
-    let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
-    let runs = texts(&mut chart);
-    let lines = runs
-        .iter()
-        .map(|(text, ..)| text.as_str())
-        .collect::<Vec<_>>();
-    assert!(lines.contains(&"+5.00  +5.00%"), "{lines:?}");
-    assert!(lines.contains(&"10 bars  10h"), "{lines:?}");
-    let angle = lines
-        .iter()
-        .find(|line| line.ends_with('°'))
-        .expect("angle line");
-    let (degrees, _) = chart
-        .drawing_screen_vector(chart.drawing(id).unwrap(), 0, 1)
-        .unwrap();
-    assert_eq!(*angle, format!("{degrees:.2}°"));
-    // The box sits beyond the second anchor, on its far side, in the drawing color.
-    let (_, box_x, box_y) = runs
-        .iter()
-        .find(|(text, ..)| text == "+5.00  +5.00%")
-        .unwrap();
-    assert!(f64::from(*box_x) > b.0 + 8.0);
-    let background = Color::rgba(0x12, 0x34, 0x56, 224);
-    let frame = chart.build_frame();
-    assert!(frame.panes[0]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Rect { color, .. } if *color == background)));
-    let hit = chart.hit_test_drawing(f64::from(*box_x) + 10.0, f64::from(*box_y));
-    assert_eq!(hit.map(|hit| hit.part), Some(DrawingDragPart::Body));
-
-    // Stats position moves the box; clearing the stats removes it.
-    assert!(chart.drawing_apply_options(
-        id,
-        r#"{"tool_options":{"line":{"stats_position":"start"}}}"#
-    ));
-    let (_, start_x, _) = texts(&mut chart)
-        .into_iter()
-        .find(|(text, ..)| text == "+5.00  +5.00%")
-        .unwrap();
-    assert!(f64::from(start_x) < a.0 - 8.0);
-    assert!(chart.drawing_apply_options(id, r#"{"labels":[]}"#));
-    assert!(!texts(&mut chart)
-        .iter()
-        .any(|(text, ..)| text.contains("bars")));
-}
-
-#[test]
-fn trend_angle_shows_the_screen_angle_with_a_reference_and_an_arc() {
-    let mut chart = chart();
-    let a = p(10.0, 101.0);
-    let (ax, ay) = chart
-        .drawing_to_px_for(0, crate::DrawingPriceScale::Right, a)
-        .unwrap();
-    let b = chart
-        .drawing_from_px_for(0, crate::DrawingPriceScale::Right, ax + 90.0, ay - 90.0)
-        .unwrap();
-    let id = add(
-        &mut chart,
-        DrawingKind::TrendAngle,
-        vec![a, b],
-        r##"{"color":"#123456"}"##,
-    );
-    let runs = texts_of(&mut chart);
-    assert!(runs.iter().any(|text| text == "45.00°"), "{runs:?}");
-    let frame = chart.build_frame();
-    let (reference_y, reference_x0, reference_x1) = frame.panes[0]
-        .main
-        .iter()
-        .find_map(|prim| match prim {
-            Prim::HLine {
-                y,
-                x0,
-                x1,
-                style: LineStyle::Dashed,
-                color,
-                ..
-            } if *color == ink() => Some((*y, *x0, *x1)),
-            _ => None,
-        })
-        .expect("crisp dashed horizontal reference");
-    assert_eq!(reference_y, ay.round() as i32);
-    assert_eq!(reference_x0, ax.round() as i32);
-    assert!(
-        f64::from(reference_x1) > ax + 90.0,
-        "as long as the segment"
-    );
-    let lines = ink_polylines(&mut chart);
-    let arc = &lines
-        .iter()
-        .find(|(points, ..)| points.len() > 2)
-        .expect("arc")
-        .0;
-    let radius = (arc[0].0 - ax).hypot(arc[0].1 - ay);
-    assert!((16.0..=48.0).contains(&radius));
-    assert!(arc
-        .iter()
-        .all(|point| ((point.0 - ax).hypot(point.1 - ay) - radius).abs() < 1e-3));
-    assert!(
-        (arc[0].1 - ay).abs() < 1e-3,
-        "the arc starts on the reference"
-    );
-    let end = arc[arc.len() - 1];
-    assert!(
-        ((end.0 - ax) + (end.1 - ay)).abs() < 1e-3,
-        "and ends on the 45° segment"
-    );
-    // Falling segments read negative.
-    let falling = chart
-        .drawing_from_px_for(0, crate::DrawingPriceScale::Right, ax + 90.0, ay + 30.0)
-        .unwrap();
-    assert!(chart
-        .set_drawing_anchors(id, &[a.into(), falling.into()])
-        .is_ok());
-    assert!(texts_of(&mut chart)
-        .iter()
-        .any(|text| text.starts_with('-') && text.ends_with('°')));
-}
-
-fn texts_of(chart: &mut ChartEngine) -> Vec<String> {
-    texts(chart).into_iter().map(|(text, ..)| text).collect()
 }
 
 #[test]
@@ -628,7 +393,7 @@ fn line_anchors_resolve_by_time_across_an_interval_switch() {
 
 #[test]
 fn schema_kind_options_and_tool_option_patches_are_typed_and_atomic() {
-    let schema = crate::drawing_property_schema(DrawingKind::Ray);
+    let schema = crate::drawing_property_schema(DrawingKind::VerticalRay);
     let default_of = |name: &str| {
         schema
             .properties
@@ -661,8 +426,8 @@ fn schema_kind_options_and_tool_option_patches_are_typed_and_atomic() {
     let mut chart = chart();
     let id = add(
         &mut chart,
-        DrawingKind::InfoLine,
-        two_points(DrawingKind::InfoLine),
+        DrawingKind::HorizontalSegment,
+        two_points(DrawingKind::HorizontalSegment),
         "{}",
     );
     let kind_options = || {
@@ -821,9 +586,9 @@ fn frames_scale_family_geometry_with_the_device_pixel_ratio() {
         let mut chart = chart_with(&hourly(40), dpr);
         let id = add(
             &mut chart,
-            DrawingKind::InfoLine,
-            vec![p(10.0, 100.0), p(20.0, 105.0)],
-            r##"{"color":"#123456"}"##,
+            DrawingKind::HorizontalSegment,
+            vec![p(10.0, 105.0), p(20.0, 105.0)],
+            r##"{"color":"#123456","labels":[{"metric":"bar_count","visible":true,"position":"on"}]}"##,
         );
         let b = anchor(&chart, id, 1);
         let stroke = ink_polylines(&mut chart).remove(0);
@@ -834,30 +599,10 @@ fn frames_scale_family_geometry_with_the_device_pixel_ratio() {
         assert!((stroke.0[1].1 - b.1 * vpr).abs() < 1e-3);
         let (_, x, _) = texts(&mut chart)
             .into_iter()
-            .find(|(text, ..)| text == "+5.00  +5.00%")
+            .find(|(text, ..)| text == "10 bars")
             .unwrap();
         assert!(f64::from(x) > (b.0 + 8.0) * dpr - 1.0);
     }
-}
-
-#[test]
-fn creation_previews_measure_the_previewed_geometry() {
-    let mut chart = chart();
-    assert!(chart.set_drawing_tool(Some(DrawingKind::InfoLine), None, None));
-    let start = chart
-        .drawing_to_px_for(0, crate::DrawingPriceScale::Right, p(10.0, 100.0))
-        .unwrap();
-    let end = chart
-        .drawing_to_px_for(0, crate::DrawingPriceScale::Right, p(20.0, 105.0))
-        .unwrap();
-    chart.drawing_tool_activate(start.0, start.1, DrawingModifiers::default());
-    chart.drawing_tool_pointer_move(end.0, end.1, DrawingModifiers::default(), false);
-    assert!(
-        texts_of(&mut chart)
-            .iter()
-            .any(|text| text == "10 bars  10h"),
-        "the pending info line shows its stats before the second click"
-    );
 }
 
 /// Twenty-two trend lines past the anchors under test, so candidate queries take the culled path.
@@ -870,51 +615,6 @@ fn crowd(chart: &mut ChartEngine) {
             "{}",
         );
     }
-}
-
-fn viewport_candidate(chart: &ChartEngine, id: DrawingId) -> bool {
-    let candidates = chart.take_drawing_candidates(0, None);
-    let found = candidates.contains(&id);
-    chart.recycle_drawing_candidates(candidates);
-    found
-}
-
-#[test]
-fn extension_patches_refresh_culling_and_rays_without_extensions_cull() {
-    let mut chart = chart();
-    crowd(&mut chart);
-    // Anchors far left of the viewport; the line would cross the right half of the pane.
-    let segment = vec![p(-30.0, 103.0), p(-28.0, 103.05)];
-    let ray = add(&mut chart, DrawingKind::Ray, segment.clone(), "{}");
-    let trend = add(&mut chart, DrawingKind::TrendLine, segment, "{}");
-    chart.build_frame();
-    let (a, b) = (anchor(&chart, ray, 0), anchor(&chart, ray, 1));
-    let x = chart.pane_w - 20.0;
-    let y = a.1 + (b.1 - a.1) * (x - a.0) / (b.0 - a.0);
-    assert!(y > chart.panes[0].top && y < chart.panes[0].top + chart.panes[0].height);
-    let hit = |chart: &ChartEngine| chart.hit_test_drawing(x, y).map(|hit| hit.id);
-    assert!(viewport_candidate(&chart, ray), "a ray reaches the pane");
-    assert!(
-        !viewport_candidate(&chart, trend),
-        "the unextended copy is culled"
-    );
-    assert_eq!(hit(&chart), Some(ray));
-
-    // Switching the ray's extension off culls it like any finite segment; switching the trend
-    // line's on makes its extension visible and hittable. Undo restores both states.
-    assert!(chart.drawing_apply_options(ray, r#"{"extend_right":false}"#));
-    assert!(chart.drawing_apply_options(trend, r#"{"extend_right":true}"#));
-    chart.build_frame();
-    assert!(!viewport_candidate(&chart, ray));
-    assert!(viewport_candidate(&chart, trend));
-    assert_eq!(hit(&chart), Some(trend));
-    assert!(chart.undo_drawing());
-    chart.build_frame();
-    assert!(!viewport_candidate(&chart, trend));
-    assert_eq!(hit(&chart), None);
-    assert!(chart.undo_drawing());
-    chart.build_frame();
-    assert_eq!(hit(&chart), Some(ray));
 }
 
 #[test]
@@ -967,108 +667,6 @@ fn cross_lines_paint_and_hit_with_their_anchor_scrolled_away() {
 }
 
 #[test]
-fn info_lines_on_non_time_bars_omit_durations() {
-    use crate::{
-        AggressorSide, FootprintAggregationOptions, FootprintBarAggregation,
-        FootprintSeriesOptions, FootprintTrade,
-    };
-    let trade = |index: i64| FootprintTrade {
-        timestamp_micros: 2_000_001 + index * 1_000_000,
-        price: 100.0 + (index % 3) as f64,
-        volume: 1.0,
-        aggressor: AggressorSide::Buy,
-        bid: None,
-        ask: None,
-        sequence: None,
-        trade_id: None,
-        conditions: 0,
-        session_id: Some(1),
-    };
-    let mut chart = ChartEngine::new(800.0, 500.0, 1.0);
-    let footprint = chart
-        .add_footprint_series(FootprintSeriesOptions {
-            aggregation: FootprintAggregationOptions {
-                tick_size: 1.0,
-                bars: FootprintBarAggregation::Trades { trades_per_bar: 1 },
-                ..FootprintAggregationOptions::default()
-            },
-            ..FootprintSeriesOptions::default()
-        })
-        .unwrap();
-    chart
-        .set_footprint_trades(footprint, (0..20).map(trade).collect())
-        .unwrap();
-    chart.time_scale.set_width(800.0);
-    chart.fit_content();
-    chart.build_frame();
-    let id = add(
-        &mut chart,
-        DrawingKind::InfoLine,
-        vec![p(2.0, 100.0), p(6.0, 102.0)],
-        r##"{"color":"#123456"}"##,
-    );
-    let runs = texts_of(&mut chart);
-    assert!(runs.iter().any(|text| text == "+2.00  +2.00%"), "{runs:?}");
-    assert!(
-        runs.iter().any(|text| text == "4 bars"),
-        "row keys are never read as a duration: {runs:?}"
-    );
-    let b = anchor(&chart, id, 1);
-    assert_eq!(
-        chart.hit_test_drawing(b.0 + 20.0, b.1).map(|hit| hit.id),
-        Some(id)
-    );
-}
-
-#[test]
-fn info_lines_paint_and_hit_on_a_lower_pane() {
-    let mut chart = chart();
-    let pane = chart.add_pane(true).unwrap();
-    let series = chart.add_series(crate::SeriesKind::Line);
-    let values = (0..40)
-        .map(|index| 10.0 + index as f64 * 0.1)
-        .collect::<Vec<_>>();
-    chart
-        .set_series_data(series, &hourly(40), &values, &values, &values, &values)
-        .unwrap();
-    chart.set_series_pane(series, pane, 1.0);
-    chart.build_frame();
-    let id = chart
-        .add_drawing(
-            DrawingKind::InfoLine,
-            pane,
-            vec![p(10.0, 10.5), p(20.0, 11.5)],
-            Some(r##"{"color":"#123456"}"##),
-        )
-        .unwrap();
-    let frame = chart.build_frame();
-    let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
-    assert!(a.1 > chart.panes[pane].top && b.1 > chart.panes[pane].top);
-    let stats = frame.panes[pane]
-        .main
-        .iter()
-        .find_map(|prim| match prim {
-            Prim::Text { text, y, .. } if text.contains("bars") => Some(f64::from(*y)),
-            _ => None,
-        })
-        .expect("stats on the drawing's own pane");
-    assert!(stats > chart.panes[pane].top);
-    assert!(!frame.panes[0]
-        .main
-        .iter()
-        .any(|prim| matches!(prim, Prim::Text { text, .. } if text.contains("bars"))));
-    let middle = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
-    assert_eq!(
-        chart.hit_test_drawing(middle.0, middle.1).map(|hit| hit.id),
-        Some(id)
-    );
-    assert_eq!(
-        chart.hit_test_drawing(b.0 + 20.0, b.1).map(|hit| hit.id),
-        Some(id)
-    );
-}
-
-#[test]
 fn derived_points_share_the_anchor_space_when_bitmap_ratios_differ() {
     // 801 × 1.5 rounds to 1202 bitmap px, so x scales by 1202/801 while y scales by 1.5. Frame
     // construction debug-asserts that `PartContext::point_px` maps every anchor onto its px.
@@ -1113,21 +711,21 @@ fn axis_locked_segments_have_their_own_catalog_entries() {
     for (kind, wire, name, link, extends) in [
         (
             DrawingKind::HorizontalSegment,
-            38,
+            240,
             "horizontal_segment",
             DrawingAnchorLink::SamePrice,
             (false, false),
         ),
         (
             DrawingKind::VerticalRay,
-            39,
+            241,
             "vertical_ray",
             DrawingAnchorLink::SameLogical,
             (false, true),
         ),
         (
             DrawingKind::VerticalSegment,
-            40,
+            242,
             "vertical_segment",
             DrawingAnchorLink::SameLogical,
             (false, false),
@@ -1426,8 +1024,8 @@ fn axis_tags(chart: &mut ChartEngine) -> Vec<String> {
 fn price_lines_run_right_from_one_anchor_with_their_price_on_the_line_and_the_axis() {
     let kind = DrawingKind::PriceLine;
     let spec = kind.spec();
-    assert_eq!((spec.wire_id, spec.name), (41, "price_line"));
-    assert_eq!(DrawingKind::from_u8(41), Some(kind));
+    assert_eq!((spec.wire_id, spec.name), (243, "price_line"));
+    assert_eq!(DrawingKind::from_u8(243), Some(kind));
     assert_eq!(DrawingKind::from_name("price_line"), Some(kind));
     assert_eq!(spec.placement, DrawingPlacement::ClickAnchors { count: 1 });
     assert!(spec.axis_price_label && !spec.axis_tag_text);

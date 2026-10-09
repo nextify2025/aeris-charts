@@ -40,7 +40,7 @@ Rust 宿主调用 `ChartEngine::set_trade_stream_sessions(stream, Some(TradeSess
 
 ### 重采样
 
-`configure_resampled_series(target, options)` 在引擎内从源系列派生出 K 线或柱 `target`（以及可选的成交量直方图）。`resample_boundaries()` 根据交易时段窗口、交易所时区和宿主的交易日期推导出各周期：
+`configure_resampled_series(source, target, options, volume_source?, volume_target?)` 在引擎内从源系列派生出 K 线或柱 `target`（以及可选的成交量直方图）。`resample_boundaries()` 根据交易时段窗口、交易所时区和宿主的交易日期推导出各周期：
 
 ```ts
 import { resample_boundaries } from "@aeristerminal/aeris-charts";
@@ -56,20 +56,20 @@ const boundaries = resample_boundaries({
   windows: [["09:30", "11:30"], ["13:00", "15:00"]],
   time_zone: "Asia/Shanghai",
 });
-chart.configure_resampled_series(hour, {
-  source: minute, volume_source: minute_volume, volume_target: hour_volume,
-  interval_seconds: 3600, boundaries,
-});
+chart.configure_resampled_series(minute, hour, { intervalSeconds: 3600, boundaries },
+  minute_volume, hour_volume);
 ```
 
-**周期。** `span: "window"`（默认值）为每个交易时段窗口返回一个边界，因此 5、15、30 和 60 分钟的柱在每个窗口开盘时重新开始（A 股 60 分钟柱位于 09:30、10:30、13:00、14:00；长度不是间隔整数倍的窗口，以一根更短的柱结束）。`span: "day"` 为每个交易日期返回一个边界，从其第一次开盘到最后一次收盘；配合 `interval_seconds: 86400`，则每个日期一根日线柱，时间戳为交易时段开盘时间，因此由延长交易时段分钟数据（美东时间 04:00–20:00）构建的 US 日线柱，在 DST 前后仍保持每天一根，尽管冬季的交易时段会越过 UTC 午夜。每个边界都以所请求的日期作为 `session_id`（`YYYYMMDD`）：对于交易时段在该日开始的市场，是交易日期；对于周日开盘的市场（见下文），是晚间日期。日期严格递增，并使用 `session_slot_times` 的放置方式（包括 `session_start` 为负的夜盘交易时段）；每个图表至多 20 000 个边界和 32 个重采样系列。宿主也可以传入自己的 `{ start_time, end_time, session_id }` 周期（例如用于周或月）。
+较早的形式 `configure_resampled_series(target, { source, volume_source?, volume_target?, interval_seconds, boundaries })` 是一个已弃用的重载，其引擎绑定与新形式相同；它仍会读取写作 `{ start_time, end_time, session_id }` 的边界行，其类型为已弃用的 `legacy_resample_boundary`。
 
-`resample_boundaries` 有自己的 `session_start`，默认值为 `0`，独立于图表自身的值，因此中国期货需显式传入 `-10800`。对于周日开盘的市场（CME Globex），请传入 `session_start: 0`、晚间日期以及 `windows: [["17:00", "16:00"]]`；此时每个边界的 `session_id` 即所请求的晚间日期（对于 2024-01-07 周日开启、属于周一交易日的交易时段，为 `20240107`）；或者自行构建 `{ start_time, end_time, session_id }` 周期。切勿将 `-25200` 与周一日期一起传入：它会把该交易时段放在周五 17:00 至周六 16:00，导致周日和周一的行落在所有边界之外而被省略。
+**周期。** `span: "window"`（默认值）为每个交易时段窗口返回一个边界，因此 5、15、30 和 60 分钟的柱在每个窗口开盘时重新开始（A 股 60 分钟柱位于 09:30、10:30、13:00、14:00；长度不是间隔整数倍的窗口，以一根更短的柱结束）。`span: "day"` 为每个交易日期返回一个边界，从其第一次开盘到最后一次收盘；配合 `intervalSeconds: 86400`，则每个日期一根日线柱，时间戳为交易时段开盘时间，因此由延长交易时段分钟数据（美东时间 04:00–20:00）构建的 US 日线柱，在 DST 前后仍保持每天一根，尽管冬季的交易时段会越过 UTC 午夜。每个边界都以所请求的日期作为 `sessionId`（`YYYYMMDD`）：对于交易时段在该日开始的市场，是交易日期；对于周日开盘的市场（见下文），是晚间日期。日期严格递增，并使用 `session_slot_times` 的放置方式（包括 `session_start` 为负的夜盘交易时段）；每个图表至多 20 000 个边界和 32 个重采样系列。边界是 `resample_boundary` 行，即 `{ startTime, endTime, sessionId }`（UTC 秒，起点包含、终点不包含），宿主也可以传入自己的边界（例如用于周或月）。
+
+`resample_boundaries` 有自己的 `session_start`，默认值为 `0`，独立于图表自身的值，因此中国期货需显式传入 `-10800`。对于周日开盘的市场（CME Globex），请传入 `session_start: 0`、晚间日期以及 `windows: [["17:00", "16:00"]]`；此时每个边界的 `sessionId` 即所请求的晚间日期（对于 2024-01-07 周日开启、属于周一交易日的交易时段，为 `20240107`）；或者自行构建 `{ startTime, endTime, sessionId }` 周期。切勿将 `-25200` 与周一日期一起传入：它会把该交易时段放在周五 17:00 至周六 16:00，导致周日和周一的行落在所有边界之外而被省略。
 
 窗口列表适用于一次调用中的每个日期。拥有日历的宿主对每组窗口调用一次 `resample_boundaries` 并拼接各数组，这些数组只需有序且互不相交：正常日期使用夜盘与日盘窗口，夜盘不交易的日期（例如休市后的第一个交易日）仅使用日盘窗口。使用 `span: "day"` 时，柱的时间戳取第一个窗口的开盘时间，因此共用的夜盘加日盘列表，会把该日期的日线柱打上从未交易的夜盘交易时段的时间戳。
 
-**源行。** 源行必须以柱开盘时间作为时间戳；位于所有边界之外的行会被省略，因此宿主在重采样之前，仍须通过减去一个间隔，将数据提供方的收盘时间戳（09:31 … 15:00）转换为开盘时间戳。若数据同时带有单独的开盘集合竞价分钟（241 根柱的数据把它标为 09:30，与收盘时间戳 09:31 并存），则必须在重采样之前将该行合并进第一分钟：若对其做平移，它会落在第一个窗口之前，并连同其成交量一起被省略。直接绘制而不做重采样的 241 根柱数据，则可以改为同样将集合竞价行前移：它落在 09:29，位于所有窗口之外，而 `bar_time_label` 将其打印为 09:30（参见 [收盘时间标签](coordinates-and-time.md#收盘时间标签)）。空白数据行（`session_slot_times` 预留）为其桶预留位置但不含价格：未成交的桶是空白柱，正在形成的桶截止于其最后一个已成交行。重采样需要时间轴：在坐标轴为非时间柱序列（成交笔数流、成交量流或区间流，合成柱）的图表上会被拒绝，并且这类序列不能加入已有重采样系列的图表。
+**源行。** 源行必须以柱开盘时间作为时间戳；位于所有边界之外的行会被省略，因此宿主在重采样之前，仍须通过减去一个间隔，将数据提供方的收盘时间戳（09:31 … 15:00）转换为开盘时间戳。若数据同时带有单独的开盘集合竞价分钟（241 根柱的数据把它标为 09:30，与收盘时间戳 09:31 并存），则必须在重采样之前将该行合并进第一分钟：若对其做平移，它会落在第一个窗口之前，并连同其成交量一起被省略。直接绘制而不做重采样的 241 根柱数据，则可以改为同样将集合竞价行前移：它落在 09:29，位于所有窗口之外，而 `bar_time_label` 将其打印为 09:30（参见 [收盘时间标签](coordinates-and-time.md#收盘时间标签)）。空白数据行（`session_slot_times` 预留）为其桶预留位置但不含价格：未成交的桶是空白柱，正在形成的桶截止于其最后一个已成交行。派生成交量对桶跨度内的每一个有限成交量行求和，跨度从桶的起点到其终点（取起点加一个间隔与边界终点二者中较早者，不含终点），包括正在形成的桶中最后一个有价格的行之后的成交量行；没有成交价格的桶没有成交量。重采样需要时间轴：在坐标轴为非时间柱序列（成交笔数流、成交量流或区间流，合成柱）的图表上会被拒绝，并且这类序列不能加入已有重采样系列的图表。
 
-**实时更新。** 对源系列或其成交量调用 `update`、`merge` 以及类型化批量，仅刷新受影响的尾部：派生柱中未变化的前缀被保留，尾部从第一个可能含有变化行的桶开始重建，因此实时的一分钟只会重读一个桶，绝不会重读历史，并且超出最后一个源行的边界（提前配置的日期）不产生任何开销。`pop`、源系列头部的保留上限裁剪、会丢失某根派生柱的向后回放，以及完整的 `set_data`，都会触发一次重建。`chart.resample_stats(target)` 报告 `rebuilds`、`tail_refreshes` 和 `rows_scanned`。在回放时钟下，正在形成的柱仅聚合时钟当时或之前的行。要到达已配置边界之后的日期，请再次调用 `configure_resampled_series`（一次重建）；也可以提前包含新日期，因为没有数据的日期不会产生柱。重新配置会保留绑定的源（换用其他源会抛出 `invalid_options`）。无论配置顺序如何，绑定都绝不链式连接：目标（或成交量目标）不得是另一个绑定的源（或成交量源）或输出，且绑定的成交量源不得是其自身的成交量目标；每种情况都会抛出 `invalid_options`（"resampling dependencies may not be chained or cyclic"）且不做任何更改。
+**实时更新。** 对源系列或其成交量调用 `update`、`merge` 以及类型化批量，仅刷新受影响的尾部：派生柱中未变化的前缀被保留，尾部从第一个可能含有变化行的桶开始重建，因此实时的一分钟只会重读一个桶，绝不会重读历史，并且超出最后一个源行的边界（提前配置的日期）不产生任何开销。`pop`、源系列头部的保留上限裁剪、会丢失某根派生柱的向后回放，以及完整的 `set_data`，都会触发一次重建。`chart.resample_stats(target)` 报告 `rebuilds`、`tail_refreshes` 和 `rows_scanned`。在回放时钟下，正在形成的柱仅聚合时钟当时或之前的行。要到达已配置边界之后的日期，请再次调用 `configure_resampled_series`（一次重建）；也可以提前包含新日期，因为没有数据的日期不会产生柱。重新配置会保留绑定的源（换用其他源会抛出 `invalid_options`）。无论配置顺序如何，绑定都绝不链式连接：目标（或成交量目标）不得是另一个绑定的源（或成交量源）或输出，且绑定的成交量源不得是其自身的成交量目标；每种情况都会抛出 `invalid_options`（`"resampling dependencies may not be chained or cyclic"`）且不做任何更改。
 
-目标由引擎持有：对其调用 `set_data`、`update`、`update_typed`、`merge` 和 `merge_typed` 会被拒绝（`last_ingestion_diagnostics()` 报告 `status: "rejected"` 及 `code: "derived_series"`）且不做任何更改，`pop` 记录同样的拒绝。目标不得是足迹图、绑定到成交流的 K 线、成交研究或合成柱系列（`invalid_options`）；不过，绑定到成交流的 K 线或成交量研究可以作为该绑定的源。移除绑定中的任一系列（源、成交量源或目标），会连同其目标系列一并移除该绑定，与指标输出相同。`chart.resampled_bars(target)` 返回派生柱，附带其 `session_id` 以及聚合的源行数量。Rust 宿主调用 `ChartEngine::configure_resampled_series(source, volume_source, target, volume_target, ResampleOptions { interval_seconds, boundaries })` 和 `aeris_charts_engine::resample_boundaries(&days, &windows, chart.exchange_time(), ResampleSpan::Window)`。
+目标由引擎持有：对其调用 `set_data`、`update`、`update_typed`、`merge` 和 `merge_typed` 会被拒绝（`last_ingestion_diagnostics()` 报告 `status: "rejected"` 及 `code: "derived_series"`）且不做任何更改，`pop` 记录同样的拒绝。目标不得是足迹图、绑定到成交流的 K 线、成交研究或合成柱系列（`invalid_options`）；不过，绑定到成交流的 K 线或成交量研究可以作为该绑定的源。移除绑定中的任一系列（源、成交量源或目标），会连同其目标系列一并移除该绑定，与指标输出相同。`chart.resampled_bars(target)`（`target` 可为句柄或系列 id）以 `resampled_bar` 行返回派生柱：`timestamp`、`sessionId`、`open`、`high`、`low`、`close` 和 `volume`（空白桶的 `open`、`high`、`low`、`close` 和 `volume` 均为 `null`），以及聚合的源行数量 `sourceRows`。Rust 宿主调用 `ChartEngine::configure_resampled_series(source, volume_source, target, volume_target, ResampleOptions { interval_seconds, boundaries })` 和 `aeris_charts_engine::resample_boundaries(&days, &windows, chart.exchange_time(), ResampleSpan::Window)`。

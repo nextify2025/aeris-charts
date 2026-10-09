@@ -9,7 +9,7 @@
 //!              and bounded single-trade live tips across every stream dependent
 //!   Target D2 — report-only retention trim of the data layer across series counts and retained
 //!              rows: one `trim_fronts` versus one `trim_front` per series
-//!   Target E — 100k visible-bar volume profile refresh and cached shared frame
+//!   Target E — 100k visible-bar volume profile refresh, periodic developing paths, and cached frame
 //!   Target F — 100k-point general XY line frame + nearest-hit interaction
 //!   Target G — mixed 100k-row general dashboard frame, hit interaction, and retained memory
 //!   Target H — combined 50k-bar financial + 50k-point general frame and retained memory
@@ -50,7 +50,9 @@ use aeris_charts_engine::{
     FootprintAggregationOptions, FootprintBarAggregation, FootprintSeriesOptions, FootprintTrade,
     FootprintVisualOptions, GeneralAxisOptions, GeneralHitMode, GeneralScaleType,
     GeneralSeriesOptions, GeneralXyInput, GestureResolver, HorizontalDomain, InputDevice,
-    InputTarget, PointerSample, SeriesKind, TradeBubbleOptions, TradeStudyOptions,
+    InputTarget, PeriodicProfilePresentationOptions, PeriodicProfilePresentationRequest,
+    PointerSample, ProfileSource, ResampleBoundary, SeriesKind, TradeBubbleOptions,
+    TradeStudyOptions,
 };
 use aeris_charts_native::render_prims;
 use aeris_charts_render::canvas2d::{execute, Canvas2d, Viewport};
@@ -1672,6 +1674,37 @@ fn main() -> ExitCode {
     println!("Target E — 100k visible-bar volume profile (48 rows):");
     let e_refresh = report("profile refresh + frame", profile_ms, FRAME_BUDGET_MS);
     let e_cached = report("cached profile frame", cached_ms, FRAME_BUDGET_MS);
+    load_chart
+        .add_periodic_profile_presentation(
+            0,
+            PeriodicProfilePresentationRequest {
+                source: ProfileSource::Candles {
+                    price_series: 0,
+                    volume_series: volume,
+                },
+                boundaries: vec![ResampleBoundary {
+                    start_time: 900_000,
+                    end_time: 1_000_000,
+                    session_id: 1,
+                }],
+                tick_size: 0.01,
+                row_count: 48,
+                value_area_percent: 70.0,
+            },
+            PeriodicProfilePresentationOptions {
+                show_developing: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let started = Instant::now();
+    load_chart.build_frame();
+    let periodic_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let e_periodic = report(
+        "periodic developing profile + frame",
+        periodic_ms,
+        FRAME_BUDGET_MS,
+    );
 
     // ---- Target F: first Phase 2 general-only density gate -----------------------------------
     let mut general = ChartEngine::new(1600.0, 800.0, 1.0);
@@ -2623,6 +2656,7 @@ fn main() -> ExitCode {
         && j_scene
         && e_refresh
         && e_cached
+        && e_periodic
         && f_frame
         && f_hit
         && g_frame

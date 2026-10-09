@@ -5,8 +5,8 @@ import { PNG } from "pngjs";
 
 // B8 Pitchforks & Gann family (Andrews, Schiff, modified Schiff, and inside pitchforks, pitchfan,
 // Gann box, Gann square, Gann square fixed, Gann fan) through the public API and real pointer
-// input: armed three-click placement, hover and selection along geometry beyond the anchors,
-// anchor and body drags with undo, typed tool options and atomic rejection, persistence,
+// input: armed placement, hover and selection along geometry beyond the anchors, anchor and body
+// drags with undo, flat level options and atomic rejection, persistence,
 // clipboard, and sync round trips, the demo toolbar entries, and WebGPU == Canvas2D parity. Every
 // geometry decision is engine-owned; these specs only drive the package API and pointer.
 
@@ -29,7 +29,7 @@ const ANCHOR_COUNT = {
   pitchfan: 3,
   gann_box: 2,
   gann_square: 2,
-  gann_square_fixed: 1,
+  gann_square_fixed: 2,
   gann_fan: 2,
 };
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
@@ -186,31 +186,13 @@ test("a pitchfork hovers and selects along its tines, drags one anchor, and undo
   const shown = await page.evaluate((id) => {
     const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
     const initial = window.__chart.drawing_kind_options(drawing);
-    const levels = drawing.options().levels.map((level) => ({ ...level, visible: level.value === 0.618 || level.visible }));
-    drawing.apply_options({ levels });
+    const levels = drawing.options().levels.map((level) => ({ ...level, visible: level.value !== 0.5 }));
+    drawing.apply_options({ levels: [...levels, { ...levels[0], value: 0.75 }] });
     return { initial, next: window.__chart.drawing_kind_options(drawing) };
   }, id);
-  expect(shown.initial.kind).toBe("pitchfork");
-  expect(shown.initial.levels.filter((level) => level.visible).map((level) => level.value)).toEqual([0.5, 1]);
-  expect(shown.next.levels.filter((level) => level.visible).map((level) => level.value)).toEqual([0.5, 0.618, 1]);
-
-  // A zone fill (between the median and the 0.5 tines) is a drag target only while selected.
-  const half = { x: (c.x - b.x) / 2, y: (c.y - b.y) / 2 };
-  const zone = { x: center.x + half.x * 0.25 + direction.x * 0.5, y: center.y + half.y * 0.25 + direction.y * 0.5 };
-  const clearance = (offset) => {
-    const base = { x: center.x + half.x * offset, y: center.y + half.y * offset };
-    const cross = (zone.x - base.x) * direction.y - (zone.y - base.y) * direction.x;
-    return Math.abs(cross) / Math.hypot(direction.x, direction.y);
-  };
-  expect(Math.min(clearance(0), clearance(0.5)), "the probe clears the median and the tine").toBeGreaterThan(6);
-  await page.mouse.move(zone.x, zone.y);
-  await expect.poll(() => overlay_cursor(page)).toBe("move");
-  await page.evaluate(() => {
-    window.__chart.wasm.set_selected_drawing(undefined);
-    window.__chart.render();
-  });
-  await page.mouse.move(zone.x + 1, zone.y);
-  await expect.poll(() => overlay_cursor(page)).not.toBe("move");
+  expect(shown.initial.kind).toBe("levels");
+  expect(shown.initial.levels.filter((level) => level.visible).map((level) => level.value)).toEqual([0, 0.5, 1]);
+  expect(shown.next.levels.filter((level) => level.visible).map((level) => level.value)).toEqual([0, 1, 0.75]);
 });
 
 test("extreme levels, sizes, and scale ratios render bounded frames on both executors", async ({ page }) => {
@@ -221,26 +203,25 @@ test("extreme levels, sizes, and scale ratios render bounded frames on both exec
     const clean = await capture(page);
     const elapsed = await page.evaluate(({ s, levels }) => {
       const chart = window.__chart;
-      // A dotted pitchfan ray a million half handles out, a fixed square grown down by 20 bars at
-      // a billion price units per bar with dashed grid lines and a dotted arc 10^5 sides out.
+      // A dotted pitchfan ray a million half handles out, and a fixed square grown down by 20 bars
+      // at a billion price units per bar with dashed grid lines and a dotted full-size arc.
       chart.add_drawing("pitchfan", [
         { logical: s.l0, price: s.p_lo }, { logical: s.lm, price: s.p_hi }, { logical: s.l1, price: s.p_mid },
       ], { style: "dotted", levels: [levels.ray] });
-      chart.add_drawing("gann_square_fixed", [{ logical: s.l0, price: s.p_mid }], {
-        levels: levels.grid,
-        tool_options: { gann: { reverse: true, scale_ratio: 1e9, arcs: [levels.arc] } },
-      });
+      chart.add_drawing("gann_square_fixed", [
+        { logical: s.l0, price: s.p_mid }, { logical: s.l0 + 20, price: s.p_mid - 2e10 },
+      ], { levels: levels.grid, level_reverse: true, gann_arcs: [levels.arc] });
       const start = performance.now();
       chart.render();
       return performance.now() - start;
-    }, { s, levels: { ray: level(1e6, "dotted"), grid: [level(0, "dashed"), level(1, "dashed")], arc: level(1e5, "dotted") } });
+    }, { s, levels: { ray: level(1e6, "dotted"), grid: [level(0, "dashed"), level(1, "dashed")], arc: level(1, "dotted") } });
     await settle_frames(page);
     expect(elapsed, `${backend} frame time`).toBeLessThan(1000);
     expect(pixel_diff(clean, await capture(page)), `${backend} paints`).toBeGreaterThan(50);
   }
 });
 
-test("a Gann box drags from its interior only while selected and rejects invalid options atomically", async ({ page }) => {
+test("a Gann box selects and drags from its level lines and rejects invalid options atomically", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
   const id = await page.evaluate(({ s }) => window.__chart.add_drawing("gann_box", [
@@ -250,18 +231,19 @@ test("a Gann box drags from its interior only while selected and rejects invalid
   await settle_frames(page);
   const a = await spot(page, s.l0, s.p_lo);
   const b = await spot(page, s.l1, s.p_hi);
-  const inside = { x: a.x + (b.x - a.x) * 0.13, y: a.y + (b.y - a.y) * 0.13 };
-  await page.mouse.move(inside.x, inside.y);
+  // Between two grid lines the box lets the pointer through.
+  const between = { x: a.x + (b.x - a.x) * 0.19, y: a.y + (b.y - a.y) * 0.19 };
+  await page.mouse.move(between.x, between.y);
   await expect.poll(() => overlay_cursor(page)).not.toBe("move");
   // The 0.5 price level is a body target.
   const level = { x: a.x + (b.x - a.x) * 0.3, y: a.y + (b.y - a.y) * 0.5 };
+  await page.mouse.move(level.x, level.y);
+  await expect.poll(() => overlay_cursor(page)).toBe("move");
   await page.mouse.click(level.x, level.y);
   expect(await selected(page)).toBe(id);
-  await page.mouse.move(inside.x, inside.y);
-  await expect.poll(() => overlay_cursor(page)).toBe("move");
   const before = await points_of(page, id);
   await page.mouse.down();
-  await page.mouse.move(inside.x + 30, inside.y - 20, { steps: 5 });
+  await page.mouse.move(level.x + 30, level.y - 20, { steps: 5 });
   await page.mouse.up();
   await settle_frames(page);
   const moved = await points_of(page, id);
@@ -272,63 +254,60 @@ test("a Gann box drags from its interior only while selected and rejects invalid
   const plain = await capture(page);
   const result = await page.evaluate((id) => {
     const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
-    drawing.apply_options({ tool_options: { gann: { show_angles: true } } });
+    // Earlier builds' `tool_options.gann.reverse` moves onto `level_reverse`.
+    drawing.apply_options({ tool_options: { gann: { reverse: true } } });
     const kind_options = window.__chart.drawing_kind_options(drawing);
     let code = null;
     try {
-      drawing.apply_options({ width: 5, tool_options: { gann: { angles: [{ value: -1, color: "#fff", visible: true, style: "solid", fill_between: false, label_visible: false }] } } });
+      drawing.apply_options({ width: 5, level_label_align: "sideways" });
     } catch (error) {
       code = error.code;
     }
-    return { kind_options, code, width: drawing.options().width, tool_options: drawing.options().tool_options };
+    return { kind_options, code, width: drawing.options().width, level_reverse: drawing.options().level_reverse };
   }, id);
-  expect(result.kind_options.kind).toBe("gann");
-  expect(result.kind_options.show_angles).toBe(true);
-  expect(result.kind_options.time_levels.map((level) => level.value)).toEqual([0, 0.25, 0.382, 0.5, 0.618, 0.75, 1]);
+  expect(result.kind_options.kind).toBe("levels");
+  expect(result.kind_options.reverse).toBe(true);
+  expect(result.kind_options.levels.map((level) => level.value)).toEqual([0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1]);
   expect(result.code).toBe("invalid_options");
   expect(result.width).toBe(1);
-  expect(result.tool_options.gann.show_angles).toBe(true);
+  expect(result.level_reverse).toBe(true);
   await settle_frames(page);
-  expect(pixel_diff(plain, await capture(page)), "angles paint").toBeGreaterThan(50);
+  expect(pixel_diff(plain, await capture(page)), "reversed levels repaint").toBeGreaterThan(0);
 });
 
-test("a fixed Gann square and a Gann fan follow their size and price-per-bar options", async ({ page }) => {
+test("a fixed Gann square sizes from its two anchors and a Gann fan projects its ratio rays", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
-  const ratio = (s.p_hi - s.p_lo) / 10;
-  const ids = await page.evaluate(({ s, ratio }) => {
-    const square = window.__chart.add_drawing("gann_square_fixed", [{ logical: s.l0, price: s.p_lo }], {
-      tool_options: { gann: { size_bars: 10, scale_ratio: ratio } },
-    });
+  const ids = await page.evaluate(({ s }) => {
+    const square = window.__chart.add_drawing("gann_square_fixed", [
+      { logical: s.l0, price: s.p_lo }, { logical: s.l0 + 10, price: s.p_hi },
+    ]);
     return { square: square.id, schema: window.__chart.drawing_property_schema(square).properties.map((property) => property.name) };
-  }, { s, ratio });
-  expect(ids.schema).toContain("tool_options.gann.size_bars");
-  expect(ids.schema).toContain("tool_options.gann.scale_ratio");
+  }, { s });
+  expect(ids.schema).toContain("gann_fans");
+  expect(ids.schema).toContain("gann_arcs");
+  expect(ids.schema).not.toContain("tool_options.gann.size_bars");
   await settle_frames(page);
-  // The far edge sits `size_bars` right of the anchor, `size_bars × ratio` above it.
-  const edge = await spot(page, s.l0 + 10, s.p_mid);
-  await page.mouse.move(edge.x, edge.y);
-  await expect.poll(() => overlay_cursor(page)).toBe("move");
-  await page.evaluate((id) => {
-    window.__chart.drawings().find((drawing) => drawing.id === id).apply_options({ tool_options: { gann: { size_bars: 5 } } });
-  }, ids.square);
+  const before = await capture(page);
+  // Moving the second anchor resizes the square.
+  await page.evaluate(({ id, s }) => {
+    window.__chart.drawings().find((drawing) => drawing.id === id).set_points([
+      { logical: s.l0, price: s.p_lo }, { logical: s.l0 + 5, price: s.p_mid },
+    ]);
+  }, { id: ids.square, s });
   await settle_frames(page);
-  await page.mouse.move(edge.x + 3, edge.y + 3);
-  await page.mouse.move(edge.x, edge.y);
-  await expect.poll(() => overlay_cursor(page)).not.toBe("move");
+  expect(pixel_diff(before, await capture(page)), "the square resizes").toBeGreaterThan(50);
   await page.evaluate(() => window.__chart.clear_drawings());
 
   const fan = await page.evaluate(({ s }) => {
     const drawing = window.__chart.add_drawing("gann_fan", [
       { logical: s.l0, price: s.p_lo },
       { logical: s.l1, price: s.p_hi },
-    ], { extend_right: false });
-    drawing.apply_options({ tool_options: { gann: { scale_ratio: 0.5 } } });
+    ]);
     return { id: drawing.id, kind_options: window.__chart.drawing_kind_options(drawing) };
   }, { s });
-  expect(fan.kind_options.kind).toBe("gann");
-  expect(fan.kind_options.scale_ratio).toBe(0.5);
-  expect(fan.kind_options.levels.map((level) => level.value)).toEqual([0.125, 0.25, 1 / 3, 0.5, 1, 2, 3, 4, 8]);
+  expect(fan.kind_options.kind).toBe("levels");
+  expect(fan.kind_options.levels.map((level) => level.value)).toEqual([0.125, 0.25, 0.333333333333, 0.5, 1, 2, 3, 4, 8]);
 });
 
 test("Pitchforks & Gann tools round-trip through persistence, clipboard, and sync with their options", async ({ page }) => {
@@ -352,10 +331,10 @@ test("Pitchforks & Gann tools round-trip through persistence, clipboard, and syn
       ["modified_schiff_pitchfork", three, {}],
       ["inside_pitchfork", three, { style: "dashed" }],
       ["pitchfan", three, { levels: [] }],
-      ["gann_box", two, { tool_options: { gann: { reverse: true, show_angles: true } } }],
+      ["gann_box", two, { level_reverse: true, tool_options: { gann: { show_angles: true } } }],
       ["gann_square", two, { tool_options: { gann: { show_stats: false } } }],
-      ["gann_square_fixed", [{ logical: 2, price: 11 }], { tool_options: { gann: { size_bars: 12, scale_ratio: 0.25 } } }],
-      ["gann_fan", two, { extend_right: false }],
+      ["gann_square_fixed", [{ logical: 2, price: 11 }, { logical: 14, price: 14 }], { tool_options: { gann: { size_bars: 12, scale_ratio: 0.25 } } }],
+      ["gann_fan", two, { extend_right: true }],
     ];
     for (const [kind, anchors, style] of additions) first.add_drawing(kind, anchors, style);
     const state = first.export_state();
@@ -395,9 +374,11 @@ test("Pitchforks & Gann tools round-trip through persistence, clipboard, and syn
   expect(styles[1].fill_enabled).toBe(false);
   expect(styles[2].tool_options).toBeUndefined();
   expect(styles[4].levels).toEqual([]);
-  expect(styles[5].tool_options.gann.reverse).toBe(true);
+  expect(styles[5].level_reverse).toBe(true);
+  // Earlier builds' Gann options without a flat counterpart stay stored, inert.
+  expect(styles[5].tool_options.gann.show_angles).toBe(true);
   expect(styles[7].tool_options.gann.size_bars).toBe(12);
-  expect(styles[8].extend_right).toBe(false);
+  expect(styles[8].extend_right).toBe(true);
   const semantic = (list) => list.map(({ kind, options }) => ({
     kind,
     color: options.color,
@@ -405,6 +386,7 @@ test("Pitchforks & Gann tools round-trip through persistence, clipboard, and syn
     extend_right: options.extend_right,
     fill_enabled: options.fill_enabled,
     levels: options.levels,
+    level_reverse: options.level_reverse,
     tool_options: options.tool_options,
     style: options.style,
     width: options.width,
@@ -450,8 +432,8 @@ test("Pitchforks & Gann tools render pixel-identical on WebGPU and Canvas2D (AA 
       ]);
       chart.add_drawing("gann_box", [{ logical: at(0.6), price: up(0.1) }, { logical: at(0.72), price: up(0.45) }]);
       chart.add_drawing("gann_square", [{ logical: at(0.75), price: up(0.55) }, { logical: at(0.9), price: up(0.95) }], { width: 2 });
-      chart.add_drawing("gann_fan", [{ logical: at(0.62), price: up(0.6) }, { logical: at(0.7), price: up(0.8) }], { extend_right: false });
-      chart.add_drawing("gann_square_fixed", [{ logical: at(0.8), price: up(0.1) }], { tool_options: { gann: { size_bars: 4, show_stats: false } } });
+      chart.add_drawing("gann_fan", [{ logical: at(0.62), price: up(0.6) }, { logical: at(0.7), price: up(0.8) }]);
+      chart.add_drawing("gann_square_fixed", [{ logical: at(0.8), price: up(0.1) }, { logical: at(0.84), price: up(0.3) }]);
       // Dashed and dotted strokes reach both executors as the same solid dash runs.
       chart.add_drawing("inside_pitchfork", [
         { logical: at(0.3), price: up(0.15) }, { logical: at(0.38), price: up(0.45) }, { logical: at(0.45), price: up(0.25) },

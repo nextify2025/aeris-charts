@@ -1,23 +1,22 @@
-//! B8 Lines family (wire ids 32..=47): ray, extended line, info line, trend angle, cross line,
-//! and arrow line. The trend, horizontal, and vertical line tools predate the family and stay
-//! core tools.
+//! B8 Lines family, own-line tools (wire ids 240..=243): the KLineChart horizontal segment,
+//! vertical ray, and vertical segment (axis-locked segments) and the price line. The upstream
+//! catalog's line tools (ray, extended line, info line, trend angle, cross line, arrow line) are
+//! upstream-rendered and carry no family hooks; [`legacy_defaults`] keeps the fork's pre-merge
+//! defaults of those tools for documents the fork wrote.
 //!
-//! The five segment tools share one geometry: the first two anchors, extended beyond the first
-//! anchor by `extend_left` and beyond the second by `extend_right` to the pane edge (the ray and
-//! extended line are these flags' defaults), end caps on the ends that are not extended, and the
-//! segment-layout text label. Any visible `labels` render as one stats box (see
-//! [`ChartEngine::drawing_stat_lines`]); the info line enables five stats by default. The trend
-//! angle adds a dashed horizontal reference, the arc between it and the segment, and the screen
-//! angle. The cross line is crisp full-span horizontal and vertical lines through its anchor with
-//! the horizontal line's axis price tag.
+//! The axis-locked segments share one geometry: the first two anchors, extended beyond the first
+//! anchor by `extend_left` and beyond the second by `extend_right` to the pane edge (the vertical
+//! ray extends to the right by default), end caps on the ends that are not extended, and the
+//! segment-layout text label. The price line is a ray to the right from its anchor with its price
+//! printed above the line and tagged on the price axis. Any visible `labels` render as one stats
+//! box (see [`ChartEngine::drawing_stat_lines`]).
 
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::LineStyle;
 use aeris_charts_render::shape::{self, Point};
 
 use super::super::parts::{
-    text_on, DrawingParts, PartContext, PartLabel, PartStroke, CURVE_TOLERANCE, STATS_ALPHA,
-    STATS_GAP, STATS_PADDING,
+    text_on, DrawingParts, PartContext, PartLabel, PartStroke, STATS_ALPHA, STATS_GAP,
+    STATS_PADDING,
 };
 use super::super::tools::{
     DrawingAnchorLink, DrawingHandleMode, DrawingLogicalExtent, DrawingMovementAxis,
@@ -61,23 +60,15 @@ pub struct LineToolOptions {
     pub stats_position: DrawingStatsPosition,
 }
 
-/// Trend-angle arc radius bounds in CSS px (a third of the segment between them).
-const ANGLE_ARC_MIN: f64 = 16.0;
-const ANGLE_ARC_MAX: f64 = 48.0;
-/// Gap between the arc and the angle text in CSS px.
-const ANGLE_LABEL_GAP: f64 = 6.0;
-/// Width of the trend angle's reference line and arc in CSS px.
-const ANGLE_DECORATION_WIDTH: f64 = 1.0;
-
 /// Shared two-anchor segment behavior; every spec below overrides its identity.
 const SEGMENT_TOOL: DrawingToolSpec = DrawingToolSpec {
-    kind: DrawingKind::Ray,
-    wire_id: 32,
-    name: "ray",
+    kind: DrawingKind::HorizontalSegment,
+    wire_id: 240,
+    name: "horizontal_segment",
     placement: DrawingPlacement::ClickAnchors { count: 2 },
     handles: DrawingHandleMode::Anchors,
     movement_axis: DrawingMovementAxis::Both,
-    straighten: DrawingStraightenMode::Segment45,
+    straighten: DrawingStraightenMode::None,
     logical_extent: DrawingLogicalExtent::Finite,
     price_extent: DrawingPriceExtent::Finite,
     bounds_padding_ratio: 0.0,
@@ -91,82 +82,26 @@ const SEGMENT_TOOL: DrawingToolSpec = DrawingToolSpec {
     axis_tag_text: false,
 };
 
-// A ray's and an extended line's reach comes from their `extend_left`/`extend_right` defaults:
-// an extended drawing's semantic bounds are unbounded (`DrawingBounds::for_drawing`), and one whose
-// extensions are switched off culls like any finite segment.
-pub(crate) const RAY: DrawingToolSpec = DrawingToolSpec {
-    kind: DrawingKind::Ray,
-    wire_id: 32,
-    name: "ray",
-    ..SEGMENT_TOOL
-};
-
-pub(crate) const EXTENDED_LINE: DrawingToolSpec = DrawingToolSpec {
-    kind: DrawingKind::ExtendedLine,
-    wire_id: 33,
-    name: "extended_line",
-    ..SEGMENT_TOOL
-};
-
-pub(crate) const INFO_LINE: DrawingToolSpec = DrawingToolSpec {
-    kind: DrawingKind::InfoLine,
-    wire_id: 34,
-    name: "info_line",
-    ..SEGMENT_TOOL
-};
-
-pub(crate) const TREND_ANGLE: DrawingToolSpec = DrawingToolSpec {
-    kind: DrawingKind::TrendAngle,
-    wire_id: 35,
-    name: "trend_angle",
-    ..SEGMENT_TOOL
-};
-
-pub(crate) const CROSS_LINE: DrawingToolSpec = DrawingToolSpec {
-    kind: DrawingKind::CrossLine,
-    wire_id: 36,
-    name: "cross_line",
-    placement: DrawingPlacement::ClickAnchors { count: 1 },
-    straighten: DrawingStraightenMode::None,
-    logical_extent: DrawingLogicalExtent::Full,
-    price_extent: DrawingPriceExtent::Full,
-    text_layout: DrawingTextLayout::Box,
-    axis_price_label: true,
-    ..SEGMENT_TOOL
-};
-
-pub(crate) const ARROW_LINE: DrawingToolSpec = DrawingToolSpec {
-    kind: DrawingKind::ArrowLine,
-    wire_id: 37,
-    name: "arrow_line",
-    ..SEGMENT_TOOL
-};
-
 // KLineChart's axis-locked segments: the anchors cannot leave their axis, so there is nothing for
-// Shift to straighten. A vertical ray extends beyond its second anchor by default.
+// Shift to straighten. A vertical ray extends beyond its second anchor by default; an extended
+// drawing's semantic bounds are unbounded (`DrawingBounds::for_drawing`).
 pub(crate) const HORIZONTAL_SEGMENT: DrawingToolSpec = DrawingToolSpec {
-    kind: DrawingKind::HorizontalSegment,
-    wire_id: 38,
-    name: "horizontal_segment",
-    straighten: DrawingStraightenMode::None,
     anchor_link: DrawingAnchorLink::SamePrice,
     ..SEGMENT_TOOL
 };
 
 pub(crate) const VERTICAL_RAY: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::VerticalRay,
-    wire_id: 39,
+    wire_id: 241,
     name: "vertical_ray",
-    straighten: DrawingStraightenMode::None,
     anchor_link: DrawingAnchorLink::SameLogical,
     ..SEGMENT_TOOL
 };
 
 pub(crate) const VERTICAL_SEGMENT: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::VerticalSegment,
-    wire_id: 40,
+    wire_id: 242,
     name: "vertical_segment",
-    straighten: DrawingStraightenMode::None,
     anchor_link: DrawingAnchorLink::SameLogical,
     ..SEGMENT_TOOL
 };
@@ -175,10 +110,9 @@ pub(crate) const VERTICAL_SEGMENT: DrawingToolSpec = DrawingToolSpec {
 // and tagged on the price axis.
 pub(crate) const PRICE_LINE: DrawingToolSpec = DrawingToolSpec {
     kind: DrawingKind::PriceLine,
-    wire_id: 41,
+    wire_id: 243,
     name: "price_line",
     placement: DrawingPlacement::ClickAnchors { count: 1 },
-    straighten: DrawingStraightenMode::None,
     logical_extent: DrawingLogicalExtent::FromFirst,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: true,
@@ -194,7 +128,7 @@ pub(crate) static FAMILY: DrawingFamily = {
     family
 };
 
-/// The info line's default stats: price change, percent change, bar count, duration, angle.
+/// The fork's info-line stats: price change, percent change, bar count, duration, angle.
 fn default_info_stats() -> Vec<DrawingLabelOptions> {
     [
         DrawingLabelMetric::PriceChange,
@@ -214,8 +148,16 @@ fn default_info_stats() -> Vec<DrawingLabelOptions> {
 }
 
 fn apply_defaults(drawing: &mut Drawing) {
+    if drawing.kind == DrawingKind::VerticalRay {
+        drawing.extend_right = true;
+    }
+}
+
+/// The fork's pre-merge defaults of the upstream line tools it rendered (see
+/// [`super::apply_legacy_fork_defaults`]).
+pub(super) fn legacy_defaults(drawing: &mut Drawing) {
     match drawing.kind {
-        DrawingKind::Ray | DrawingKind::VerticalRay => drawing.extend_right = true,
+        DrawingKind::Ray => drawing.extend_right = true,
         DrawingKind::ExtendedLine => {
             drawing.extend_left = true;
             drawing.extend_right = true;
@@ -235,10 +177,7 @@ fn build_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
     let Some(&a) = ctx.px.first() else {
         return;
     };
-    if drawing.kind == DrawingKind::CrossLine {
-        parts.hline(a.1, ctx.pane.left, ctx.pane.right, PartStroke::default());
-        parts.vline(a.0, ctx.pane.top, ctx.pane.bottom, PartStroke::default());
-    } else if drawing.kind == DrawingKind::PriceLine {
+    if drawing.kind == DrawingKind::PriceLine {
         price_line(ctx, a, parts);
     } else {
         let Some(&b) = ctx.px.get(1) else {
@@ -247,9 +186,6 @@ fn build_parts(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
         let (extend_start, extend_end) = (drawing.extend_left, drawing.extend_right);
         let (start, end) = shape::extend_segment(a, b, ctx.pane, extend_start, extend_end);
         parts.capped_segment(drawing, start, end, (!extend_start, !extend_end), ctx.scale);
-        if drawing.kind == DrawingKind::TrendAngle {
-            angle_decoration(ctx, a, b, parts);
-        }
     }
     stats_box(ctx, parts);
 }
@@ -278,82 +214,6 @@ fn price_line(ctx: &PartContext<'_>, a: Point, parts: &mut DrawingParts) {
         padding: (0.0, 0.0),
         hit: false,
     });
-}
-
-/// The dashed horizontal reference toward the second anchor's side, the arc from it to the
-/// segment, and the screen angle beside the arc.
-fn angle_decoration(ctx: &PartContext<'_>, a: Point, b: Point, parts: &mut DrawingParts) {
-    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let length = dx.hypot(dy);
-    if length <= f64::EPSILON {
-        return;
-    }
-    let direction = if dx < 0.0 { -1.0 } else { 1.0 };
-    // Crisp like the horizontal-line tool, so the dash pattern is the executors' shared
-    // full-pixel dash rather than a path dash.
-    let decoration = PartStroke::decoration(ANGLE_DECORATION_WIDTH, LineStyle::Dashed);
-    parts.hline(a.1, a.0, a.0 + direction * length, decoration);
-
-    let radius = (length / 3.0)
-        .clamp(ANGLE_ARC_MIN * ctx.scale, ANGLE_ARC_MAX * ctx.scale)
-        .min(length);
-    let start = if direction > 0.0 {
-        0.0
-    } else {
-        std::f64::consts::PI
-    };
-    let sweep = {
-        let raw = dy.atan2(dx) - start;
-        (raw + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
-    };
-    let mut arc = Vec::new();
-    shape::EllipseArc::circle(a, radius, start, sweep).append_points(CURVE_TOLERANCE, &mut arc);
-    parts.stroke(
-        &arc,
-        PartStroke::decoration(ANGLE_DECORATION_WIDTH, LineStyle::Solid),
-        false,
-    );
-
-    let Some(degrees) = trend_angle_degrees(ctx.engine, ctx.drawing) else {
-        return;
-    };
-    let bisector = start + sweep / 2.0;
-    let distance = radius + ANGLE_LABEL_GAP * ctx.scale;
-    let size = ctx.engine.drawing_text_size(ctx.drawing) * ctx.scale;
-    parts.label(PartLabel {
-        anchor: (
-            a.0 + distance * bisector.cos(),
-            a.1 + distance * bisector.sin(),
-        ),
-        h_align: if bisector.cos() >= 0.0 {
-            DrawingTextHAlign::Left
-        } else {
-            DrawingTextHAlign::Right
-        },
-        v_align: DrawingTextVAlign::Middle,
-        lines: vec![format!("{degrees:.2}°")],
-        size,
-        weight: ctx.drawing.text_weight.unwrap_or(400),
-        italic: ctx.drawing.text_italic,
-        color: None,
-        background: None,
-        border: None,
-        padding: (0.0, 0.0),
-        hit: false,
-    });
-}
-
-/// The trend angle's value: the screen angle of the segment from the horizontal toward its
-/// second anchor, rising positive, in [-90°, 90°].
-fn trend_angle_degrees(engine: &ChartEngine, drawing: &Drawing) -> Option<f64> {
-    let (angle, _) = engine.drawing_screen_vector(drawing, 0, 1)?;
-    Some(if angle > 90.0 {
-        180.0 - angle
-    } else if angle < -90.0 {
-        -180.0 - angle
-    } else {
-        angle
-    })
 }
 
 fn stats_box(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
@@ -408,9 +268,9 @@ fn stats_box(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
     ));
 }
 
-/// Conservative reach of the stats box and the trend-angle label beyond the anchors, in CSS px.
-/// Text that follows the viewport (angle, distance) or data (bars, duration) gets four ems of
-/// slack so the cached pad stays valid between text-key refreshes.
+/// Conservative reach of the stats box beyond the anchors, in CSS px. Text that follows the
+/// viewport (angle, distance) or data (bars, duration) gets four ems of slack so the cached pad
+/// stays valid between text-key refreshes.
 fn decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
     let family = &engine.options.get().layout.font_family;
     let mut extent: f64 = 0.0;
@@ -425,17 +285,6 @@ fn decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
         let height = lines.len() as f64 * size * 1.25;
         extent = extent.max(STATS_GAP + width + 2.0 * STATS_PADDING.0 + 4.0 * size);
         extent = extent.max(STATS_GAP + height + 2.0 * STATS_PADDING.1);
-    }
-    if drawing.kind == DrawingKind::TrendAngle {
-        let size = engine.drawing_text_size(drawing);
-        let width = engine.measure_text_run(
-            "-90.00°",
-            size,
-            family,
-            drawing.text_weight.unwrap_or(400),
-            drawing.text_italic,
-        );
-        extent = extent.max(ANGLE_ARC_MAX + ANGLE_LABEL_GAP + width + size);
     }
     extent
 }

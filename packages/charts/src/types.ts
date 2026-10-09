@@ -1663,18 +1663,6 @@ export interface trade_session_options {
   outside?: out_of_session_policy;
 }
 
-/** One resampling period: bars restart at `start_time` and never cross `end_time` (UTC seconds). */
-export interface resample_boundary {
-  start_time: number;
-  /** Exclusive. */
-  end_time: number;
-  /**
-   * Opaque session identity; {@link resample_boundaries} uses the requested date as `YYYYMMDD`
-   * (the trading date, or the evening date for a Sunday-open market passed with `session_start: 0`).
-   */
-  session_id: number;
-}
-
 /** Input of {@link resample_boundaries}. */
 export interface resample_boundary_options {
   /** Trading dates (`"YYYY-MM-DD"` or business days), strictly ascending; host calendar data. */
@@ -1700,7 +1688,11 @@ export interface resample_boundary_options {
   span?: "window" | "day";
 }
 
-/** Options of {@link chart_api.configure_resampled_series}. */
+/**
+ * @deprecated Options of the fork's {@link chart_api.configure_resampled_series} form; use
+ * {@link resample_options} with the `(source, target, options, volume_source?, volume_target?)`
+ * form.
+ */
 export interface resample_series_options {
   /** Candlestick or bar series whose bar-open-stamped rows are resampled. */
   source: series_api | number;
@@ -1710,21 +1702,22 @@ export interface resample_series_options {
   volume_target?: series_api | number;
   /** Width of one derived bar in seconds; buckets restart at each boundary. */
   interval_seconds: number;
-  /** At most 20 000 ordered, disjoint periods; source rows outside every boundary are omitted. */
-  boundaries: readonly resample_boundary[];
+  /**
+   * At most 20 000 ordered, disjoint periods; source rows outside every boundary are omitted.
+   * The fork's snake_case rows ({@link legacy_resample_boundary}) are still accepted.
+   */
+  boundaries: readonly (resample_boundary | legacy_resample_boundary)[];
 }
 
-/** One derived bar of a resampled series; whitespace bars carry `null` prices and volume. */
-export interface resampled_bar {
-  time: number;
+/**
+ * @deprecated The fork's snake_case boundary row, accepted by the deprecated
+ * {@link chart_api.configure_resampled_series} form; use the camelCase {@link resample_boundary}.
+ */
+export interface legacy_resample_boundary {
+  start_time: number;
+  /** Exclusive. */
+  end_time: number;
   session_id: number;
-  open: number | null;
-  high: number | null;
-  low: number | null;
-  close: number | null;
-  volume: number | null;
-  /** Source rows aggregated into the bar, whitespace rows included. */
-  source_rows: number;
 }
 
 /** Lifetime work counters of a resampled series. */
@@ -2637,28 +2630,26 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
 // ---------------------------------------------------------------------------------------------
 
 /**
- * The drawing-tool kinds. Each tool is an engine-owned drawing object with defining anchor
- * points: trend line (2), rectangle (2), Long Position / Short Position tools (3: entry, target,
- * stop), horizontal line/ray, vertical line, and text (1 each), a multi-click arrow-ended
- * straight-segment path (variable length, every vertex editable), the freehand brush (a
- * variable-length curve, anchor handles at the two ends), and the price range, date range, and
- * date-and-price range measuring tools (2: start, end; the measured sign follows start → end).
- * The measuring tools snap both anchors to whole bars and price ticks. Holding Shift while
- * clicking an empty pane starts a transient date-and-price range (the quick measure; it is never a
- * drawing, history entry, or persisted object).
+ * Built-in drawing kinds. Each kind has an engine-owned placement rule, editable defining
+ * anchors, shared frame geometry, and a stable wire ID in DRAWING_KIND_TO_U8.
  *
- * Lines family (B8): `ray`, `extended_line`, `info_line`, `trend_angle`, and `arrow_line` place
- * two anchors; `extend_left` extends beyond the first anchor and `extend_right` beyond the second
- * (a ray defaults to `extend_right`, an extended line to both). `cross_line` places one anchor.
- * `horizontal_segment` keeps both anchors on one price, and `vertical_ray` and `vertical_segment`
- * keep both on one bar (the shared coordinate follows the anchor placed or dragged last); the
- * vertical ray defaults to `extend_right`, which runs it through its second anchor to the pane edge.
- * `price_line` places one anchor: a line from it to the right pane edge with its price printed on
- * the line and on the price axis.
+ * The measuring tools (`price_range`, `date_range`, `date_price_range`) snap both anchors to
+ * whole bars and price ticks, and the measured sign follows start → end. Holding Shift while
+ * clicking an empty pane starts a transient date-and-price range (the quick measure; it is never
+ * a drawing, history entry, or persisted object).
  *
- * Channels family (B8): `price_channel` places three anchors: the base line through the first two,
- * its parallel through the third, and the base line mirrored on the other side. It defaults to
- * extending both ways, with no fill.
+ * Own-line kinds (not in the AerisTerminal upstream catalog): `horizontal_segment` keeps both
+ * anchors on one price, and `vertical_ray` and `vertical_segment` keep both on one bar (the
+ * shared coordinate follows the anchor placed or dragged last; the vertical ray defaults to
+ * `extend_right`, which runs it through its second anchor to the pane edge). `price_line` places
+ * one anchor: a line from it to the right pane edge with its price printed on the line and on the
+ * price axis. `price_channel` places three anchors: the base line through the first two, its
+ * parallel through the third, and the base line mirrored on the other side; it defaults to
+ * extending both ways, with no fill. `simple_tag` is a dashed line across the pane whose
+ * price-axis tag shows the drawing's `text` (the price when it has none), and
+ * `simple_annotation` is a dashed stem with a head under boxed text. The legacy fork spellings in
+ * {@link drawing_kind_alias} are accepted on input only (normalized through
+ * {@link DRAWING_KIND_ALIASES}) and are never returned.
  */
 export type drawing_kind =
   | "trend_line"
@@ -2671,29 +2662,98 @@ export type drawing_kind =
   | "path"
   | "long_position"
   | "short_position"
-  // B8: lines — begin
+  | "fixed_range_volume_profile"
+  | "anchored_volume_profile"
+  | "anchored_vwap"
+  | "price_range"
+  | "date_range"
+  | "date_price_range"
   | "ray"
   | "extended_line"
   | "info_line"
   | "trend_angle"
   | "cross_line"
   | "arrow_line"
+  | "parallel_channel"
+  | "regression_trend"
+  | "flat_top_channel"
+  | "flat_bottom_channel"
+  | "disjoint_channel"
+  | "polyline"
+  | "highlighter"
+  | "rotated_rectangle"
+  | "ellipse"
+  | "circle"
+  | "triangle"
+  | "arc"
+  | "curve"
+  | "double_curve"
+  | "fibonacci_retracement"
+  | "fibonacci_extension"
+  | "fibonacci_channel"
+  | "fibonacci_time_zones"
+  | "fibonacci_trend_time"
+  | "fibonacci_speed_fan"
+  | "fibonacci_speed_arcs"
+  | "fibonacci_circles"
+  | "fibonacci_spiral"
+  | "fibonacci_wedge"
+  | "andrews_pitchfork"
+  | "schiff_pitchfork"
+  | "modified_schiff_pitchfork"
+  | "inside_pitchfork"
+  | "pitchfan"
+  | "pattern_xabcd"
+  | "pattern_cypher"
+  | "pattern_abcd"
+  | "pattern_head_shoulders"
+  | "pattern_triangle"
+  | "pattern_three_drives"
+  | "elliott_impulse"
+  | "elliott_correction"
+  | "elliott_triangle"
+  | "elliott_double_combination"
+  | "elliott_triple_combination"
+  | "cyclic_lines"
+  | "time_cycles"
+  | "sine_line"
+  | "arrow_marker_up"
+  | "arrow_marker_down"
+  | "arrow_marker_left"
+  | "arrow_marker_right"
+  | "flag_mark"
+  | "signpost"
+  | "note"
+  | "comment"
+  | "callout"
+  | "price_note"
+  | "price_label"
+  | "anchored_text"
+  | "icon_stamp"
+  | "gann_box"
+  | "gann_square"
+  | "gann_square_fixed"
+  | "gann_fan"
+  | "projection"
+  | "forecast"
+  | "bars_pattern"
+  // Own-line kinds (not in AerisTerminal upstream)
   | "horizontal_segment"
   | "vertical_ray"
   | "vertical_segment"
   | "price_line"
-  // B8: lines — end
-  // B8: channels — begin
-  | "parallel_channel"
-  | "regression_trend"
-  | "flat_top_bottom"
-  | "disjoint_channel"
   | "price_channel"
-  // B8: channels — end
-  // B8: fibonacci — begin
-  // Fibonacci family: two anchors (retracement, time zone, speed resistance fan and arcs,
-  // circles, spiral) or three (trend-based extension and time, channel, wedge); levels come
-  // from `levels`, options from `tool_options.fibonacci`.
+  | "simple_tag"
+  | "simple_annotation"
+  | drawing_kind_alias;
+
+/**
+ * @deprecated Legacy fork spellings of catalog kinds, accepted on input only (`add_drawing`,
+ * `set_drawing_tool`, templates, clipboard and sync payloads, persisted documents) and normalized
+ * through {@link DRAWING_KIND_ALIASES}. The engine never returns them; use the canonical name.
+ */
+export type drawing_kind_alias =
+  | "date_and_price_range"
   | "fib_retracement"
   | "trend_based_fib_extension"
   | "fib_channel"
@@ -2704,50 +2764,6 @@ export type drawing_kind =
   | "fib_circles"
   | "fib_spiral"
   | "fib_wedge"
-  // B8: fibonacci — end
-  // B8: pitchforks_gann — begin
-  | "andrews_pitchfork"
-  | "schiff_pitchfork"
-  | "modified_schiff_pitchfork"
-  | "inside_pitchfork"
-  | "pitchfan"
-  | "gann_box"
-  | "gann_square"
-  | "gann_square_fixed"
-  | "gann_fan"
-  // B8: pitchforks_gann — end
-  // B8: projection_annotations — begin
-  // Projection & Annotations: `projection` places three anchors; `forecast`, `bars_pattern`,
-  // the three ranges, `price_note`, and `callout` two; the other annotations one.
-  // `simple_tag` is a dashed line across the pane whose price-axis tag shows the drawing's `text`
-  // (the price when it has none); `simple_annotation` is a dashed stem with a head under boxed text.
-  // `anchored_text` anchors are pane fractions (`logical` = x / pane width, `price` = y / pane
-  // height) and carry no `time`.
-  | "forecast"
-  | "bars_pattern"
-  | "price_range"
-  | "date_range"
-  | "date_and_price_range"
-  | "projection"
-  | "anchored_text"
-  | "note"
-  | "price_note"
-  | "callout"
-  | "comment"
-  | "price_label"
-  | "signpost"
-  | "flag_mark"
-  | "arrow_mark_up"
-  | "arrow_mark_down"
-  | "arrow_mark_left"
-  | "arrow_mark_right"
-  | "icon"
-  | "simple_tag"
-  | "simple_annotation"
-  // B8: projection_annotations — end
-  // B8: patterns_elliott_cycles — begin
-  // Patterns (boxed point labels; XABCD, cypher, ABCD, and three drives add ratio connectors),
-  // Elliott waves (degree-notation labels), and cycles (repeats across the pane).
   | "xabcd_pattern"
   | "cypher_pattern"
   | "abcd_pattern"
@@ -2759,28 +2775,21 @@ export type drawing_kind =
   | "elliott_triangle_wave"
   | "elliott_double_combo"
   | "elliott_triple_combo"
-  | "cyclic_lines"
-  | "time_cycles"
-  | "sine_line"
-  // B8: patterns_elliott_cycles — end
-  // B8: shapes — begin
-  // Shapes family: `rotated_rectangle` (axis ends + a point on a long side), `ellipse` (box
-  // corners), `circle` (center + rim), `triangle`, `arc` (start, end, a point on the arc),
-  // `curve` (start, end, the curve's midpoint), `double_curve` (start, end, the points at one and
-  // two thirds), multi-click `polyline`, and the freehand `highlighter`.
-  | "rotated_rectangle"
-  | "ellipse"
-  | "circle"
-  | "triangle"
-  | "arc"
-  | "curve"
-  | "double_curve"
-  | "polyline"
-  | "highlighter"
-  // B8: shapes — end
-  ;
+  | "arrow_mark_up"
+  | "arrow_mark_down"
+  | "arrow_mark_left"
+  | "arrow_mark_right"
+  | "icon"
+  | "flat_top_bottom";
 
-export const DRAWING_KIND_TO_U8: Record<drawing_kind, number> = {
+/**
+ * Wire ids of the canonical kinds. They cross only the in-process JS ↔ wasm boundary: documents,
+ * clipboard and sync payloads, and templates carry the snake_case names, so the ids are not a
+ * persistence contract. Ids 0..=84 follow the AerisTerminal upstream table; the own-line kinds
+ * take the top of the u8 range (240..) so upstream can keep allocating from 85. Aliases have no
+ * id: normalize them through {@link DRAWING_KIND_ALIASES} first.
+ */
+export const DRAWING_KIND_TO_U8: Record<Exclude<drawing_kind, drawing_kind_alias>, number> = {
   trend_line: 0,
   horizontal_line: 1,
   horizontal_ray: 2,
@@ -2791,98 +2800,126 @@ export const DRAWING_KIND_TO_U8: Record<drawing_kind, number> = {
   path: 7,
   long_position: 8,
   short_position: 9,
-  // B8: lines — begin (wire ids 32..=47)
-  ray: 32,
-  extended_line: 33,
-  info_line: 34,
-  trend_angle: 35,
-  cross_line: 36,
-  arrow_line: 37,
-  horizontal_segment: 38,
-  vertical_ray: 39,
-  vertical_segment: 40,
-  price_line: 41,
-  // B8: lines — end
-  // B8: channels — begin (wire ids 48..=63)
-  parallel_channel: 48,
-  regression_trend: 49,
-  flat_top_bottom: 50,
-  disjoint_channel: 51,
-  price_channel: 52,
-  // B8: channels — end
-  // B8: fibonacci — begin (wire ids 64..=95)
-  fib_retracement: 64,
-  trend_based_fib_extension: 65,
-  fib_channel: 66,
-  fib_time_zone: 67,
-  trend_based_fib_time: 68,
-  fib_speed_resistance_fan: 69,
-  fib_speed_resistance_arcs: 70,
-  fib_circles: 71,
-  fib_spiral: 72,
-  fib_wedge: 73,
-  // B8: fibonacci — end
-  // B8: pitchforks_gann — begin (wire ids 96..=127)
-  andrews_pitchfork: 96,
-  schiff_pitchfork: 97,
-  modified_schiff_pitchfork: 98,
-  inside_pitchfork: 99,
-  pitchfan: 100,
-  gann_box: 101,
-  gann_square: 102,
-  gann_square_fixed: 103,
-  gann_fan: 104,
-  // B8: pitchforks_gann — end
-  // B8: projection_annotations — begin (wire ids 128..=159)
-  forecast: 128,
-  bars_pattern: 129,
-  price_range: 130,
-  date_range: 131,
-  date_and_price_range: 132,
-  projection: 133,
-  anchored_text: 134,
-  note: 135,
-  price_note: 136,
-  callout: 137,
-  comment: 138,
-  price_label: 139,
-  signpost: 140,
-  flag_mark: 141,
-  arrow_mark_up: 142,
-  arrow_mark_down: 143,
-  arrow_mark_left: 144,
-  arrow_mark_right: 145,
-  icon: 146,
-  simple_tag: 147,
-  simple_annotation: 148,
-  // B8: projection_annotations — end
-  // B8: patterns_elliott_cycles — begin (wire ids 160..=191)
-  xabcd_pattern: 160,
-  cypher_pattern: 161,
-  abcd_pattern: 162,
-  head_and_shoulders: 163,
-  triangle_pattern: 164,
-  three_drives_pattern: 165,
-  elliott_impulse_wave: 166,
-  elliott_correction_wave: 167,
-  elliott_triangle_wave: 168,
-  elliott_double_combo: 169,
-  elliott_triple_combo: 170,
-  cyclic_lines: 171,
-  time_cycles: 172,
-  sine_line: 173,
-  // B8: patterns_elliott_cycles — end
-  // B8: shapes — begin (wire ids 192..=223)
-  rotated_rectangle: 192,
-  ellipse: 193,
-  circle: 194,
-  triangle: 195,
-  arc: 196,
-  curve: 197,
-  double_curve: 198,
-  polyline: 199,
-  highlighter: 200,
-  // B8: shapes — end
+  fixed_range_volume_profile: 10,
+  anchored_volume_profile: 11,
+  anchored_vwap: 12,
+  price_range: 13,
+  date_range: 14,
+  date_price_range: 15,
+  ray: 16,
+  extended_line: 17,
+  info_line: 18,
+  trend_angle: 19,
+  cross_line: 20,
+  arrow_line: 21,
+  parallel_channel: 22,
+  regression_trend: 23,
+  flat_top_channel: 24,
+  flat_bottom_channel: 25,
+  disjoint_channel: 26,
+  polyline: 34,
+  highlighter: 35,
+  rotated_rectangle: 27,
+  ellipse: 28,
+  circle: 29,
+  triangle: 30,
+  arc: 31,
+  curve: 32,
+  double_curve: 33,
+  fibonacci_retracement: 36,
+  fibonacci_extension: 37,
+  fibonacci_channel: 38,
+  fibonacci_time_zones: 39,
+  fibonacci_trend_time: 40,
+  fibonacci_speed_fan: 41,
+  fibonacci_speed_arcs: 42,
+  fibonacci_circles: 43,
+  fibonacci_spiral: 44,
+  fibonacci_wedge: 45,
+  andrews_pitchfork: 46,
+  schiff_pitchfork: 47,
+  modified_schiff_pitchfork: 48,
+  inside_pitchfork: 49,
+  pitchfan: 50,
+  pattern_xabcd: 51,
+  pattern_cypher: 52,
+  pattern_abcd: 53,
+  pattern_head_shoulders: 54,
+  pattern_triangle: 55,
+  pattern_three_drives: 56,
+  elliott_impulse: 57,
+  elliott_correction: 58,
+  elliott_triangle: 59,
+  elliott_double_combination: 60,
+  elliott_triple_combination: 61,
+  cyclic_lines: 62,
+  time_cycles: 63,
+  sine_line: 64,
+  arrow_marker_up: 65,
+  arrow_marker_down: 66,
+  arrow_marker_left: 67,
+  arrow_marker_right: 68,
+  flag_mark: 69,
+  signpost: 70,
+  note: 71,
+  comment: 72,
+  callout: 73,
+  price_note: 74,
+  price_label: 75,
+  anchored_text: 76,
+  icon_stamp: 77,
+  gann_box: 78,
+  gann_square: 79,
+  gann_square_fixed: 80,
+  gann_fan: 81,
+  projection: 82,
+  forecast: 83,
+  bars_pattern: 84,
+  // Own-line kinds (not in AerisTerminal upstream)
+  horizontal_segment: 240,
+  vertical_ray: 241,
+  vertical_segment: 242,
+  price_line: 243,
+  price_channel: 244,
+  simple_tag: 245,
+  simple_annotation: 246,
+};
+
+/**
+ * The canonical kind of every legacy fork spelling ({@link drawing_kind_alias}). Input APIs
+ * normalize through it before the wire-id lookup; outputs always carry the canonical name.
+ * `flat_top_bottom` maps to `flat_top_channel` wherever no anchors decide (document restore picks
+ * the flat-top or flat-bottom channel from the stored anchors).
+ */
+export const DRAWING_KIND_ALIASES: Readonly<Record<drawing_kind_alias, Exclude<drawing_kind, drawing_kind_alias>>> = {
+  date_and_price_range: "date_price_range",
+  fib_retracement: "fibonacci_retracement",
+  trend_based_fib_extension: "fibonacci_extension",
+  fib_channel: "fibonacci_channel",
+  fib_time_zone: "fibonacci_time_zones",
+  trend_based_fib_time: "fibonacci_trend_time",
+  fib_speed_resistance_fan: "fibonacci_speed_fan",
+  fib_speed_resistance_arcs: "fibonacci_speed_arcs",
+  fib_circles: "fibonacci_circles",
+  fib_spiral: "fibonacci_spiral",
+  fib_wedge: "fibonacci_wedge",
+  xabcd_pattern: "pattern_xabcd",
+  cypher_pattern: "pattern_cypher",
+  abcd_pattern: "pattern_abcd",
+  head_and_shoulders: "pattern_head_shoulders",
+  triangle_pattern: "pattern_triangle",
+  three_drives_pattern: "pattern_three_drives",
+  elliott_impulse_wave: "elliott_impulse",
+  elliott_correction_wave: "elliott_correction",
+  elliott_triangle_wave: "elliott_triangle",
+  elliott_double_combo: "elliott_double_combination",
+  elliott_triple_combo: "elliott_triple_combination",
+  arrow_mark_up: "arrow_marker_up",
+  arrow_mark_down: "arrow_marker_down",
+  arrow_mark_left: "arrow_marker_left",
+  arrow_mark_right: "arrow_marker_right",
+  icon: "icon_stamp",
+  flat_top_bottom: "flat_top_channel",
 };
 
 /**
@@ -2944,6 +2981,8 @@ export type drawing_label_metric = "price" | "price_change" | "percent_change" |
 export type drawing_label_position = "above" | "on" | "below" | "inside" | "outside";
 export interface drawing_label_options { metric: drawing_label_metric; visible: boolean; position: drawing_label_position; text?: string }
 export interface drawing_level { value: number; color: string; visible: boolean; style: string; fill_between: boolean; fill_color?: string; label_visible: boolean }
+/** Elliott wave degree, smallest first; each vertex label reads `<label> (<degree>)`. */
+export type drawing_wave_degree = "subminuette" | "minuette" | "minute" | "minor" | "intermediate" | "primary" | "cycle" | "supercycle" | "grand_supercycle" | "submillennium" | "millennium" | "supermillennium";
 export type drawing_property_type = "boolean" | "number" | "integer" | "string" | "color" | "enum" | "points" | "levels" | "interval_set";
 export interface drawing_property_descriptor { name: string; property_type: drawing_property_type; default: unknown; min?: number; max?: number; enum_values: string[] }
 export interface drawing_property_schema { revision: number; kind: drawing_kind; properties: drawing_property_descriptor[] }
@@ -2951,172 +2990,142 @@ export interface drawing_template { name: string; kind: drawing_kind; options: P
 export type drawing_kind_options =
   | { kind: "rectangle"; fill_color?: string; preview_fill_color?: string; border_visible: boolean; show_labels: boolean; axis_bands_visible: boolean; label_color?: string; label_text_color?: string; snap_time_to_data: boolean }
   | { kind: "text"; box_color?: string; box_border_color?: string; box_border_width: number }
+  | { kind: "anchored_text"; screen_x: number; screen_y: number; box_color?: string; box_border_color?: string; box_border_width: number }
+  | { kind: "icon_stamp"; icon_name?: string; icon_size: number }
+  | { kind: "bars_pattern"; mirror_x: boolean; mirror_y: boolean; mode: bars_pattern_mode; bar_count: number }
   | { kind: "position"; levels: drawing_level[]; account_size: number; risk_percent: number }
+  | { kind: "levels"; levels: drawing_level[]; reverse: boolean; log_scale: boolean; show_prices: boolean; show_values: boolean; show_percents: boolean; label_align: "left" | "center" | "right" }
+  | { kind: "gann_square"; levels: drawing_level[]; fans: drawing_level[]; arcs: drawing_level[]; reverse: boolean; show_prices: boolean; show_values: boolean; show_percents: boolean; label_align: "left" | "center" | "right" }
+  | { kind: "regression_trend"; source_id: number | null; deviations: number }
+  | { kind: "elliott"; wave_degree: drawing_wave_degree }
   | { kind: "generic" }
-  // B8: lines — begin
+  // Own-line tools and the measuring ranges (engine family path): `line` for horizontal_segment,
+  // vertical_ray, vertical_segment, and price_line; `channel` for price_channel;
+  // `projection_annotation` for price_range, date_range, date_price_range, simple_tag, and
+  // simple_annotation.
   | { kind: "line"; stats_position: drawing_stats_position }
-  // B8: lines — end
-  // B8: channels — begin
   | { kind: "channel"; middle_line: boolean; middle_color: string | null }
   | {
-    kind: "regression_trend";
-    middle_line: boolean;
-    middle_color: string | null;
-    upper_deviation: number;
-    lower_deviation: number;
-    use_upper_deviation: boolean;
-    use_lower_deviation: boolean;
-    source: indicator_input_source;
-    show_pearsons: boolean;
-  }
-  // B8: channels — end
-  // B8: fibonacci — begin
-  | ({ kind: "fibonacci" } & Required<fibonacci_tool_options>)
-  // B8: fibonacci — end
-  // B8: pitchforks_gann — begin
-  | { kind: "pitchfork"; levels: drawing_level[] }
-  | {
-    kind: "gann";
-    levels: drawing_level[];
-    time_levels: drawing_level[];
-    angles: drawing_level[];
-    arcs: drawing_level[];
-    reverse: boolean;
-    show_angles: boolean;
-    show_stats: boolean;
-    scale_ratio: number | null;
-    size_bars: number;
-  }
-  // B8: pitchforks_gann — end
-  // B8: projection_annotations — begin
-  | {
     kind: "projection_annotation";
+    /** The resolved legacy `tool_options.projection_annotation` block; these tools do not paint it. */
     bars_mode: bars_pattern_mode;
     mirrored: boolean;
     flipped: boolean;
-    /** Number of bars a `bars_pattern` copied (0 for other tools). */
+    /** Number of bars a legacy fork bars pattern copied (0 for the tools that report this arm). */
     pattern_bars: number;
     icon: drawing_icon;
     icon_size: number;
     always_show_text: boolean;
-  }
-  // B8: projection_annotations — end
-  // B8: patterns_elliott_cycles — begin
-  | { kind: "pattern"; show_ratios: boolean }
-  | { kind: "elliott_wave"; degree: elliott_wave_degree; show_wave: boolean }
-  // B8: patterns_elliott_cycles — end
-  // B8: shapes — begin
-  | { kind: "shape"; closed: boolean }
-  // B8: shapes — end
-  ;
+  };
 
-// B8: lines — begin
-/** Where a Lines-family stats box sits: beyond the first anchor, below the midpoint, or beyond the second anchor. */
+/** Where a line-family stats box sits: beyond the first anchor, below the midpoint, or beyond the second anchor. */
 export type drawing_stats_position = "start" | "middle" | "end";
-/** Lines-family options (`tool_options.line`); absent fields keep their defaults. */
+/**
+ * Line-family options (`tool_options.line`); absent fields keep their defaults. The own-line
+ * line tools (`horizontal_segment`, `vertical_ray`, `vertical_segment`, `price_line`) read them.
+ * The line tools of the shared catalog (`info_line` and the others) store them but do not render
+ * them.
+ */
 export interface line_tool_options {
   /** Stats box position along the anchor segment (default `"end"`). */
   stats_position?: drawing_stats_position;
 }
-// B8: lines — end
-// B8: channels — begin
 /**
- * Channels-family options (`tool_options.channel`). Absent fields take the tool's own default
- * and `null` resets one field. The deviation, source, and Pearson fields apply to
- * `regression_trend` only.
+ * Channel options (`tool_options.channel`). Absent fields take the tool's own default and `null`
+ * resets one field. The own-line `price_channel` reads `middle_line` and `middle_color`. For
+ * `regression_trend`, which the shared catalog renders from the flat `regression_deviations` and
+ * `regression_source_id`, the deviation fields are input aliases mapped onto
+ * `regression_deviations` on patch and restore (never written back), and the other regression
+ * fields are stored but not rendered. The shared catalog's other channels store the block
+ * without rendering it.
  */
 export interface channel_tool_options {
-  /** Dashed middle line; the regression line on a regression trend (default on for the parallel channel and the regression trend, off for the others). */
+  /** Dashed middle line (`price_channel`; default off). Stored but not rendered for the shared catalog's channels. */
   middle_line?: boolean | null;
   /** Middle-line CSS color; `""` follows the stroke color (default). */
   middle_color?: string | null;
-  /** Upper line offset in residual standard deviations (default 2, range -100..100). */
+  /** @deprecated Input alias of `regression_deviations` (upper line offset in residual standard deviations). */
   upper_deviation?: number | null;
-  /** Lower line offset in residual standard deviations (default -2, range -100..100). */
+  /** @deprecated Input alias of `regression_deviations` (lower line offset in residual standard deviations). */
   lower_deviation?: number | null;
-  /** Paint the upper deviation line and its zone (default true). */
+  /** Paint the upper deviation line and its zone. Stored but not rendered. */
   use_upper_deviation?: boolean | null;
-  /** Paint the lower deviation line and its zone (default true). */
+  /** Paint the lower deviation line and its zone. Stored but not rendered. */
   use_lower_deviation?: boolean | null;
-  /** Bar value the regression fits (default `"close"`). */
+  /** Bar value the regression fits. Stored but not rendered (the regression fits closes). */
   source?: indicator_input_source | null;
-  /** Paint Pearson's R below the regression's start (default true). */
+  /** Paint Pearson's R below the regression's start. Stored but not rendered. */
   show_pearsons?: boolean | null;
 }
-// B8: channels — end
-// B8: fibonacci — begin
 /**
- * Fibonacci-family options (`tool_options.fibonacci`); absent fields keep their defaults. Each
- * tool's property schema lists the fields it reads.
+ * Legacy Fibonacci options (`tool_options.fibonacci`). The shared catalog renders the Fibonacci
+ * tools from the flat `levels` and `level_*` options: the deprecated fields are input aliases
+ * mapped onto those flat fields on patch and restore and never written back, and the other
+ * fields are stored but not rendered.
  */
 export interface fibonacci_tool_options {
-  /**
-   * Swap the ends levels 0 and 1 sit at (retracement, extension, channel, fan), project time
-   * zones backward, or turn the spiral counterclockwise (default `false`).
-   */
+  /** @deprecated Input alias of `level_reverse`. */
   reverse?: boolean;
-  /** Show level values in labels (default `true`). */
+  /** @deprecated Input alias of `level_show_values`. */
   show_levels?: boolean;
-  /** Show level prices in labels: retracement and extension (default `true`). */
+  /** @deprecated Input alias of `level_show_prices`. */
   show_prices?: boolean;
-  /** Show level values as percents, `61.8%` instead of `0.618` (default `false`). */
+  /** @deprecated Input alias of `level_show_percents` (`61.8%` instead of `0.618`). */
   levels_as_percent?: boolean;
-  /** Interpolate price levels in log space: retracement, extension, channel (default `false`). */
+  /** @deprecated Input alias of `level_log_scale`. */
   log_scale?: boolean;
-  /** Show the dashed trend line through the anchors (default `true`). */
+  /** Dashed trend line through the anchors. Stored but not rendered. */
   trend_line?: boolean;
-  /** Show the speed resistance fan's grid (default `true`). */
+  /** Speed resistance fan grid. Stored but not rendered. */
   grid?: boolean;
-  /** Draw speed resistance arcs as full circles (default `false`). */
+  /** Speed resistance arcs as full circles. Stored but not rendered. */
   full_circles?: boolean;
-  /**
-   * Level label placement: beyond the left end, centered, or beyond the right end of price
-   * levels; left of, on, or right of time levels. Absent: `"left"` for price levels, `"right"`
-   * for time levels.
-   */
+  /** @deprecated Input alias of `level_label_align`. */
   label_h_align?: drawing_text_h_align;
-  /**
-   * Level label placement: above, on, or below price levels; at the top, middle, or bottom of
-   * time levels. Absent: `"middle"` for price levels, `"bottom"` for time levels.
-   */
+  /** Vertical level label placement. Stored but not rendered. */
   label_v_align?: drawing_text_v_align;
 }
-// B8: fibonacci — end
-// B8: pitchforks_gann — begin
 /**
- * Gann-tool options (`tool_options.gann`); absent fields keep their defaults. Each field applies
- * to the Gann tools named on it. Pitchforks and the pitchfan use only the common options: their
- * `levels` are median offsets in half-handle widths (level 1 passes through the handle's ends).
+ * Legacy Gann options (`tool_options.gann`). The shared catalog renders the pitchforks and the
+ * Gann tools from the flat `levels`, `gann_fans`, `gann_arcs`, and `level_*` options: the
+ * deprecated fields are input aliases mapped onto those flat fields on patch and restore and
+ * never written back, and the other fields are stored but not rendered.
  */
 export interface gann_tool_options {
-  /** Gann box vertical levels as fractions of the box width (its `levels` are the price levels). */
+  /** Gann box vertical levels as fractions of the box width. Stored but not rendered. */
   time_levels?: drawing_level[];
-  /**
-   * Gann box (with `show_angles`) and Gann squares: angle lines from the pivot corner as positive
-   * multiples of the 1×1 slope (`2` is 1×2, `0.5` is 2×1).
-   */
+  /** @deprecated Input alias of `gann_fans` (angle lines as multiples of the 1×1 slope). */
   angles?: drawing_level[];
-  /** Gann squares: quarter arcs around the pivot corner, radii as positive fractions of the side. */
+  /** @deprecated Input alias of `gann_arcs` (quarter arcs as fractions of the side). */
   arcs?: drawing_level[];
-  /** Gann box and squares: measure from the second anchor's price; the fixed square grows down. */
+  /** @deprecated Input alias of `level_reverse`. */
   reverse?: boolean;
-  /** Gann box: paint `angles` from the pivot corner (default `false`). */
+  /** Gann box angle lines from the pivot corner. Stored but not rendered. */
   show_angles?: boolean;
-  /** Gann squares: the price range, bars, and price-per-bar box (default `true`). */
+  /** Gann square stats box. Stored but not rendered. */
   show_stats?: boolean;
   /**
-   * Gann fan and fixed square: price units per bar of the 1×1 angle. `null` makes the fan's 1×1
-   * pass through its second anchor and the fixed square a square on screen.
+   * Price units per bar of the 1×1 angle (fan and fixed square). Stored but not rendered;
+   * restoring a legacy one-anchor fixed square reads it to place the second anchor.
    */
   scale_ratio?: number | null;
-  /** Fixed square: side length in bars, 1..=100000 (default 20). */
+  /**
+   * Fixed square side length in bars, 1..=100000. Stored but not rendered; restoring a legacy
+   * one-anchor fixed square reads it to place the second anchor.
+   */
   size_bars?: number;
 }
-// B8: pitchforks_gann — end
-// B8: projection_annotations — begin
-/** How a `bars_pattern` paints its copied bars: high–low or open–close sticks, or a line through one field. */
-export type bars_pattern_mode = "hl_bars" | "oc_bars" | "line_open" | "line_high" | "line_low" | "line_close";
-/** The bounded built-in icon set of the `icon` tool. */
+/**
+ * How a `bars_pattern` paints its copied bars: high–low sticks (`"bars"`), open–close sticks
+ * (`"oc_bars"`), or a line through one field. `"hl_bars"` is the legacy fork spelling of
+ * `"bars"`, accepted on input only.
+ */
+export type bars_pattern_mode = "bars" | "oc_bars" | "line_open" | "line_high" | "line_low" | "line_close" | "hl_bars";
+/**
+ * The built-in vector icon names. An `icon_stamp` whose `icon_name` has no registered raster
+ * (see {@link chart_api.register_drawing_icon}) and is one of these names paints the built-in
+ * glyph; any other unregistered name paints a placeholder.
+ */
 export type drawing_icon =
   | "star"
   | "heart"
@@ -3127,112 +3136,78 @@ export type drawing_icon =
   | "diamond"
   | "triangle_up"
   | "triangle_down";
-/** Projection & Annotations options (`tool_options.projection_annotation`); absent fields keep their defaults. */
+/**
+ * Legacy Projection & Annotations options (`tool_options.projection_annotation`). The shared
+ * catalog renders `bars_pattern`, `icon_stamp`, and `note`: the deprecated fields are input
+ * aliases mapped onto flat drawing options on patch and restore and never written back, and the
+ * other fields are stored but not rendered.
+ */
 export interface projection_annotation_tool_options {
-  /** `bars_pattern` paint mode (default `"hl_bars"`). */
+  /** @deprecated Input alias of `bars_pattern_mode` (`"hl_bars"` becomes `"bars"`). */
   bars_mode?: bars_pattern_mode;
-  /** `bars_pattern`: reverse the copied bars in time (default `false`). */
+  /** @deprecated Input alias of `bars_pattern_mirror_x` (reverse the copied bars in time). */
   mirrored?: boolean;
-  /** `bars_pattern`: turn the copied bars upside down within the box between its two anchors (default `false`). */
+  /** @deprecated Input alias of `bars_pattern_mirror_y` (turn the copied bars upside down). */
   flipped?: boolean;
   /**
-   * `bars_pattern`: the copied `[open, high, low, close]` bars, oldest first (at most 128). The
-   * engine captures them when the pattern is created; paste, sync, and persistence carry them,
-   * while named templates keep only the style.
+   * @deprecated Legacy copied `[open, high, low, close]` bars, oldest first; restore converts
+   * them into the `bars_pattern` sample (at most 512 bars).
    */
   bars?: [number, number, number, number][];
-  /** `icon` shape (default `"star"`). */
+  /** @deprecated Input alias of `icon_name` (the built-in icon of that name). */
   icon?: drawing_icon;
-  /** `icon` size in CSS px, 8..128 (default 24). */
+  /** @deprecated Input alias of `icon_size`, 8..96 CSS px (larger legacy values are clamped on restore). */
   icon_size?: number;
-  /**
-   * `note`: paint the text box while the note is neither hovered, selected, nor edited (default
-   * `false`: only the pin shows then).
-   */
+  /** `note`: paint the text box while the note is not focused. Stored but not rendered. */
   always_show_text?: boolean;
 }
-// B8: projection_annotations — end
-// B8: patterns_elliott_cycles — begin
+/** @deprecated The same type as {@link drawing_wave_degree}. */
+export type elliott_wave_degree = drawing_wave_degree;
 /**
- * Elliott wave degree, largest first. Labels follow the Frost–Prechter notation: supercycle-scale
- * degrees use upper Roman numerals and lowercase letters, primary to minor Arabic numerals and
- * uppercase letters, minute to subminuette lower Roman numerals and lowercase letters; within each
- * triad the degrees are ringed, parenthesized, and bare. The millennium degrees wrap upper Roman
- * numerals in braces, brackets, and angle brackets.
+ * Legacy pattern and Elliott wave options (`tool_options.pattern`). The shared catalog renders
+ * these tools: `degree` is an input alias of the flat `wave_degree` (mapped on patch and restore,
+ * never written back), and the other fields are stored but not rendered.
  */
-export type elliott_wave_degree =
-  | "supermillennium"
-  | "millennium"
-  | "submillennium"
-  | "grand_supercycle"
-  | "supercycle"
-  | "cycle"
-  | "primary"
-  | "intermediate"
-  | "minor"
-  | "minute"
-  | "minuette"
-  | "subminuette";
-/** Patterns, Elliott waves, and cycles options (`tool_options.pattern`); absent fields keep their defaults. */
 export interface pattern_tool_options {
-  /** XABCD, cypher, ABCD, and three drives: dashed ratio connectors and their ratios (default `true`). */
+  /** XABCD, cypher, ABCD, and three drives ratio connectors. Stored but not rendered. */
   show_ratios?: boolean;
-  /** Elliott waves: the degree whose notation labels the waves (default `"intermediate"`). */
+  /** @deprecated Input alias of `wave_degree`. */
   degree?: elliott_wave_degree;
-  /** Elliott waves: the wave polyline; `false` leaves only the labels (default `true`). */
+  /** Elliott wave polyline visibility. Stored but not rendered. */
   show_wave?: boolean;
 }
-// B8: patterns_elliott_cycles — end
-// B8: shapes — begin
-/** Shapes-family options (`tool_options.shape`); absent fields keep their defaults. */
+/** Legacy shape options (`tool_options.shape`); the shared catalog stores them but does not render them. */
 export interface shape_tool_options {
-  /**
-   * Polyline only: join the last vertex back to the first and, while `fill_enabled`, fill the
-   * enclosed region by the nonzero rule (default `false`). Other shapes ignore it. The fill is
-   * bounded work: more than 2,048 vertices, or a polygon so heavily self-intersecting that its
-   * fill exceeds the tessellation bounds, paints the outline only (no fill, no interior selection
-   * target, no error).
-   */
+  /** Polyline: join the last vertex back to the first. Stored but not rendered. */
   closed?: boolean;
 }
-// B8: shapes — end
 
 /**
- * Family-specific option blocks (B8), one optional block per drawing family. Patches deep-merge:
- * absent keys keep their values and `null` resets a block to its defaults.
+ * Fork extension blocks, one optional block per legacy drawing family. Fields that upstream
+ * models as flat drawing options are deprecated input aliases (mapped on patch and restore, never
+ * written back); the own-line tools still read their own blocks. Patches deep-merge: absent keys
+ * keep their values and `null` resets a block to its defaults.
  */
 export interface drawing_tool_options {
-  // B8: lines — begin
   line?: line_tool_options | null;
-  // B8: lines — end
-  // B8: channels — begin
   channel?: channel_tool_options | null;
-  // B8: channels — end
-  // B8: fibonacci — begin
   fibonacci?: fibonacci_tool_options | null;
-  // B8: fibonacci — end
-  // B8: pitchforks_gann — begin
   gann?: gann_tool_options | null;
-  // B8: pitchforks_gann — end
-  // B8: projection_annotations — begin
   projection_annotation?: projection_annotation_tool_options | null;
-  // B8: projection_annotations — end
-  // B8: patterns_elliott_cycles — begin
   pattern?: pattern_tool_options | null;
-  // B8: patterns_elliott_cycles — end
-  // B8: shapes — begin
   shape?: shape_tool_options | null;
-  // B8: shapes — end
 }
 
 /**
  * A drawing's options (engine `Drawing`). Every tool can carry a text label placed by the
- * 3×3 `text_h_align`/`text_v_align` against the tool's geometry, except the nine tools that
- * paint no text on the chart (`forecast`, `bars_pattern`, `price_range`, `date_range`,
- * `date_and_price_range`, `projection`, `flag_mark`, `icon`, `simple_tag`), which keep `text`
- * without showing it (the simple tag shows it as its price-axis tag). A painted label is
- * edited in place: double-click it (or select the drawing and press Enter or F2), and tools that
- * start from a default text open the editor when placed. Colors parse per the engine's
+ * 3×3 `text_h_align`/`text_v_align` against the tool's geometry, except the four tools that
+ * paint no text label on the chart (`price_range`, `date_range`, `date_price_range`, and
+ * `simple_tag`), which keep `text` without showing it as a label (the measuring tools paint their
+ * stats instead, and the simple tag shows its text as its price-axis tag); `price_label` paints
+ * its text inside its own label. A painted label is edited in place: double-click it (or select
+ * the drawing and press Enter or F2; a single click on an already selected text annotation also
+ * opens it), and tools that start from a default text open the editor when placed. Colors parse
+ * per the engine's
  * CSS rules; `""` for optional colors means "follow the default" (the border color at
  * 20% alpha for a rectangle's fill, the chart's `layout.textColor` for labels), and
  * `text_size: null` follows `layout.fontSize`.
@@ -3242,6 +3217,14 @@ export interface drawing_options {
   position_account_size: number;
   /** Percentage of the hypothetical balance risked at the stop, 0–100 (default 25). */
   position_risk_percent: number;
+  /**
+   * Optional source series ID for Regression Trend: a live series on the drawing's pane and price
+   * scale (a series that is not live there leaves the regression undrawn). `null` follows the
+   * pane's first ordinary series (custom series and indicator outputs excluded).
+   */
+  regression_source_id: number | null;
+  /** Residual standard deviations on each side of the Regression Trend center, from 0 to 10. */
+  regression_deviations: number;
   name: string;
   group_id: string;
   revision: number;
@@ -3257,6 +3240,29 @@ export interface drawing_options {
   magnet: drawing_magnet_mode;
   labels: drawing_label_options[];
   levels: drawing_level[];
+  gann_fans: drawing_level[];
+  gann_arcs: drawing_level[];
+  level_reverse: boolean;
+  level_log_scale: boolean;
+  level_show_prices: boolean;
+  level_show_values: boolean;
+  level_show_percents: boolean;
+  level_label_align: "left" | "center" | "right";
+  /** Elliott wave degree used in the vertex labels (default `"minor"`). */
+  wave_degree: drawing_wave_degree;
+  /** Pane-relative screen position for anchored text, 0 to 1. */
+  screen_x: number;
+  screen_y: number;
+  /**
+   * Icon stamp: the name of a raster registered with {@link chart_api.register_drawing_icon}; an
+   * unregistered {@link drawing_icon} name paints that built-in vector glyph.
+   */
+  icon_name?: string;
+  /** Icon stamp size in CSS px, 8..96. */
+  icon_size: number;
+  bars_pattern_mirror_x: boolean;
+  bars_pattern_mirror_y: boolean;
+  bars_pattern_mode: bars_pattern_mode;
   /** Price scale used for price-coordinate conversion (`overlay` is the pane's overlay scale). */
   price_scale_id: "left" | "right" | "overlay";
   /** Line/border color (default: the canonical primary token). */
@@ -3309,8 +3315,10 @@ export interface drawing_options {
   /** Text-tool container border width in CSS px (default 1). */
   box_border_width: number;
   /**
-   * Family-specific option blocks (B8). The Lines family's stats (`info_line` shows them by
-   * default) are the common `labels` list; `tool_options.line.stats_position` places their box.
+   * Fork extension blocks ({@link drawing_tool_options}); fields upstream models as flat options
+   * above are deprecated input aliases, mapped on patch and restore and never written back. The
+   * own-line tools read their own blocks (`tool_options.line.stats_position` places the stats box
+   * of the `labels` list on the own-line line tools).
    */
   tool_options: drawing_tool_options;
 }
@@ -3349,6 +3357,27 @@ export interface persisted_drawing_style_v1 {
   magnet?: drawing_magnet_mode;
   labels?: drawing_label_options[];
   levels?: drawing_level[];
+  /** Individually styled fan ratios on Gann square tools; each value is 0.01 to 100. */
+  gann_fans?: drawing_level[];
+  /** Individually styled quarter arcs on Gann square tools; each value is 0 to 1. */
+  gann_arcs?: drawing_level[];
+  level_reverse?: boolean;
+  level_log_scale?: boolean;
+  level_show_prices?: boolean;
+  level_show_values?: boolean;
+  level_show_percents?: boolean;
+  level_label_align?: "left" | "center" | "right";
+  wave_degree?: drawing_wave_degree;
+  screen_x?: number;
+  screen_y?: number;
+  icon_name?: string;
+  /** Icon stamp size in CSS px, 8..96. */
+  icon_size?: number;
+  /** Frozen OHLC sample for a bars-pattern ghost copy; at most 512 bars. */
+  bars_pattern?: Array<{ offset: number; open: number; high: number; low: number; close: number }>;
+  bars_pattern_mirror_x?: boolean;
+  bars_pattern_mirror_y?: boolean;
+  bars_pattern_mode?: bars_pattern_mode;
   price_scale_id?: "left" | "right" | "overlay";
   color?: string;
   width?: number;
@@ -3394,6 +3423,12 @@ export interface chart_state_v1 {
   drawings: persisted_drawing_v1[];
   /** Host-defined price basis of the drawing prices (see {@link chart_api.set_drawing_price_basis}). */
   drawing_price_basis?: string;
+  /**
+   * Drawing catalog marker (`2` for documents written since the AerisTerminal B8 catalog was
+   * adopted). Restore treats a document without it as possibly written by an older fork build and
+   * converts its legacy drawings when fork-only markers are present.
+   */
+  drawing_catalog?: number;
   /** Hidden timeline-mark groups (see {@link timeline_marks_api.set_group_hidden}); marks never persist. */
   hidden_mark_groups?: string[];
 }
@@ -3471,6 +3506,8 @@ export interface chart_state_v2 {
   }[];
   chart_options: Record<string, unknown>;
   drawing_price_basis?: string;
+  /** Drawing catalog marker; see {@link chart_state_v1.drawing_catalog}. */
+  drawing_catalog?: number;
   hidden_mark_groups?: string[];
 }
 
@@ -3499,6 +3536,8 @@ export interface chart_state_v3 {
     styles: indicator_output_style[];
   }[];
   drawing_price_basis?: string;
+  /** Drawing catalog marker; see {@link chart_state_v1.drawing_catalog}. */
+  drawing_catalog?: number;
   hidden_mark_groups?: string[];
 }
 
@@ -3536,6 +3575,158 @@ export type drawing_tool_change_handler = (tool: drawing_kind | null) => void;
 // ---------------------------------------------------------------------------------------------
 // Handles
 // ---------------------------------------------------------------------------------------------
+
+/**
+ * Host-defined UTC interval (seconds). All boundaries are start-inclusive and end-exclusive: bars
+ * restart at `startTime` and never cross `endTime`.
+ */
+export interface resample_boundary {
+  startTime: number;
+  /** Exclusive. */
+  endTime: number;
+  /**
+   * Opaque session identity; {@link resample_boundaries} uses the requested date as `YYYYMMDD`
+   * (the trading date, or the evening date for a Sunday-open market passed with `session_start: 0`).
+   */
+  sessionId: number;
+}
+
+/** Buckets restart at each host-supplied boundary; the engine does not infer a timezone. */
+export interface resample_options {
+  intervalSeconds: number;
+  boundaries: readonly resample_boundary[];
+}
+
+/** One derived bar of a resampled series; whitespace buckets carry `null` prices and volume. */
+export interface resampled_bar {
+  timestamp: number;
+  sessionId: number;
+  open: number | null;
+  high: number | null;
+  low: number | null;
+  close: number | null;
+  volume: number | null;
+  /** Source rows aggregated into the bar, whitespace rows included. */
+  sourceRows: number;
+}
+
+/** Tape profiles are tick-accurate; candle profiles distribute OHLCV approximately. */
+export type profile_source =
+  | { kind: "tape"; stream_id: number }
+  | { kind: "candles"; price_series: number; volume_series: number };
+
+export interface profile_request {
+  source: profile_source;
+  startTimestampMicros: number;
+  endTimestampMicros: number;
+  tickSize: number;
+  rowCount: number;
+  valueAreaPercent: number;
+}
+
+export interface profile_row_snapshot {
+  low: number;
+  high: number;
+  bidVolume: number;
+  askVolume: number;
+  unknownVolume: number;
+  totalVolume: number;
+  delta: number;
+}
+
+export interface profile_snapshot {
+  startTimestampMicros: number;
+  endTimestampMicros: number;
+  sessionId: number;
+  tickSize: number;
+  rows: readonly profile_row_snapshot[];
+  totalVolume: number;
+  poc: number | null;
+  valueAreaLow: number | null;
+  valueAreaHigh: number | null;
+  developing: readonly { timestampMicros: number; poc: number; valueAreaLow: number; valueAreaHigh: number }[];
+  candleApproximation: boolean;
+}
+
+export interface naked_profile_level {
+  sessionId: number;
+  price: number;
+  kind: "poc" | "value_area_low" | "value_area_high";
+  startTimestampMicros: number;
+  touchedTimestampMicros: number | null;
+}
+
+export interface tpo_request {
+  priceSeries: number;
+  boundaries: readonly resample_boundary[];
+  periodSeconds: number;
+  tickSize: number;
+  valueAreaPercent: number;
+  initialBalancePeriods: number;
+}
+
+export interface tpo_snapshot {
+  sessionId: number;
+  startTimestampMicros: number;
+  endTimestampMicros: number;
+  rows: readonly { price: number; periods: readonly number[]; singlePrint: boolean }[];
+  poc: number | null;
+  valueAreaLow: number | null;
+  valueAreaHigh: number | null;
+  initialBalanceLow: number | null;
+  initialBalanceHigh: number | null;
+}
+
+export interface tpo_presentation_options {
+  mode: "letters" | "blocks";
+  color: string;
+  valueAreaColor: string;
+  singlePrintColor: string;
+  pocColor: string;
+  initialBalanceColor: string;
+}
+
+export interface periodic_profile_presentation_request {
+  source: profile_source;
+  boundaries: readonly resample_boundary[];
+  tickSize: number;
+  rowCount: number;
+  valueAreaPercent: number;
+}
+
+export interface periodic_profile_presentation_options {
+  mode: "bid_ask" | "delta" | "total";
+  widthPercent: number;
+  bidColor: string;
+  askColor: string;
+  unknownColor: string;
+  pocColor: string;
+  valueAreaColor: string;
+  /** Extend POC and value-area levels to the first later tape tick or candle-range touch. */
+  extendNakedLevels: boolean;
+  /** Trace sampled developing POC and value-area levels for tape or candle periods. */
+  showDeveloping: boolean;
+}
+
+export interface anchored_vwap_point {
+  timestampMicros: number;
+  vwap: number;
+  upperBand: number;
+  lowerBand: number;
+}
+
+export interface profile_drawing_options {
+  source: profile_source;
+  tickSize: number;
+  rowCount: number;
+  valueAreaPercent: number;
+  bandMultiplier: number;
+  widthPercent: number;
+}
+
+export type profile_drawing_snapshot =
+  | { kind: "volume"; data: profile_snapshot }
+  | { kind: "vwap"; data: readonly anchored_vwap_point[] };
 
 /** A single data series on the chart. */
 export interface series_api {
@@ -4542,16 +4733,44 @@ export interface chart_api {
    */
   add_trade_volume_series(stream_id: number, pane?: number): series_api;
   /**
-   * Derive `target` (a candlestick or bar series) and an optional volume histogram from a source
-   * series by engine resampling; both follow every source change, refreshing only the affected
-   * tail. The targets are engine-owned: host writes to them are rejected (see
-   * {@link series_api.last_ingestion_diagnostics}). Reconfigure to extend the boundaries, e.g. when a
-   * new trading date starts; source rows outside every boundary are omitted.
+   * Derive OHLCV into a host-created `target` (a candlestick or bar series) and an optional
+   * `volume_target` histogram from `source` (and `volume_source`) for higher-timeframe overlays
+   * and study inputs. Both follow every source change, refreshing only the affected tail. The
+   * targets are engine-owned: host writes to them are rejected (see
+   * {@link series_api.last_ingestion_diagnostics}). Reconfigure to extend the boundaries, e.g.
+   * when a new trading date starts; source rows outside every boundary are omitted. Throws
+   * `invalid_handle` for a series that is not live on this chart and `invalid_options` when the
+   * engine rejects the sources, targets, or boundaries.
+   */
+  configure_resampled_series(source: series_api, target: series_api, options: resample_options, volume_source?: series_api | null, volume_target?: series_api | null): void;
+  /**
+   * @deprecated Use the `(source, target, options, volume_source?, volume_target?)` form. The
+   * fork's form: `options` names the source and volume series and carries `interval_seconds` and
+   * camelCase {@link resample_boundary} rows (legacy `start_time`/`end_time`/`session_id` keys
+   * are still read). Throws `invalid_options` with the engine's rejection reason.
    */
   configure_resampled_series(target: series_api | number, options: resample_series_options): void;
-  /** The derived bars of a resampled series, or `null` when it is not resampled. */
+  /**
+   * The engine's current aggregate rows of a resampled series (whitespace buckets carry `null`
+   * prices and volume), or `null` when `target` is not resampled. A stale or foreign handle object
+   * throws `invalid_handle`.
+   */
   resampled_bars(target: series_api | number): readonly resampled_bar[] | null;
+  /** Lifetime work counters of a resampled series, or `null` when it is not resampled. */
   resample_stats(target: series_api | number): resample_stats | null;
+  volume_profile_snapshot(request: profile_request): profile_snapshot | null;
+  periodic_volume_profiles(source: profile_source, boundaries: readonly resample_boundary[], tick_size: number, row_count: number, value_area_percent: number): readonly profile_snapshot[] | null;
+  periodic_naked_profile_levels(source: profile_source, boundaries: readonly resample_boundary[], tick_size: number, row_count: number, value_area_percent: number): readonly naked_profile_level[] | null;
+  tpo_profiles(request: tpo_request): readonly tpo_snapshot[] | null;
+  /** Add engine-rendered TPO letters or blocks on the source series' pane. */
+  add_tpo_presentation(request: tpo_request, options?: Partial<tpo_presentation_options>): number;
+  remove_tpo_presentation(id: number): boolean;
+  /** Render host-boundary volume profiles on an existing price series' pane. */
+  add_periodic_profile_presentation(anchor: series_api, request: periodic_profile_presentation_request, options?: Partial<periodic_profile_presentation_options>): number;
+  remove_periodic_profile_presentation(id: number): boolean;
+  anchored_vwap(source: profile_source, start_timestamp_micros: number, end_timestamp_micros: number, band_multiplier: number): readonly anchored_vwap_point[] | null;
+  configure_profile_drawing(drawing: drawing_api, options: profile_drawing_options): void;
+  profile_drawing_snapshot(drawing: drawing_api): profile_drawing_snapshot | null;
   add_series(kind: "footprint", options?: Partial<any_series_options> & Partial<footprint_series_options>): footprint_series_api;
   add_series(kind: general_series_kind, options: general_series_options): general_series_api;
   add_series(kind: series_kind, options?: Partial<any_series_options>): series_api;
@@ -4905,6 +5124,9 @@ export interface chart_api {
   /** Return the typed common property schema for a live drawing. */
   drawing_property_schema(drawing: drawing_api | number): drawing_property_schema;
   drawing_kind_options(drawing: drawing_api | number): drawing_kind_options;
+  /** Register a bounded chart-local RGBA8 stamp by name. Re-register to replace its pixels. */
+  register_drawing_icon(name: string, width: number, height: number, pixels: Uint8Array): void;
+  remove_drawing_icon(name: string): boolean;
   /** Return the object-tree snapshot as stable JSON-compatible records. */
   drawing_object_tree(): unknown[];
   /** Set host-supplied interval metadata used by interval visibility. */
@@ -4949,11 +5171,11 @@ export interface chart_api {
   can_redo_drawing(): boolean;
   /**
    * Arm an interactive drawing tool (industry-standard), or disarm with `null`. While armed,
-   * pane clicks place the tool's anchors through the engine's creation flow — one click for the
-   * single-anchor kinds, two for `trend_line`/`rectangle`, and repeated clicks for `path` until
-   * double-click or Enter — the mouse previews the pending anchor, Backspace or Delete removes the
-   * latest placed point (never another drawing, indicator, or series once the first point is
-   * down), and Escape cancels. `options` templates the drawing created this way. One-shot:
+   * pane clicks place the tool's anchors through the engine's creation flow. Multi-click paths
+   * finish on double-click or Enter; freehand tools capture a press-drag. The mouse previews the
+   * pending anchor, Backspace or Delete removes the latest placed point (never another drawing,
+   * indicator, or series once the first point is down), and Escape cancels. `options` templates
+   * the drawing created this way. One-shot:
    * the tool disarms after each commit (listen with {@link chart_api.set_drawing_tool_listener}
    * to sync a toolbar). While armed the tool also owns order and position lines: a click there
    * places an anchor and no press there drags an order, while the markers' close, `TP`/`SL`, and

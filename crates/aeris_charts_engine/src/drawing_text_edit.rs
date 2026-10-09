@@ -1,15 +1,16 @@
-//! Engine-owned typing session for every drawing that paints its own text: the text tool, the
-//! one-line run labels of trend lines and every other line, channel, Fibonacci, pitchfork,
-//! pattern, and shape tool, and the multi-line text boxes of the annotation families.
+//! Engine-owned typing session for every drawing that paints its own text: the text tool and the
+//! text annotations (note, comment, callout, price note, anchored text), the one-line run labels
+//! of trend lines and every other line, channel, Fibonacci, pitchfork, pattern, and shape tool,
+//! and the multi-line text boxes of the family tools that own their text.
 //!
 //! The session owns the product rules every host shares: live text, caret and selection,
-//! Enter/Escape semantics, and the empty lifecycle (an emptied text tool is removed; every other
-//! drawing keeps its emptied label or box). Live text is written straight to the drawing, so
-//! typing records no undo step and no sync revision: commit records the whole edit as one
-//! `Update` and cancel restores the text and revision the session began from. Hosts only forward
-//! input. A browser host keeps its native editable surface for IME, clipboard, and accessibility
-//! and mirrors it through [`ChartEngine::set_drawing_text_edit`]; native hosts use the typing API
-//! and ask the engine to paint the caret in the canonical frame.
+//! Enter/Escape semantics, and the empty lifecycle (an emptied text tool or text annotation is
+//! removed; every other drawing keeps its emptied label or box). Live text is written straight to
+//! the drawing, so typing records no undo step and no sync revision: commit records the whole edit
+//! as one `Update` and cancel restores the text and revision the session began from. Hosts only
+//! forward input. A browser host keeps its native editable surface for IME, clipboard, and
+//! accessibility and mirrors it through [`ChartEngine::set_drawing_text_edit`]; native hosts use
+//! the typing API and ask the engine to paint the caret in the canonical frame.
 
 use crate::drawings::{collapse_line_breaks, DrawingId, DrawingKind};
 use crate::{ChartEngine, MAX_DRAWING_TEXT_BYTES};
@@ -100,6 +101,13 @@ fn word_right(chars: &[char], caret: usize) -> usize {
         index += 1;
     }
     index
+}
+
+/// Whether an emptied `kind` is removed when its session ends: the text tool and the text
+/// annotations are their text, so an empty one has nothing left to show. (Upstream's lifecycle
+/// for the annotations; the fork kept emptied annotation boxes.)
+fn removes_when_empty(kind: DrawingKind) -> bool {
+    kind == DrawingKind::Text || kind.is_text_annotation()
 }
 
 fn byte_index(text: &str, caret: usize) -> usize {
@@ -373,8 +381,9 @@ impl ChartEngine {
     }
 
     /// Enter / blur: keep the typed text, trimmed. A change records one `Update` undo step and one
-    /// sync revision; an emptied text tool is then removed (so the history reads Update, Delete),
-    /// while every other drawing keeps its emptied label or box. False while no session is open.
+    /// sync revision; an emptied text tool or text annotation (note, comment, callout, price note,
+    /// anchored text) is then removed (so the history reads Update, Delete), while every other
+    /// drawing keeps its emptied label or box. False while no session is open.
     pub fn commit_drawing_text_edit(&mut self) -> bool {
         let Some(session) = self.drawing_text_edit.take() else {
             return false;
@@ -396,7 +405,7 @@ impl ChartEngine {
             }
             self.update_drawing_runtime(id);
             let drawing = &self.drawings[index];
-            if drawing.kind == DrawingKind::Text && drawing.text.is_empty() {
+            if removes_when_empty(drawing.kind) && drawing.text.is_empty() {
                 self.remove_drawing(id);
             }
         }
@@ -405,7 +414,8 @@ impl ChartEngine {
     }
 
     /// Escape: restore the text and revision from before the session, recording nothing. A text
-    /// tool that began empty (a fresh placement) is removed. False while no session is open.
+    /// tool or text annotation that began empty (a fresh placement) is removed. False while no
+    /// session is open.
     pub fn cancel_drawing_text_edit(&mut self) -> bool {
         let Some(session) = self.drawing_text_edit.take() else {
             return false;
@@ -413,7 +423,7 @@ impl ChartEngine {
         let id = session.id;
         let mut remove = false;
         if let Some(drawing) = self.drawings.iter_mut().find(|drawing| drawing.id == id) {
-            remove = drawing.kind == DrawingKind::Text && session.original.trim().is_empty();
+            remove = removes_when_empty(drawing.kind) && session.original.trim().is_empty();
             drawing.text = session.original;
             drawing.revision = session.original_revision;
         }
@@ -478,8 +488,8 @@ mod tests {
         chart.fit_content();
         // The drawings sit inside the scaled bars: an editor opens only on text in view.
         chart.autoscale_visible();
-        let points = match kind {
-            DrawingKind::Text => vec![DrawingPoint {
+        let points = match kind.anchor_count() {
+            1 => vec![DrawingPoint {
                 logical: 5.0,
                 price: 100.0,
             }],
@@ -640,11 +650,13 @@ mod tests {
         assert_eq!(chart.drawing_text_edit(), Some((id, "€", 1)));
     }
 
-    fn comment_chart() -> (ChartEngine, DrawingId) {
+    /// A family tool that owns its text as a multi-line box (the simple annotation). Upstream's
+    /// note and comment paint one run, so they edit as a single line.
+    fn text_box_chart() -> (ChartEngine, DrawingId) {
         let (mut chart, _) = chart_with(DrawingKind::Text, "");
         let id = chart
             .add_drawing(
-                DrawingKind::Comment,
+                DrawingKind::SimpleAnnotation,
                 0,
                 vec![DrawingPoint {
                     logical: 8.0,
@@ -652,7 +664,7 @@ mod tests {
                 }],
                 None,
             )
-            .expect("comment");
+            .expect("simple annotation");
         chart.build_frame();
         (chart, id)
     }
@@ -681,9 +693,9 @@ mod tests {
 
     #[test]
     fn box_labels_keep_line_breaks_and_run_labels_collapse_them() {
-        let (mut chart, comment) = comment_chart();
+        let (mut chart, comment) = text_box_chart();
         assert!(chart.begin_drawing_text_edit(comment, false));
-        // A new comment starts with its default text: clear it first.
+        // Start from an empty box.
         assert!(chart.set_drawing_text_edit("", 0));
         assert!(chart.drawing_text_edit_insert("a\r\nb"));
         assert_eq!(text(&chart, comment).as_deref(), Some("a\nb"));
@@ -735,7 +747,7 @@ mod tests {
 
     #[test]
     fn a_click_places_the_caret_on_the_clicked_line_of_a_text_box() {
-        let (mut chart, comment) = comment_chart();
+        let (mut chart, comment) = text_box_chart();
         chart.set_text_measure(Some(Box::new(|text, _, _, _, _| {
             text.chars().count() as f64 * 10.0
         })));
@@ -761,5 +773,62 @@ mod tests {
         assert_eq!(text(&chart, id).as_deref(), Some(""));
         assert!(chart.undo_drawing(), "the update");
         assert_eq!(text(&chart, id).as_deref(), Some("abc"));
+    }
+
+    // The emptied-annotation lifecycle genuinely conflicted between the lines: the fork kept an
+    // emptied annotation box, upstream removes it. Upstream's rule applies to every text
+    // annotation through the session.
+    #[test]
+    fn an_emptied_text_annotation_records_its_update_then_its_delete() {
+        for kind in [DrawingKind::Note, DrawingKind::Callout] {
+            let (mut chart, id) = chart_with(kind, "abc");
+            assert!(chart.begin_drawing_text_edit(id, false), "{kind:?}");
+            assert!(chart.set_drawing_text_edit(" ", 1));
+            assert!(chart.commit_drawing_text_edit());
+            assert!(
+                chart.drawing(id).is_none(),
+                "an emptied {kind:?} is removed"
+            );
+            assert!(chart.undo_drawing(), "the delete");
+            assert_eq!(text(&chart, id).as_deref(), Some(""), "{kind:?}");
+            assert!(chart.undo_drawing(), "the update");
+            assert_eq!(text(&chart, id).as_deref(), Some("abc"), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_fresh_text_annotation_cancelled_empty_is_removed() {
+        let (mut chart, id) = chart_with(DrawingKind::Callout, "");
+        assert!(chart.begin_drawing_text_edit(id, false));
+        assert!(chart.drawing_text_edit_insert("draft"));
+        assert!(chart.cancel_drawing_text_edit());
+        assert!(chart.drawing(id).is_none());
+
+        // An annotation that began with text keeps it on cancel.
+        let (mut chart, note) = chart_with(DrawingKind::Note, "keep");
+        assert!(chart.begin_drawing_text_edit(note, false));
+        assert!(chart.set_drawing_text_edit("", 0));
+        assert!(chart.cancel_drawing_text_edit());
+        assert_eq!(text(&chart, note).as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn text_annotations_edit_as_one_run() {
+        for kind in [
+            DrawingKind::Note,
+            DrawingKind::Comment,
+            DrawingKind::Callout,
+            DrawingKind::PriceNote,
+            DrawingKind::AnchoredText,
+        ] {
+            let (mut chart, id) = chart_with(kind, "a");
+            let layout = chart
+                .drawing_text_edit_layout(id)
+                .expect("an editor layout");
+            assert!(!layout.multiline, "{kind:?}");
+            assert!(chart.begin_drawing_text_edit(id, false), "{kind:?}");
+            assert!(chart.set_drawing_text_edit("a\nb", 3));
+            assert_eq!(text(&chart, id).as_deref(), Some("a b"), "{kind:?}");
+        }
     }
 }

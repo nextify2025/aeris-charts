@@ -5,27 +5,28 @@ import { PNG } from "pngjs";
 
 // B8 Fibonacci family (retracement, trend-based extension, channel, time zones, trend-based time,
 // speed resistance fan and arcs, circles, spiral, wedge) through the public API and real pointer
-// input: armed placement of every tool, the three-anchor first-leg preview, level lines, labels,
-// and selected-only band hits, level-list and typed tool-option edits, body drags with undo,
-// persistence/clipboard/sync round trips, the demo toolbar, and WebGPU == Canvas2D parity. Every
-// geometry decision is engine-owned; these specs only drive the package API and pointer.
+// input: armed placement of every tool, the three-anchor first-leg preview, level lines and their
+// hits, level-list and flat level-option edits, body drags with undo, persistence/clipboard/sync
+// round trips, the demo toolbar, and WebGPU == Canvas2D parity. Every geometry decision is
+// engine-owned; these specs only drive the package API and pointer.
 
 const fixture = JSON.parse(readFileSync(new URL("../fixtures/d1/candles.json", import.meta.url), "utf8"));
 const PR = fixture.pixel_ratio;
 const FIBONACCI = [
-  "fib_retracement",
-  "trend_based_fib_extension",
-  "fib_channel",
-  "fib_time_zone",
-  "trend_based_fib_time",
-  "fib_speed_resistance_fan",
-  "fib_speed_resistance_arcs",
-  "fib_circles",
-  "fib_spiral",
-  "fib_wedge",
+  "fibonacci_retracement",
+  "fibonacci_extension",
+  "fibonacci_channel",
+  "fibonacci_time_zones",
+  "fibonacci_trend_time",
+  "fibonacci_speed_fan",
+  "fibonacci_speed_arcs",
+  "fibonacci_circles",
+  "fibonacci_spiral",
+  "fibonacci_wedge",
 ];
-const THREE_ANCHORS = new Set(["trend_based_fib_extension", "fib_channel", "trend_based_fib_time", "fib_wedge"]);
-const GREEN = [76, 175, 80]; // #4caf50 — the default 0.5 level
+const THREE_ANCHORS = new Set(["fibonacci_extension", "fibonacci_channel", "fibonacci_trend_time", "fibonacci_wedge"]);
+const GREEN = [76, 175, 80]; // #4caf50
+const PINK = [233, 30, 99]; // #e91e63
 
 test.beforeEach(async ({ page }) => {
   page.on("console", (message) => console.log(`[browser:${message.type()}] ${message.text()}`));
@@ -130,6 +131,13 @@ test("every Fibonacci tool places through the armed-tool flow and paints", async
     // Remove it again so each tool is measured against the clean chart.
     await page.evaluate(() => window.__chart.clear_drawings());
   }
+  // Earlier builds' spellings arm the canonical tool.
+  expect(await page.evaluate(() => {
+    window.__chart.set_drawing_tool("fib_retracement");
+    const armed = window.__chart.active_drawing_tool();
+    window.__chart.set_drawing_tool(null);
+    return armed;
+  })).toBe("fibonacci_retracement");
 });
 
 test("three-anchor tools preview their first leg before the second click", async ({ page }) => {
@@ -137,7 +145,7 @@ test("three-anchor tools preview their first leg before the second click", async
   // Hide the crosshair so only drawing geometry changes the pixels.
   await page.evaluate(() => window.__chart.apply_options({ crosshair: { mode: 2 } }));
   const s = await anchor_spots(page);
-  await page.evaluate(() => window.__chart.set_drawing_tool("trend_based_fib_extension", { color: "#e91e63" }));
+  await page.evaluate(() => window.__chart.set_drawing_tool("fibonacci_extension", { color: "#e91e63" }));
   const a = await spot(page, s.l0, s.p_lo);
   const b = await spot(page, s.l1, s.p_hi);
   await page.mouse.click(a.x, a.y);
@@ -157,91 +165,85 @@ test("three-anchor tools preview their first leg before the second click", async
   expect(list[0].points).toHaveLength(3);
 });
 
-test("the retracement paints ratio levels and hits levels, labels, and selected bands", async ({ page }) => {
+test("the retracement paints ratio levels and hits its level lines", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
   const info = await page.evaluate(({ s }) => {
-    const drawing = window.__chart.add_drawing("fib_retracement", [
+    const drawing = window.__chart.add_drawing("fibonacci_retracement", [
       { logical: s.l0, price: s.p_lo },
       { logical: s.l1, price: s.p_hi },
-    ]);
+    ], { color: "#e91e63" });
     return {
       id: drawing.id,
-      levels: drawing.options().levels.map((level) => [level.value, level.color]),
+      levels: drawing.options().levels.map((level) => level.value),
       kind_options: window.__chart.drawing_kind_options(drawing),
       schema: window.__chart.drawing_property_schema(drawing).properties
-        .filter((property) => property.name.startsWith("tool_options."))
+        .filter((property) => property.name.startsWith("level_"))
         .map((property) => [property.name, property.default]),
     };
   }, { s });
-  expect(info.levels.slice(0, 7)).toEqual([
-    [0, "#787b86"], [0.236, "#f23645"], [0.382, "#ff9800"], [0.5, "#4caf50"],
-    [0.618, "#089981"], [0.786, "#00bcd4"], [1, "#787b86"],
-  ]);
-  expect(info.kind_options).toMatchObject({ kind: "fibonacci", reverse: false, label_h_align: "left", label_v_align: "middle" });
-  expect(info.schema).toContainEqual(["tool_options.fibonacci.log_scale", false]);
+  expect(info.levels).toEqual([0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]);
+  expect(info.kind_options).toMatchObject({ kind: "levels", reverse: false, log_scale: false, label_align: "right" });
+  expect(info.schema).toContainEqual(["level_log_scale", false]);
   await settle_frames(page);
 
-  // The 0.5 level paints on its price (level 0 sits on the second anchor).
+  // Level 0 sits on the first anchor: the 0.236 level paints a quarter of the way up from it.
+  const rows = color_rows(await capture(page), PINK);
+  const low = await spot(page, (s.l0 + s.l1) / 2, s.p_lo + (s.p_hi - s.p_lo) * 0.236);
+  expect(rows.some((row) => Math.abs(row - low.y * PR) <= 2), `rows ${rows} near ${low.y * PR}`).toBe(true);
+
+  // A level line hovers and selects the drawing; the band between two levels does not.
   const half = (s.p_lo + s.p_hi) / 2;
   const level = await spot(page, (s.l0 + s.l1) / 2, half);
-  const rows = color_rows(await capture(page), GREEN);
-  expect(rows.some((row) => Math.abs(row - level.y * PR) <= 2), `rows ${rows} near ${level.y * PR}`).toBe(true);
-
-  // A level line hovers and selects the drawing; a band does not until it is selected.
-  const quarter = await spot(page, (s.l0 + s.l1) / 2, s.p_hi - (s.p_hi - s.p_lo) * 0.3);
-  await page.mouse.move(quarter.x, quarter.y);
+  const band = await spot(page, (s.l0 + s.l1) / 2, s.p_lo + (s.p_hi - s.p_lo) * 0.7);
+  await page.mouse.move(band.x, band.y);
   await expect.poll(() => overlay_cursor(page)).not.toBe("move");
   await page.mouse.move(level.x, level.y);
   await expect.poll(() => overlay_cursor(page)).toBe("move");
   await page.mouse.click(level.x, level.y);
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(info.id);
-  await page.mouse.move(quarter.x, quarter.y);
-  await expect.poll(() => overlay_cursor(page)).toBe("move");
 
-  // The label left of the first anchor is a body target too.
-  await page.evaluate(() => {
-    window.__chart.wasm.set_selected_drawing(undefined);
-    window.__chart.render();
-  });
-  expect(await page.evaluate(() => window.__chart.selected_drawing()?.id ?? null)).toBeNull();
-  await page.waitForTimeout(700);
-  const left = await spot(page, s.l0, half);
-  await page.mouse.click(left.x - 30, left.y);
-  expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(info.id);
-
-  // Typed options: reverse moves level 0 to the first anchor; invalid blocks reject atomically.
+  // Flat level options: reverse moves level 0 to the second anchor; an invalid value rejects the
+  // whole patch. Earlier builds' `tool_options.fibonacci` keys move onto the flat options (their
+  // `reverse` had level 0 on the second anchor already, so it inverts).
   const edited = await page.evaluate((id) => {
     const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
-    drawing.apply_options({ tool_options: { fibonacci: { reverse: true, levels_as_percent: true } } });
+    drawing.apply_options({ level_reverse: true, level_show_percents: true });
     let code = null;
     try {
-      drawing.apply_options({ width: 7, tool_options: { fibonacci: { label_v_align: "sideways" } } });
+      drawing.apply_options({ width: 7, level_label_align: "sideways" });
     } catch (error) {
       code = error.code;
     }
-    return {
+    const flat = {
       code,
       width: drawing.options().width,
-      tool_options: drawing.options().tool_options,
       kind_options: window.__chart.drawing_kind_options(drawing),
     };
+    drawing.apply_options({ tool_options: { fibonacci: { reverse: true, label_h_align: "left" } } });
+    return { ...flat, legacy: window.__chart.drawing_kind_options(drawing), tool_options: drawing.options().tool_options };
   }, info.id);
   expect(edited.code).toBe("invalid_options");
   expect(edited.width).toBe(1);
-  expect(edited.tool_options).toEqual({ fibonacci: expect.objectContaining({ reverse: true, levels_as_percent: true }) });
-  expect(edited.kind_options).toMatchObject({ kind: "fibonacci", reverse: true, levels_as_percent: true });
+  expect(edited.kind_options).toMatchObject({ kind: "levels", reverse: true, show_percents: true });
+  expect(edited.legacy).toMatchObject({ reverse: false, label_align: "left" });
+  expect(edited.tool_options).toEqual({});
+  await settle_frames(page);
+  const reversed = color_rows(await capture(page), PINK);
+  const high = await spot(page, (s.l0 + s.l1) / 2, s.p_hi - (s.p_hi - s.p_lo) * 0.236);
+  expect(reversed.some((row) => Math.abs(row - high.y * PR) <= 2), `rows ${reversed} near ${high.y * PR}`).toBe(false);
 });
 
 test("level lists edit values, visibility, colors, and fills", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
-  const id = await page.evaluate(({ s }) => window.__chart.add_drawing("fib_retracement", [
+  const id = await page.evaluate(({ s }) => window.__chart.add_drawing("fibonacci_retracement", [
     { logical: s.l0, price: s.p_lo },
     { logical: s.l1, price: s.p_hi },
   ]).id, { s });
   await settle_frames(page);
-  const target = await spot(page, (s.l0 + s.l1) / 2, s.p_hi - (s.p_hi - s.p_lo) * 0.25);
+  // Level 0 sits on the first anchor, so the 0.25 level is a quarter of the way up from it.
+  const target = await spot(page, (s.l0 + s.l1) / 2, s.p_lo + (s.p_hi - s.p_lo) * 0.25);
   expect(color_rows(await capture(page), [233, 30, 99]).length).toBe(0);
   const levels = await page.evaluate((id) => {
     const drawing = window.__chart.drawings().find((candidate) => candidate.id === id);
@@ -263,13 +265,13 @@ test("level lists edit values, visibility, colors, and fills", async ({ page }) 
   expect(color_rows(png, GREEN).length, "hidden levels paint nothing").toBe(0);
   expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
   const restored = await page.evaluate((id) => window.__chart.drawings().find((drawing) => drawing.id === id).options().levels.length, id);
-  expect(restored).toBe(11);
+  expect(restored).toBe(7);
 });
 
 test("a trend-based extension drags from a level line and undoes as one step", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
-  const id = await page.evaluate(({ s }) => window.__chart.add_drawing("trend_based_fib_extension", [
+  const id = await page.evaluate(({ s }) => window.__chart.add_drawing("fibonacci_extension", [
     { logical: s.l0, price: s.p_lo },
     { logical: s.l1, price: s.p_hi },
     { logical: s.l2, price: s.p_mid },
@@ -338,7 +340,7 @@ test("an already synced cell accepts pointer drags and armed placements", async 
   }
 
   // An armed retracement placed with real clicks on the first cell.
-  await page.evaluate(() => window.__chart.set_drawing_tool("fib_retracement"));
+  await page.evaluate(() => window.__chart.set_drawing_tool("fibonacci_retracement"));
   for (const [logical, price] of [[s.l1, s.p_hi], [s.l2, s.p_mid]]) {
     const point = await spot(page, logical, price);
     await page.mouse.click(point.x, point.y);
@@ -348,7 +350,7 @@ test("an already synced cell accepts pointer drags and armed placements", async 
     applied: window.__sync(),
     kinds: window.__mirror.drawings().map((drawing) => drawing.kind()).sort(),
   }));
-  expect(placed).toEqual({ applied: true, kinds: ["fib_retracement", "trend_line"] });
+  expect(placed).toEqual({ applied: true, kinds: ["fibonacci_retracement", "trend_line"] });
   await page.evaluate(() => window.__mirror.remove());
 });
 
@@ -368,16 +370,16 @@ test("Fibonacci tools round-trip through persistence, clipboard, and sync with t
     const first_host = host();
     const first = await create_chart(first_host, { backend: "canvas2d", autoSize: false });
     const additions = [
-      ["fib_retracement", two, { extend_right: true, tool_options: { fibonacci: { reverse: true, label_h_align: "right" } } }],
-      ["trend_based_fib_extension", three, { tool_options: { fibonacci: { log_scale: true } } }],
-      ["fib_channel", three, { levels: [] }],
-      ["fib_time_zone", two, { fill_enabled: true }],
-      ["trend_based_fib_time", three, {}],
-      ["fib_speed_resistance_fan", two, { tool_options: { fibonacci: { grid: false } } }],
-      ["fib_speed_resistance_arcs", two, { tool_options: { fibonacci: { full_circles: true } } }],
-      ["fib_circles", two, { levels: [{ value: 0.5, color: "#abcdef", visible: true, style: "dashed", fill_between: false, label_visible: false }] }],
-      ["fib_spiral", two, { tool_options: { fibonacci: { reverse: true } }, style: "dotted" }],
-      ["fib_wedge", three, { fill_enabled: false }],
+      ["fibonacci_retracement", two, { extend_right: true, level_reverse: true, level_label_align: "left" }],
+      ["fibonacci_extension", three, { level_log_scale: true }],
+      ["fibonacci_channel", three, { levels: [] }],
+      ["fibonacci_time_zones", two, { fill_enabled: true }],
+      ["fibonacci_trend_time", three, {}],
+      ["fibonacci_speed_fan", two, { tool_options: { fibonacci: { grid: false } } }],
+      ["fibonacci_speed_arcs", two, { tool_options: { fibonacci: { full_circles: true } } }],
+      ["fibonacci_circles", two, { levels: [{ value: 0.5, color: "#abcdef", visible: true, style: "dashed", fill_between: false, label_visible: false }] }],
+      ["fibonacci_spiral", two, { level_reverse: true, style: "dotted" }],
+      ["fibonacci_wedge", three, { fill_enabled: false }],
     ];
     for (const [kind, anchors, style] of additions) first.add_drawing(kind, anchors, style);
     const state = first.export_state();
@@ -412,7 +414,10 @@ test("Fibonacci tools round-trip through persistence, clipboard, and sync with t
 
   expect(result.canonical).toEqual(result.state);
   const styles = result.state.drawings.map((drawing) => drawing.style);
-  expect(styles[0].tool_options).toEqual({ fibonacci: expect.objectContaining({ reverse: true, label_h_align: "right" }) });
+  expect(styles[0].level_reverse).toBe(true);
+  expect(styles[0].level_label_align).toBe("left");
+  expect(styles[0].tool_options).toBeUndefined();
+  expect(styles[1].level_log_scale).toBe(true);
   expect(styles[0].extend_right).toBe(true);
   expect(styles[0].levels, "default levels are omitted").toBeUndefined();
   expect(styles[2].levels, "a cleared level list persists").toEqual([]);
@@ -425,6 +430,9 @@ test("Fibonacci tools round-trip through persistence, clipboard, and sync with t
     tool_options: options.tool_options,
     style: options.style,
     color: options.color,
+    level_reverse: options.level_reverse,
+    level_log_scale: options.level_log_scale,
+    level_label_align: options.level_label_align,
   }));
   expect(semantic(result.restored)).toEqual(semantic(result.expected));
   expect(semantic(result.pasted)).toEqual(semantic(result.expected));
@@ -439,7 +447,7 @@ test("the demo toolbar arms every Fibonacci tool", async ({ page }) => {
     await page.click(`#drawings_group [data-tool='${kind}']`);
     expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBe(kind);
   }
-  await page.click("#drawings_group [data-tool='fib_wedge']");
+  await page.click("#drawings_group [data-tool='fibonacci_wedge']");
   expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBeNull();
 });
 
@@ -456,30 +464,30 @@ test("Fibonacci tools render pixel-identical on WebGPU and Canvas2D (AA coverage
       const lo = Math.min(b0.low, b1.low);
       const hi = Math.max(b0.high, b1.high);
       const up = (fraction) => lo + (hi - lo) * fraction;
-      chart.add_drawing("fib_retracement", [{ logical: at(0.1), price: up(0.1) }, { logical: at(0.3), price: up(0.9) }]);
-      chart.add_drawing("fib_time_zone", [{ logical: at(0.05), price: up(0.5) }, { logical: at(0.08), price: up(0.5) }], { fill_enabled: true });
-      chart.add_drawing("fib_speed_resistance_fan", [{ logical: at(0.4), price: up(0.2) }, { logical: at(0.5), price: up(0.6) }]);
-      chart.add_drawing("fib_circles", [{ logical: at(0.62), price: up(0.4) }, { logical: at(0.66), price: up(0.55) }]);
-      chart.add_drawing("fib_spiral", [{ logical: at(0.8), price: up(0.5) }, { logical: at(0.82), price: up(0.5) }], { color: "#7b1fa2" });
+      chart.add_drawing("fibonacci_retracement", [{ logical: at(0.1), price: up(0.1) }, { logical: at(0.3), price: up(0.9) }]);
+      chart.add_drawing("fibonacci_time_zones", [{ logical: at(0.05), price: up(0.5) }, { logical: at(0.08), price: up(0.5) }], { fill_enabled: true });
+      chart.add_drawing("fibonacci_speed_fan", [{ logical: at(0.4), price: up(0.2) }, { logical: at(0.5), price: up(0.6) }]);
+      chart.add_drawing("fibonacci_circles", [{ logical: at(0.62), price: up(0.4) }, { logical: at(0.66), price: up(0.55) }]);
+      chart.add_drawing("fibonacci_spiral", [{ logical: at(0.8), price: up(0.5) }, { logical: at(0.82), price: up(0.5) }], { color: "#7b1fa2" });
       // Extended both ways: the bands are the pane clipped between neighbouring level lines.
-      chart.add_drawing("fib_channel", [
+      chart.add_drawing("fibonacci_channel", [
         { logical: at(0.35), price: up(0.9) }, { logical: at(0.55), price: up(1.0) }, { logical: at(0.45), price: up(0.75) },
       ], { extend_left: true, extend_right: true });
       // Centered left of the pane with dashed rings: only the pane's angular window is
       // tessellated, each ring starting on its own dash phase.
       const ring = (value, color) => ({ value, color, visible: true, style: "dashed", fill_between: true, label_visible: true });
-      chart.add_drawing("fib_circles", [
+      chart.add_drawing("fibonacci_circles", [
         { logical: range.from - (range.to - range.from) * 0.3, price: up(0.5) },
         { logical: range.from - (range.to - range.from) * 0.1, price: up(0.5) },
       ], { levels: [ring(1.5, "#2962ff"), ring(2, "#f23645"), ring(2.5, "#089981")] });
-      chart.add_drawing("fib_speed_resistance_arcs", [{ logical: at(0.12), price: up(0.25) }, { logical: at(0.16), price: up(0.4) }], { style: "dotted" });
-      chart.add_drawing("trend_based_fib_extension", [
+      chart.add_drawing("fibonacci_speed_arcs", [{ logical: at(0.12), price: up(0.25) }, { logical: at(0.16), price: up(0.4) }], { style: "dotted" });
+      chart.add_drawing("fibonacci_extension", [
         { logical: at(0.5), price: up(0.05) }, { logical: at(0.56), price: up(0.25) }, { logical: at(0.6), price: up(0.15) },
       ], { extend_right: true });
-      chart.add_drawing("trend_based_fib_time", [
+      chart.add_drawing("fibonacci_trend_time", [
         { logical: at(0.86), price: up(0.9) }, { logical: at(0.89), price: up(0.75) }, { logical: at(0.91), price: up(0.85) },
       ]);
-      chart.add_drawing("fib_wedge", [
+      chart.add_drawing("fibonacci_wedge", [
         { logical: at(0.7), price: up(0.1) }, { logical: at(0.78), price: up(0.3) }, { logical: at(0.78), price: up(0.0) },
       ]);
       const first = chart.drawings()[0];

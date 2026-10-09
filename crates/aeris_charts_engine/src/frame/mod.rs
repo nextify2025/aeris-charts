@@ -532,9 +532,6 @@ pub(crate) struct RetainedFrame {
     coordinate_generation: u64,
     last_layout_key: Option<[u64; 9]>,
     last_overlay_key: Option<[u64; 7]>,
-    /// The hovered and the selected drawing when their family paints parts only while focused
-    /// (`DrawingFamily::reveals_on_focus`).
-    last_focus_key: [Option<crate::DrawingId>; 2],
     last_options_generation: u64,
     last_series_revision: u64,
     last_time_scale_revision: u64,
@@ -1236,20 +1233,20 @@ impl ChartEngine {
 
     pub(crate) fn invalidate_frame_series(&mut self, id: SeriesId) {
         self.frame_invalidation.series(id);
-        // Family drawings whose geometry reads series data (regression statistics, a forecast's
-        // outcome) follow their own source series; a change of any other series leaves them.
+        // Drawings whose geometry reads series data (a regression fit, a forecast's outcome)
+        // follow their own source series; a change of any other series leaves them. Streaming
+        // bar updates reach only this hook, so without it their geometry would stay stale.
         // Structural source changes (series add, removal, pane or scale moves) invalidate the
         // whole scene instead.
         if self.drawings.iter().any(|drawing| {
-            drawing
-                .kind
-                .spec()
-                .family
-                .is_some_and(|family| (family.reads_series_data)(drawing))
-                && self.drawing_source_series(drawing) == Some(id)
+            matches!(
+                drawing.kind,
+                DrawingKind::RegressionTrend | DrawingKind::Forecast
+            ) && self.drawing_source_series(drawing) == Some(id)
         }) {
             self.frame_invalidation.drawings();
         }
+        self.invalidate_profile_drawings_using_series(id);
     }
 
     /// The generation a retained series layer is built from. A `histogram_updown` histogram
@@ -1478,21 +1475,19 @@ impl ChartEngine {
             self.frame_invalidation.all();
         } else if self.retained_frame.last_series_revision != series_revision {
             self.frame_invalidation.scene();
+            if self
+                .drawings
+                .iter()
+                .any(|drawing| drawing.kind == crate::DrawingKind::RegressionTrend)
+            {
+                self.frame_invalidation.drawings();
+            }
         } else if self.retained_frame.last_overlay_key != Some(overlay_key) {
             self.frame_invalidation.overlay();
         }
         let time_scale_revision = self.time_scale.revision();
         if self.retained_frame.last_time_scale_revision != time_scale_revision {
             self.frame_invalidation.time_coordinates();
-        }
-        // Hover and selection normally reassemble retained drawing geometry without rebuilding
-        // it; a drawing that paints parts only while focused rebuilds the layer when it gains
-        // or loses focus.
-        let focus_key = [self.hovered_drawing(), self.selected_drawing()]
-            .map(|id| id.filter(|&id| self.drawing_reveals_on_focus(id)));
-        if self.retained_frame.last_focus_key != focus_key {
-            self.frame_invalidation.drawings();
-            self.retained_frame.last_focus_key = focus_key;
         }
         let price_scales_changed = self.retained_frame.last_price_scale_revisions.len()
             != self.panes.len()

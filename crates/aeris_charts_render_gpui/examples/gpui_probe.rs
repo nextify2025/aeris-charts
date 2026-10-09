@@ -2953,7 +2953,7 @@ impl Render for InteractiveDemo {
                     b("date range", DemoAction::Drawing(DrawingKind::DateRange)),
                     b(
                         "date & price",
-                        DemoAction::Drawing(DrawingKind::DateAndPriceRange),
+                        DemoAction::Drawing(DrawingKind::DatePriceRange),
                     ),
                     b("clear", DemoAction::ClearDrawings),
                 ],
@@ -3803,7 +3803,7 @@ mod tests {
         };
         rebuild(&mut probe);
         probe.engine.clear_drawings();
-        probe.arm_drawing(DrawingKind::DateAndPriceRange);
+        probe.arm_drawing(DrawingKind::DatePriceRange);
         assert_eq!(
             place_drawing_anchor(&mut probe, 200.0, 200.0, DrawingModifiers::default()),
             -1
@@ -3811,7 +3811,7 @@ mod tests {
         let id = place_drawing_anchor(&mut probe, 500.0, 400.0, DrawingModifiers::default());
         assert!(id > 0);
         let drawing = probe.engine.drawing(id as u32).unwrap();
-        assert_eq!(drawing.kind, DrawingKind::DateAndPriceRange);
+        assert_eq!(drawing.kind, DrawingKind::DatePriceRange);
         assert!(drawing
             .points
             .iter()

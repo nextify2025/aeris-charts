@@ -33,7 +33,7 @@
 - 通过系列选项 `time_alignment: "as_of"` 和 `as_of_max_staleness` 实现的多日历叠加层（参见 [多日历叠加层](coordinates-and-time.md#时间交易所时区与交易时段)）；
 - 这些句柄所声明的内置系列、指标、绘图类型、选项、主题、数据写入、交互、订阅、截图和生命周期操作；
 - 通过规范的 `drawing_kind` 值 `"long_position"` 和 `"short_position"` 提供的多头头寸与空头头寸绘图；每个绘图按入场、目标、止损的顺序存储三个可编辑锚点，绘制目标/入场/止损信息，将三个价格都投影到所属 Y 轴，并使用共享的绘图历史、持久化、命中测试和后端帧路径。统计数据使用两个持久化的绘图选项：`position_account_size`（假设的余额，默认 1,000）和 `position_risk_percent`（在止损处承担风险的占比，0–100，默认 25），与券商订单无关；
-- 通过规范的 `drawing_kind` 值 `"price_range"`、`"date_range"` 和 `"date_and_price_range"` 提供的测量绘图（早先的拼写 `"date_price_range"` 在导入、模板、剪贴板和同步时仍会被读取，但绝不会写出）；每个绘图存储一个可编辑的起始锚点和结束锚点，吸附到整根柱和价格刻度，标注带符号的价格变化、百分比、刻度数（按品种刻度或价格区间价位梯计数）、柱数和经过的时间（`labels` 选项决定显示哪些度量项），并以绘图颜色绘制；
+- 通过规范的 `drawing_kind` 值 `"price_range"`、`"date_range"` 和 `"date_price_range"` 提供的测量绘图（自有线早期构建所用的拼写 `"date_and_price_range"` 在导入、模板、剪贴板和同步时仍会被读取，但绝不会写出）；每个绘图存储一个可编辑的起始锚点和结束锚点，吸附到整根柱和价格刻度，标注带符号的价格变化、百分比、刻度数（按品种刻度或价格区间价位梯计数）、柱数和经过的时间（`labels` 选项决定显示哪些度量项），并以绘图颜色绘制；
 - 内置指针处理中的 Shift 点击快速测量：在图表空白区域 Shift + 按下，会启动一次临时的日期与价格测量，该测量跟随指针（上涨使用绘图默认颜色，下跌使用市场下跌颜色），在拖动后松开时或下一次点击时冻结，并由随后的点击或 Escape 取消。它绝不是绘图、历史条目或持久化对象；
 - 通过 `chart.add_volume_profile(prices, volume, options)` 提供的可见范围成交量分布，返回带有 `options()`、`apply_options()`、`snapshot()` 和 `remove()` 的分布句柄；
 - KLineChart 的 27 个指标模板，通过 `chart.add_klinechart_indicator(source, indicator, volume_source?, options?)` 提供，详见 [KLineChart 指标](indicators.md#klinechart-指标)；

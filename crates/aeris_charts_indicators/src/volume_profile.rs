@@ -43,6 +43,97 @@ pub struct VolumeProfile {
     pub value_area_high_index: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DevelopingProfilePoint {
+    pub timestamp_micros: i64,
+    pub poc_index: usize,
+    pub value_area_low_index: usize,
+    pub value_area_high_index: usize,
+}
+
+/// Incremental value-area path on the final profile's fixed price grid. The grid is held
+/// constant so historical points remain comparable after a session's range grows. Work is
+/// O(bars + sampled_points × rows + bar/bin overlaps), with a caller-owned sample budget.
+pub fn volume_profile_developing(
+    bars: &[(i64, ProfileBar)],
+    final_rows: &[ProfileRow],
+    value_area_percent: f64,
+    sample_limit: usize,
+) -> Result<Vec<DevelopingProfilePoint>, &'static str> {
+    if final_rows.is_empty()
+        || sample_limit == 0
+        || !(0.0 < value_area_percent && value_area_percent <= 100.0)
+    {
+        return Ok(Vec::new());
+    }
+    let row_count = final_rows.len();
+    let low = final_rows[0].low;
+    let step = final_rows[0].high - low;
+    if !step.is_finite() || step <= 0.0 {
+        return Err("invalid volume-profile grid");
+    }
+    let valid_count = bars.iter().filter(|(_, bar)| bar.valid()).count();
+    let stride = if sample_limit < 2 || valid_count < 2 {
+        usize::MAX
+    } else {
+        (valid_count - 1).div_ceil(sample_limit - 1)
+    };
+    let mut volumes = vec![0.0; row_count];
+    let mut total_volume = 0.0;
+    let mut output = Vec::with_capacity(valid_count.min(sample_limit));
+    let bin = |price: f64| (((price - low) / step).floor() as usize).min(row_count - 1);
+    for (index, &(timestamp_micros, bar)) in bars.iter().filter(|(_, bar)| bar.valid()).enumerate()
+    {
+        let first = bin(bar.low);
+        let last = bin(bar.high);
+        if first == last || bar.low == bar.high {
+            volumes[first] += bar.volume;
+        } else {
+            let span = bar.high - bar.low;
+            volumes[first] += bar.volume * ((low + (first + 1) as f64 * step - bar.low) / span);
+            volumes[last] += bar.volume * ((bar.high - (low + last as f64 * step)) / span);
+            let full = bar.volume * (step / span);
+            for volume in volumes.iter_mut().take(last).skip(first + 1) {
+                *volume += full;
+            }
+        }
+        total_volume += bar.volume;
+        if !total_volume.is_finite() {
+            return Err("volume-profile volume overflow");
+        }
+        if index + 1 != valid_count && (stride == usize::MAX || index % stride != 0) {
+            continue;
+        }
+        if volumes.iter().any(|volume| !volume.is_finite()) {
+            return Err("volume-profile bin overflow");
+        }
+        let mut poc = 0;
+        for candidate in 1..row_count {
+            if volumes[candidate] > volumes[poc] {
+                poc = candidate;
+            }
+        }
+        let target = total_volume * value_area_percent / 100.0;
+        let (mut lower, mut upper, mut included) = (poc, poc, volumes[poc]);
+        while included < target && (lower > 0 || upper + 1 < row_count) {
+            if upper + 1 == row_count || (lower > 0 && volumes[lower - 1] >= volumes[upper + 1]) {
+                lower -= 1;
+                included += volumes[lower];
+            } else {
+                upper += 1;
+                included += volumes[upper];
+            }
+        }
+        output.push(DevelopingProfilePoint {
+            timestamp_micros,
+            poc_index: poc,
+            value_area_low_index: lower,
+            value_area_high_index: upper,
+        });
+    }
+    Ok(output)
+}
+
 /// Two passes over the input and O(rows) storage/work beyond those passes. Full-bin
 /// contributions use a difference array, avoiding a bars × rows inner loop.
 /// POC ties choose the lowest price; value-area expansion chooses the larger adjacent
@@ -199,6 +290,96 @@ mod tests {
             (profile.value_area_low_index, profile.value_area_high_index),
             (Some(0), Some(1))
         );
+    }
+
+    #[test]
+    fn developing_path_matches_final_distribution_and_samples_endpoints() {
+        let bars = [
+            (
+                0,
+                ProfileBar {
+                    open: 1.0,
+                    low: 0.0,
+                    high: 2.0,
+                    close: 2.0,
+                    volume: 10.0,
+                },
+            ),
+            (
+                1,
+                ProfileBar {
+                    open: 2.0,
+                    low: 1.0,
+                    high: 3.0,
+                    close: 1.0,
+                    volume: 20.0,
+                },
+            ),
+            (
+                2,
+                ProfileBar {
+                    open: 1.0,
+                    low: 0.0,
+                    high: 4.0,
+                    close: 4.0,
+                    volume: 30.0,
+                },
+            ),
+        ];
+        let final_profile = volume_profile(bars.iter().map(|(_, bar)| *bar), 4, 70.0, 1.0).unwrap();
+        let path = volume_profile_developing(&bars, &final_profile.rows, 70.0, 2).unwrap();
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].timestamp_micros, 0);
+        assert_eq!(path[1].timestamp_micros, 2);
+        assert_eq!(path[1].poc_index, final_profile.poc_index.unwrap());
+        assert_eq!(
+            path[1].value_area_low_index,
+            final_profile.value_area_low_index.unwrap()
+        );
+        assert_eq!(
+            path[1].value_area_high_index,
+            final_profile.value_area_high_index.unwrap()
+        );
+    }
+
+    #[test]
+    fn developing_last_value_matches_final_profile_across_mixed_bars() {
+        let mut seed = 17_u64;
+        for _fixture in 0..24 {
+            let bars = (0..64)
+                .map(|timestamp_micros| {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    let low = ((seed >> 32) % 80) as f64 * 0.25;
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    let high = low + (((seed >> 32) % 12) + 1) as f64 * 0.25;
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    let volume = ((seed >> 32) % 50 + 1) as f64;
+                    (
+                        timestamp_micros,
+                        ProfileBar {
+                            open: low,
+                            low,
+                            high,
+                            close: high,
+                            volume,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let final_profile =
+                volume_profile(bars.iter().map(|(_, bar)| *bar), 32, 70.0, 0.25).unwrap();
+            let path = volume_profile_developing(&bars, &final_profile.rows, 70.0, 64).unwrap();
+            let last = path.last().unwrap();
+            assert_eq!(last.poc_index, final_profile.poc_index.unwrap());
+            assert_eq!(
+                last.value_area_low_index,
+                final_profile.value_area_low_index.unwrap()
+            );
+            assert_eq!(
+                last.value_area_high_index,
+                final_profile.value_area_high_index.unwrap()
+            );
+        }
     }
 
     #[test]

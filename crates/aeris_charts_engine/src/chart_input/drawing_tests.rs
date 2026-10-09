@@ -846,7 +846,7 @@ fn backspace_steps_back_a_fixed_count_tool_and_never_deletes_the_selected_drawin
         (420.0, 300.0),
         (500.0, 150.0),
     ];
-    for (kind, placed) in [(DrawingKind::TrendLine, 1), (DrawingKind::XabcdPattern, 3)] {
+    for (kind, placed) in [(DrawingKind::TrendLine, 1), (DrawingKind::PatternXabcd, 3)] {
         let count = kind.anchor_count();
         // The clicks that finish the drawing after the latest placed point is stepped back.
         let kept: Vec<(f64, f64)> = clicks[..placed - 1]

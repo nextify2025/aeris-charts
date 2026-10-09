@@ -106,7 +106,9 @@ impl ChartEngine {
         Some(((-dy).atan2(dx).to_degrees(), dx.hypot(dy)))
     }
 
-    fn drawing_metric_text(
+    /// One metric's engine-formatted text from anchor `from` to anchor `to`; `None` when the
+    /// metric has no value on the current axis (for example a duration before time data).
+    pub(crate) fn drawing_metric_text(
         &self,
         drawing: &Drawing,
         metric: DrawingLabelMetric,

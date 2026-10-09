@@ -141,6 +141,48 @@ async function drawings(page) {
   })));
 }
 
+test("expanded drawing catalog paints from the same public API on both browser backends", async ({ page }) => {
+  const painted = [];
+  for (const backend of ["canvas2d", "webgpu"]) {
+    await goto_fixture(page, backend);
+    expect(await page.evaluate(() => window.__chart.backend())).toBe(backend);
+    const s = await anchor_spots(page);
+    const before = await capture(page);
+    const created = await page.evaluate(({ l0, l1, p_lo, p_hi }) => {
+      const anchors = [
+        { logical: l0, price: p_lo },
+        { logical: l1, price: p_hi },
+      ];
+      const style = { color: "#ff00ff", width: 2 };
+      return [
+        window.__chart.add_drawing("fibonacci_retracement", anchors, {
+          ...style,
+          levels: [{ value: 0.5, color: "#ff00ff", visible: true, style: "solid", fill_between: false, label_visible: false }],
+        }),
+        window.__chart.add_drawing("gann_box", anchors, style),
+        window.__chart.add_drawing("gann_square", anchors, {
+          ...style,
+          gann_fans: [{ value: 2, color: "#ff00ff", visible: true, style: "solid", fill_between: false, label_visible: false }],
+          gann_arcs: [{ value: 0.5, color: "#ff00ff", visible: true, style: "solid", fill_between: false, label_visible: false }],
+        }),
+        window.__chart.add_drawing("rotated_rectangle", [...anchors, { logical: l1, price: p_lo }], style),
+      ];
+    }, s);
+    expect(created.every((id) => id !== null && id !== undefined)).toBe(true);
+    await settle_frames(page);
+    const after = await capture(page);
+    expect(pixel_diff(before, after)).toBeGreaterThan(100);
+    const ink = count_color(after, [255, 0, 255], 8);
+    expect(ink).toBeGreaterThan(50);
+    expect((await drawings(page)).map((drawing) => drawing.kind)).toEqual([
+      "fibonacci_retracement", "gann_box", "gann_square", "rotated_rectangle",
+    ]);
+    painted.push(ink);
+  }
+  expect(painted[1] / painted[0]).toBeGreaterThan(0.8);
+  expect(painted[1] / painted[0]).toBeLessThan(1.2);
+});
+
 async function overlay_cursor(page) {
   return page.evaluate(() => {
     const canvases = document.querySelectorAll("#chart_container canvas");

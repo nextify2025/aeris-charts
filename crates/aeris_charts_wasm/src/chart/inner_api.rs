@@ -2907,6 +2907,13 @@ impl ChartInner {
             .drawing_kind_options_json(id)
             .unwrap_or_default()
     }
+    pub fn set_drawing_icon(&mut self, name: &str, width: u32, height: u32, pixels: &[u8]) -> bool {
+        self.engine
+            .set_drawing_icon(name, width, height, std::sync::Arc::from(pixels))
+    }
+    pub fn remove_drawing_icon(&mut self, name: &str) -> bool {
+        self.engine.remove_drawing_icon(name)
+    }
     pub fn drawing_object_tree_json(&self) -> String {
         self.engine.drawing_object_tree_json()
     }

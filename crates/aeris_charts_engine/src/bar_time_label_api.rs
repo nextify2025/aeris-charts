@@ -787,8 +787,15 @@ mod tests {
             chart.drawing_stat_lines(&drawing, 0, 1),
             [format!("{} – {}", printed(times[10]), printed(times[30]))]
         );
+        // Upstream's label path prints the same engine-formatted range on the frame.
+        assert!(text_prims(&mut chart).contains(&format!(
+            "{} – {}",
+            printed(times[10]),
+            printed(times[30])
+        )));
+        chart.remove_drawing(range);
 
-        // Forecast target time.
+        // Forecast target time (the fork's line above upstream's outcome label).
         chart
             .add_drawing(
                 DrawingKind::Forecast,

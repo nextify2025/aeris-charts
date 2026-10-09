@@ -382,6 +382,8 @@ pub(crate) enum NativeSeriesPrimitiveKind {
         options: TrendLineOptions,
     },
     VolumeProfileIndicator(Box<crate::volume_profile::VolumeProfileIndicatorState>),
+    PeriodicProfile(Box<crate::profiles::PeriodicProfilePresentationState>),
+    TpoProfile(Box<crate::profiles::TpoPresentationState>),
     VolumeProfile {
         data: VolumeProfileData,
         options: VolumeProfileOptions,
@@ -419,6 +421,14 @@ impl NativeSeriesPrimitive {
                 })
             }
             NativeSeriesPrimitiveKind::VolumeProfileIndicator(state) => state.capacity_bytes(),
+            NativeSeriesPrimitiveKind::PeriodicProfile(state) => {
+                state.request.boundaries.capacity()
+                    * core::mem::size_of::<crate::ResampleBoundary>()
+            }
+            NativeSeriesPrimitiveKind::TpoProfile(state) => {
+                state.request.boundaries.capacity()
+                    * core::mem::size_of::<crate::ResampleBoundary>()
+            }
             NativeSeriesPrimitiveKind::VolumeProfile { data, .. } => {
                 data.profile.capacity() * core::mem::size_of::<VolumeProfilePoint>()
             }

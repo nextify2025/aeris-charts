@@ -413,7 +413,8 @@ impl RasterImageCache {
         pixels.copy_within(last_row..last_row + row_bytes, last_row + row_bytes);
         let buffer = RgbaImage::from_raw(padded_width, padded_height, pixels)?;
         let image = Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)));
-        if self.entries.len() == 16 {
+        // A chart may show all 32 registered stamp images alongside depth and alert images.
+        if self.entries.len() == 64 {
             if let Some(oldest) = self
                 .entries
                 .iter()

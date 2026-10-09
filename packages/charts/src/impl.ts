@@ -45,7 +45,10 @@ import type {
   price_scale_info, price_scale_options, ring_source_layout,
   series_api, series_change_handler, series_data, series_kind, series_merge_columns, series_merge_data, series_update_options,
   series_marker, series_marker_options, series_options, single_value_data, size_change_handler, time, time_range,
-  replay_clock_stats, replay_seek_stats, synthetic_bar_options, trade_stream_stats,
+  replay_clock_stats, replay_seek_stats, resample_options, synthetic_bar_options, trade_stream_stats,
+  profile_source, profile_request, profile_snapshot, naked_profile_level, tpo_request, tpo_snapshot, tpo_presentation_options,
+  periodic_profile_presentation_request, periodic_profile_presentation_options,
+  anchored_vwap_point, profile_drawing_options, profile_drawing_snapshot,
   time_and_sales_options, time_and_sales_row, time_scale_api, time_scale_options, tracking_mode_options, trading_api, trading_execution, trading_hit,
   chart_sync_event, crosshair_sync_position,
   trading_intent, trading_intent_handler, trading_position, trading_preview, trading_snapshot,
@@ -55,13 +58,14 @@ import type {
   volume_profile_indicator_api, volume_profile_indicator_options, volume_profile_indicator_snapshot,
   time_label_context, time_zone,
   baseline_mode, histogram_updown_rule, kdj_parameters, session_slot_options, time_tick_mark, time_alignment,
-  resample_boundary, resample_boundary_options, resample_series_options, resample_stats, resampled_bar,
+  legacy_resample_boundary, resample_boundary, resample_boundary_options, resample_series_options, resample_stats, resampled_bar,
   trade_session_options, business_day,
 } from "./types.js";
 import {
-  DRAWING_KIND_TO_U8, FEATURE_KIND_TO_U8, KIND_TO_U8, LINE_STYLE_TO_U8, LINE_TYPE_TO_U8,
-  is_feature_series_kind, is_footprint_series_kind,
+  DRAWING_KIND_ALIASES, DRAWING_KIND_TO_U8, FEATURE_KIND_TO_U8, KIND_TO_U8, LINE_STYLE_TO_U8,
+  LINE_TYPE_TO_U8, is_feature_series_kind, is_footprint_series_kind,
 } from "./types.js";
+import type { drawing_kind_alias } from "./types.js";
 import { default_theme_name, theme_options, theme_palette, type theme_name } from "./theme.js";
 import {
   exchange_time_json, resolve_time_zone, split_exchange_time_options,
@@ -74,11 +78,19 @@ import {
 
 let init_promise: Promise<unknown> | null = null;
 
-// Wire ids are sparse (reserved per drawing family), so the reverse map derives from the single
-// DRAWING_KIND_TO_U8 list instead of an index-ordered array.
+// Wire ids are upstream's contiguous 0..84 plus the own-line block from 240, so the reverse map
+// derives from the single DRAWING_KIND_TO_U8 list instead of an index-ordered array. The table
+// holds canonical names only, so every kind the engine reports back is canonical.
 const DRAWING_KIND_FROM_U8: ReadonlyMap<number, drawing_kind> = new Map(
   (Object.entries(DRAWING_KIND_TO_U8) as [drawing_kind, number][]).map(([kind, wire]) => [wire, kind]),
 );
+
+/** The canonical catalog name of `kind`: a legacy fork spelling resolves through
+ * {@link DRAWING_KIND_ALIASES}; every other name is already canonical. */
+export function canonical_drawing_kind(kind: drawing_kind): Exclude<drawing_kind, drawing_kind_alias> {
+  const aliases: Readonly<Partial<Record<string, Exclude<drawing_kind, drawing_kind_alias>>>> = DRAWING_KIND_ALIASES;
+  return aliases[kind] ?? (kind as Exclude<drawing_kind, drawing_kind_alias>);
+}
 
 type persistence_error_result = {
   ok: false;
@@ -193,9 +205,9 @@ export function resample_boundaries(options: resample_boundary_options): resampl
   const boundaries: resample_boundary[] = [];
   for (let offset = 0; offset + 2 < flat.length; offset += 3) {
     boundaries.push({
-      start_time: flat[offset] ?? 0,
-      end_time: flat[offset + 1] ?? 0,
-      session_id: flat[offset + 2] ?? 0,
+      startTime: flat[offset] ?? 0,
+      endTime: flat[offset + 1] ?? 0,
+      sessionId: flat[offset + 2] ?? 0,
     });
   }
   return boundaries;
@@ -5747,28 +5759,70 @@ export class chart_impl implements chart_api {
     return series;
   }
 
-  configure_resampled_series(target: series_api | number, options: resample_series_options): void {
-    const id_of = (series: series_api | number | undefined) =>
-      series === undefined ? undefined : typeof series === "number" ? series : series.id;
-    const request = JSON.stringify({
-      source: id_of(options.source),
-      volume_source: id_of(options.volume_source),
-      volume_target: id_of(options.volume_target),
-      interval_seconds: options.interval_seconds,
-      boundaries: Array.from(options.boundaries ?? [], (boundary) => ({
-        start_time: boundary.start_time,
-        end_time: boundary.end_time,
-        session_id: boundary.session_id,
-      })),
-    });
-    const target_id = typeof target === "number" ? target : target.id;
-    const result = this.wasm.configure_resampled_series(target_id, request);
-    if (result !== "") throw new AerisChartsError("invalid_options", result);
+  configure_resampled_series(
+    source: series_api,
+    target: series_api,
+    options: resample_options,
+    volume_source?: series_api | null,
+    volume_target?: series_api | null,
+  ): void;
+  configure_resampled_series(target: series_api | number, options: resample_series_options): void;
+  configure_resampled_series(
+    first: series_api | number,
+    second: series_api | resample_series_options,
+    options?: resample_options,
+    volume_source?: series_api | null,
+    volume_target?: series_api | null,
+  ): void {
+    if (options !== undefined) {
+      // Upstream's form: live source and target handles plus camelCase options.
+      const source = first as series_api;
+      const target = second as series_api;
+      const all = [source, target, volume_source, volume_target].filter((series): series is series_api => series != null);
+      if (all.some((series) => this.series_by_id.get(series.id) !== series)) {
+        throw new AerisChartsError("invalid_handle", "resampling requires live series from this chart");
+      }
+      if (!this.wasm.configure_resampled_series_json(
+        source.id,
+        volume_source?.id ?? -1,
+        target.id,
+        volume_target?.id ?? -1,
+        JSON.stringify(options),
+      )) {
+        throw new AerisChartsError("invalid_options", "invalid resampling sources, targets, or UTC boundaries");
+      }
+    } else {
+      // The deprecated fork form: the options name the sources; boundaries are camelCase rows,
+      // and the legacy snake_case keys are still read.
+      const legacy = second as resample_series_options;
+      const id_of = (series: series_api | number | undefined) =>
+        series === undefined ? undefined : typeof series === "number" ? series : series.id;
+      const request = JSON.stringify({
+        source: id_of(legacy.source),
+        volume_source: id_of(legacy.volume_source),
+        volume_target: id_of(legacy.volume_target),
+        interval_seconds: legacy.interval_seconds,
+        boundaries: Array.from(legacy.boundaries ?? [], (boundary) => {
+          const row = boundary as Partial<resample_boundary> & Partial<legacy_resample_boundary>;
+          return {
+            start_time: row.startTime ?? row.start_time,
+            end_time: row.endTime ?? row.end_time,
+            session_id: row.sessionId ?? row.session_id,
+          };
+        }),
+      });
+      const target_id = typeof first === "number" ? first : first.id;
+      const result = this.wasm.configure_resampled_series(target_id, request);
+      if (result !== "") throw new AerisChartsError("invalid_options", result);
+    }
     this.sync_countdown_timer();
     this.repaint();
   }
 
   resampled_bars(target: series_api | number): readonly resampled_bar[] | null {
+    if (typeof target !== "number" && this.series_by_id.get(target.id) !== target) {
+      throw new AerisChartsError("invalid_handle", "resampling target must be a live series from this chart");
+    }
     const id = typeof target === "number" ? target : target.id;
     return JSON.parse(this.wasm.resampled_bars_json(id)) as resampled_bar[] | null;
   }
@@ -6048,6 +6102,96 @@ export class chart_impl implements chart_api {
     // gets real bounds on this frame instead of waiting for the next incidental repaint.
     this.repaint();
     return series;
+  }
+
+  volume_profile_snapshot(request: profile_request): profile_snapshot | null {
+    return JSON.parse(this.wasm.volume_profile_snapshot_json(JSON.stringify(request))) as profile_snapshot | null;
+  }
+
+  periodic_volume_profiles(
+    source: profile_source,
+    boundaries: readonly resample_boundary[],
+    tick_size: number,
+    row_count: number,
+    value_area_percent: number,
+  ): readonly profile_snapshot[] | null {
+    return JSON.parse(this.wasm.periodic_volume_profiles_json(
+      JSON.stringify(source), JSON.stringify(boundaries), tick_size, row_count, value_area_percent,
+    )) as profile_snapshot[] | null;
+  }
+
+  periodic_naked_profile_levels(
+    source: profile_source,
+    boundaries: readonly resample_boundary[],
+    tick_size: number,
+    row_count: number,
+    value_area_percent: number,
+  ): readonly naked_profile_level[] | null {
+    return JSON.parse(this.wasm.periodic_naked_profile_levels_json(
+      JSON.stringify(source), JSON.stringify(boundaries), tick_size, row_count, value_area_percent,
+    )) as naked_profile_level[] | null;
+  }
+
+  tpo_profiles(request: tpo_request): readonly tpo_snapshot[] | null {
+    return JSON.parse(this.wasm.tpo_profiles_json(JSON.stringify(request))) as tpo_snapshot[] | null;
+  }
+
+  add_tpo_presentation(request: tpo_request, options: Partial<tpo_presentation_options> = {}): number {
+    if (!this.series_by_id.has(request.priceSeries)) {
+      throw new AerisChartsError("invalid_handle", "TPO presentation requires a live source series from this chart");
+    }
+    const id = this.wasm.add_tpo_presentation(JSON.stringify(request), JSON.stringify(options));
+    if (id === 0) throw new AerisChartsError("invalid_options", "invalid TPO boundaries, options, or presentation limit");
+    this.repaint();
+    return id;
+  }
+
+  remove_tpo_presentation(id: number): boolean {
+    const removed = this.wasm.remove_native_primitive(id);
+    if (removed) this.repaint();
+    return removed;
+  }
+
+  add_periodic_profile_presentation(
+    anchor: series_api,
+    request: periodic_profile_presentation_request,
+    options: Partial<periodic_profile_presentation_options> = {},
+  ): number {
+    if (this.series_by_id.get(anchor.id) !== anchor) {
+      throw new AerisChartsError("invalid_handle", "periodic profile requires a live anchor series from this chart");
+    }
+    const id = this.wasm.add_periodic_profile_presentation(anchor.id, JSON.stringify(request), JSON.stringify(options));
+    if (id === 0) throw new AerisChartsError("invalid_options", "invalid periodic profile source, boundaries, options, or presentation limit");
+    this.repaint();
+    return id;
+  }
+
+  remove_periodic_profile_presentation(id: number): boolean {
+    const removed = this.wasm.remove_native_primitive(id);
+    if (removed) this.repaint();
+    return removed;
+  }
+
+  anchored_vwap(
+    source: profile_source,
+    start_timestamp_micros: number,
+    end_timestamp_micros: number,
+    band_multiplier: number,
+  ): readonly anchored_vwap_point[] | null {
+    return JSON.parse(this.wasm.anchored_vwap_json(
+      JSON.stringify(source), start_timestamp_micros, end_timestamp_micros, band_multiplier,
+    )) as anchored_vwap_point[] | null;
+  }
+
+  configure_profile_drawing(drawing: drawing_api, options: profile_drawing_options): void {
+    if (!this.wasm.configure_profile_drawing_json(drawing.id, JSON.stringify(options))) {
+      throw new AerisChartsError("invalid_options", "invalid profile drawing or source");
+    }
+    this.repaint();
+  }
+
+  profile_drawing_snapshot(drawing: drawing_api): profile_drawing_snapshot | null {
+    return JSON.parse(this.wasm.profile_drawing_snapshot_json(drawing.id)) as profile_drawing_snapshot | null;
   }
 
   add_sma(source: series_api, period: number, options?: Partial<series_options>): series_api {
@@ -6691,7 +6835,8 @@ export class chart_impl implements chart_api {
     options?: Partial<drawing_options>,
     pane_index = 0,
   ): drawing_api {
-    const wire_kind = DRAWING_KIND_TO_U8[kind];
+    const canonical = canonical_drawing_kind(kind);
+    const wire_kind = DRAWING_KIND_TO_U8[canonical];
     if (wire_kind === undefined) throw new AerisChartsError("invalid_data", `unknown drawing kind ${String(kind)}`);
     const { id } = drawing_result<{ id: number }>(this.wasm.add_drawing_result_json(
       wire_kind,
@@ -6700,7 +6845,7 @@ export class chart_impl implements chart_api {
       JSON.stringify(options ?? {}),
     ));
     this.repaint();
-    return new drawing_impl(this, id, kind, pane_index);
+    return new drawing_impl(this, id, canonical, pane_index);
   }
 
   set_drawings_points(updates: readonly drawing_points_update[]): number {
@@ -6767,6 +6912,19 @@ export class chart_impl implements chart_api {
     const value = this.wasm.drawing_kind_options_json(id);
     if (value === "") throw new AerisChartsError("stale_handle", "drawing has been removed");
     return JSON.parse(value) as drawing_kind_options;
+  }
+
+  register_drawing_icon(name: string, width: number, height: number, pixels: Uint8Array): void {
+    if (!this.wasm.set_drawing_icon(name, width, height, pixels)) {
+      throw new AerisChartsError("invalid_options", "drawing icon must be a named RGBA8 image of at most 96 by 96 pixels");
+    }
+    this.repaint();
+  }
+
+  remove_drawing_icon(name: string): boolean {
+    const removed = this.wasm.remove_drawing_icon(name);
+    if (removed) this.repaint();
+    return removed;
   }
 
   drawing_object_tree(): unknown[] {
@@ -6934,10 +7092,12 @@ export class chart_impl implements chart_api {
   }
 
   set_drawing_tool(
-    tool: drawing_kind | null,
+    requested: drawing_kind | null,
     options?: Partial<drawing_options>,
     pane_index?: number,
   ): void {
+    // Legacy fork spellings arm their canonical tool; listeners and the active tool report it.
+    const tool = requested === null ? null : canonical_drawing_kind(requested);
     const previous_tool = this.active_drawing_tool();
     const previous_pane_wire = Number(this.wasm.active_drawing_tool_pane());
     const previous_pane = previous_pane_wire >= 0 ? previous_pane_wire : null;

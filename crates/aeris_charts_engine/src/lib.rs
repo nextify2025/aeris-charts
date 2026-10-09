@@ -123,36 +123,29 @@ pub use drawings::kinds::lines::{DrawingStatsPosition, LineToolOptions};
 // B8: channels — begin
 pub use drawings::kinds::channels::ChannelToolOptions;
 // B8: channels — end
-// B8: fibonacci — begin
 pub use drawings::kinds::fibonacci::{
     FibonacciLabelHAlign, FibonacciLabelVAlign, FibonacciToolOptions,
 };
-// B8: fibonacci — end
-// B8: pitchforks_gann — begin
 pub use drawings::kinds::pitchforks_gann::{GannToolOptions, MAX_GANN_SQUARE_BARS};
-// B8: pitchforks_gann — end
 // B8: projection_annotations — begin
 pub use drawings::kinds::projection_annotations::{
-    BarsPatternMode, DrawingIcon, ProjectionAnnotationToolOptions, MAX_BARS_PATTERN_BARS,
+    BarsPatternMode, DrawingIcon, ProjectionAnnotationToolOptions,
 };
 // B8: projection_annotations — end
-// B8: patterns_elliott_cycles — begin
-pub use drawings::kinds::patterns_elliott_cycles::{ElliottWaveDegree, PatternToolOptions};
-// B8: patterns_elliott_cycles — end
-// B8: shapes — begin
-pub use drawings::kinds::shapes::ShapeToolOptions;
-// B8: shapes — end
 pub use bar_time_label_api::BarTimeLabel;
 pub use drawing_text_edit::DrawingTextEditKey;
+pub use drawings::kinds::patterns_elliott_cycles::{ElliottWaveDegree, PatternToolOptions};
+pub use drawings::kinds::shapes::ShapeToolOptions;
 pub use drawings::{
     Drawing, DrawingAnchor, DrawingCreationUpdate, DrawingDragPart, DrawingHit, DrawingId,
     DrawingKind, DrawingModifiers, DrawingPoint, DrawingPriceScale, DrawingTextEditLayout,
     DrawingWorkStats, TextCapCenterFn, TextMeasureFn, DRAWING_DEFAULT_COLOR,
-    DRAWING_WEAK_MAGNET_DISTANCE,
+    DRAWING_WEAK_MAGNET_DISTANCE, MAX_BARS_PATTERN_BARS, MAX_DRAWING_ICONS,
+    MAX_DRAWING_ICON_NAME_BYTES, MAX_DRAWING_ICON_SIZE,
 };
 pub(crate) use drawings::{
     DrawingAnchorTime, DrawingChartSettings, DrawingController, DrawingDrag, DrawingHistory,
-    DrawingRuntime,
+    DrawingIconRegistry, DrawingRuntime,
 };
 pub use external_studies::{
     ExternalStudyError, ExternalStudyInputRequirements, ExternalStudyInputStream,
@@ -253,9 +246,13 @@ pub use persistence::{
 };
 pub use profiles::{
     AnchoredVwapPoint, DevelopingValueArea, NakedProfileLevel, NakedProfileLevelKind,
+    PeriodicProfilePresentationOptions, PeriodicProfilePresentationRequest, ProfileDisplayMode,
     ProfileDrawingOptions, ProfileDrawingSnapshot, ProfileError, ProfileRequest,
-    ProfileRowSnapshot, ProfileSnapshot, ProfileSource, TpoRequest, TpoRowSnapshot, TpoSnapshot,
-    MAX_PROFILE_DEVELOPING_POINTS, MAX_PROFILE_PERIODS, MAX_PROFILE_ROWS, MAX_TPO_PERIODS,
+    ProfileRowSnapshot, ProfileSnapshot, ProfileSource, TpoCellMode, TpoPresentationOptions,
+    TpoRequest, TpoRowSnapshot, TpoSnapshot, MAX_PERIODIC_PROFILE_PRESENTATIONS,
+    MAX_PROFILE_DEVELOPING_POINTS, MAX_PROFILE_PERIODS, MAX_PROFILE_ROWS,
+    MAX_PROFILE_TOTAL_DEVELOPING_POINTS, MAX_PROFILE_TOTAL_ROWS, MAX_TPO_PERIODS,
+    MAX_TPO_PRESENTATIONS, MAX_TPO_TOTAL_CELLS, MAX_TPO_TOTAL_ROWS,
 };
 pub use resampling::{
     resample_boundaries, ResampleBoundary, ResampleError, ResampleOptions, ResampleSpan,
@@ -2175,6 +2172,7 @@ pub struct ChartEngine {
     /// Long/Short Position,
     /// text) in z-order, bottom first. See drawings.rs.
     drawings: Vec<Drawing>,
+    drawing_icons: DrawingIconRegistry,
     /// Derived, chart-local drawing bounds, pane candidates, and coordinate geometry. Semantic
     /// anchors and styles in `drawings` remain authoritative and are the only serialized state.
     drawing_runtime: RefCell<DrawingRuntime>,
@@ -2387,6 +2385,7 @@ impl ChartEngine {
             primitive_autoscale: Vec::new(),
             drawings: Vec::new(),
             drawing_runtime: RefCell::new(DrawingRuntime::default()),
+            drawing_icons: DrawingIconRegistry::default(),
             next_drawing_id: 1,
             selected_drawing: None,
             selected_drawings: Vec::new(),
@@ -3038,6 +3037,7 @@ impl ChartEngine {
             // The scale losing this source refits exactly under stable autoscale.
             self.reset_series_scale_stabilization(rid);
             self.drop_volume_profiles_using(rid);
+            self.drop_periodic_profiles_using(rid);
             if let Some(entry) = self.series.iter_mut().find(|s| s.id == rid) {
                 entry.removed = true;
                 entry.visible = false;
@@ -4398,10 +4398,7 @@ impl ChartEngine {
         &self,
         drawing: &Drawing,
     ) -> Vec<Option<DrawingAnchorTime>> {
-        let Some(points) = self
-            .sequence_points()
-            .filter(|_| !drawing.kind.pane_anchored())
-        else {
+        let Some(points) = self.sequence_points() else {
             return Vec::new();
         };
         drawing

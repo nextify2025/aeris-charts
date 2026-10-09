@@ -41,31 +41,6 @@ impl ChartInner {
             .map_or_else(|error| error.to_string(), |()| String::new())
     }
 
-    /// The derived bars of a resampled target as JSON (`null` when unbound); whitespace bars
-    /// carry `null` prices and volume.
-    pub(super) fn resampled_bars_json(&self, target: u32) -> String {
-        let Some(bars) = self.engine.resampled_bars(target) else {
-            return "null".to_string();
-        };
-        serde_json::Value::Array(
-            bars.iter()
-                .map(|bar| {
-                    serde_json::json!({
-                        "time": bar.timestamp,
-                        "session_id": bar.session_id,
-                        "open": bar.open,
-                        "high": bar.high,
-                        "low": bar.low,
-                        "close": bar.close,
-                        "volume": bar.volume,
-                        "source_rows": bar.source_rows,
-                    })
-                })
-                .collect(),
-        )
-        .to_string()
-    }
-
     pub(super) fn resample_stats_json(&self, target: u32) -> String {
         self.engine
             .resample_stats(target)
