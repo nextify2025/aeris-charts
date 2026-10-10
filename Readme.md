@@ -234,6 +234,6 @@ Aeris Charts 是开源软件，依据 [GNU Affero General Public License v3.0](L
 
 Aeris Charts 是独立设计和实现的。公开文档、公开示例以及对成熟图表产品的行为观察，仅用于了解常见的用户期望，并构建仅限开发用途的兼容性对比。这些参考资料不与 Aeris 共享引擎、渲染或状态管理实现。
 
-KLineChart 指标移植是例外：其公式转译自 [KLineChart](https://github.com/klinecharts/KLineChart) v10.0.3（Apache-2.0），并在 [NOTICE](NOTICE) 和模块文档中注明出处。
+例外有两项：KLineChart 指标移植的公式转译自 [KLineChart](https://github.com/klinecharts/KLineChart) v10.0.3（Apache-2.0）；图标戳和箭头标记的内置实心图标取自 [Phosphor Icons](https://github.com/phosphor-icons/core) v2.1.1 的 fill 字重（MIT）。两者都在 [NOTICE](NOTICE) 和模块文档中注明出处，npm 包也随附 `NOTICE`。
 
 开发测试通过 Lightweight Charts 的公共 API，将其作为固定版本的 Apache-2.0 依赖使用。该依赖不包含在已发布的 `@aeristerminal/aeris-charts` 包中。TradingView 和 Lightweight Charts 是其各自所有者的商标；Aeris Charts 与 TradingView 没有隶属关系，也未获得 TradingView 的认可。仓库中的第三方实现归属见 [NOTICE](NOTICE)。

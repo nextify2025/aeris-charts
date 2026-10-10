@@ -252,9 +252,9 @@ test("a text annotation's text spans lines: Shift+Enter stacks a line in its blo
   await page.keyboard.press("Shift+Enter");
   await page.keyboard.type("second");
   await expect.poll(() => text_of(page, id)).toBe("first\nsecond");
-  // The note is centered on its anchor: its block grows by half a line each way.
+  // The note's box hangs from its anchor: the first line stays and the box grows down a line.
   const grown = await edit_layout(page, id);
-  expect(grown.y).toBeCloseTo(before.y - before.line_height / 2, 3);
+  expect(grown.y).toBeCloseTo(before.y, 3);
   expect(grown.rect[3] - grown.rect[1]).toBeCloseTo(before.rect[3] - before.rect[1] + before.line_height, 3);
   await page.keyboard.press("Enter");
   await expect(editor).toHaveCount(0);
@@ -263,7 +263,7 @@ test("a text annotation's text spans lines: Shift+Enter stacks a line in its blo
   expect(await text_of(page, id), "one undo step").toBe("first");
 });
 
-test("placing a fork-look signpost opens its editor on its starter text; an upstream signpost opens none", async ({ page }) => {
+test("placing a signpost opens its editor: a fork-look one on its starter text, an upstream one empty and single-line", async ({ page }) => {
   await goto_fixture(page);
   const editor = page.locator(EDITOR);
   const range = await page.evaluate(() => window.__chart.time_scale().get_visible_logical_range());
@@ -276,26 +276,23 @@ test("placing a fork-look signpost opens its editor on its starter text; an upst
         ...(fork ? { tool_options: { projection_annotation: {} } } : {}),
       });
     }, fork);
-    for (const price of [b0.low, b0.high]) {
-      const point = await spot(page, l0, price);
-      await page.mouse.click(point.x, point.y);
-      await page.waitForTimeout(650);
-    }
+    // One click drops the signpost: its base on the clicked bar, its box above.
+    const point = await spot(page, l0, b0.low);
+    await page.mouse.click(point.x, point.y);
     await settle_frames(page);
     const id = await page.evaluate(() => window.__chart.drawings().at(-1)?.id);
-    if (!fork) {
-      await expect(editor).toHaveCount(0);
-      expect(await text_of(page, id)).toBe("");
-      continue;
-    }
+    expect(await page.evaluate(() => window.__chart.active_drawing_tool())).toBeNull();
     await expect(editor).toBeFocused();
-    expect(await editor.evaluate((el) => el.tagName)).toBe("TEXTAREA");
-    expect(await text_of(page, id)).toBe("Signpost");
-    await page.keyboard.type(" A");
-    await expect.poll(() => text_of(page, id)).toBe("Signpost A");
+    expect(await page.evaluate(() => window.__chart.wasm.editing_drawing())).toBe(id);
+    // The fork's plate keeps its lines; upstream's box is one line.
+    expect(await editor.evaluate((el) => el.tagName)).toBe(fork ? "TEXTAREA" : "DIV");
+    const starter = fork ? "Signpost" : "";
+    expect(await text_of(page, id)).toBe(starter);
+    await page.keyboard.type("A");
+    await expect.poll(() => text_of(page, id)).toBe(`${starter}A`);
     await page.keyboard.press("Enter");
     await expect(editor).toHaveCount(0);
-    expect(await text_of(page, id)).toBe("Signpost A");
+    expect(await text_of(page, id)).toBe(`${starter}A`);
   }
 });
 
@@ -660,7 +657,8 @@ async function place_with_tool(page, kind, tap) {
   const l0 = Math.floor(range.from + (range.to - range.from) * 0.4);
   const b0 = await page.evaluate((logical) => window.__main.data_by_index(logical), l0);
   const b1 = await page.evaluate((logical) => window.__main.data_by_index(logical), l0 + 4);
-  const spots = kind === "callout"
+  // The callout, the note, and the price note place two anchors; the others one.
+  const spots = ["callout", "note", "price_note"].includes(kind)
     ? [[l0, b0.low], [l0 + 4, b1.high]]
     : [[l0, b0.high]];
   await page.evaluate((kind) => {
@@ -722,20 +720,28 @@ for (const touch of [false, true]) {
       }
     });
 
-    test("placing a note or a price note opens its editor; Escape leaves an empty annotation removed", async ({ page }) => {
+    test("placing a note opens its editor and Escape removes it empty; a price note opens none", async ({ page }) => {
       await goto_fixture(page);
       const editor = page.locator(EDITOR);
-      for (const kind of ["note", "price_note"]) {
-        await place_with_tool(page, kind, tap(page));
-        const id = await page.evaluate(() => window.__chart.drawings().at(-1)?.id);
-        await expect(editor, kind).toBeFocused();
-        await expect(editor).toHaveAttribute("aria-label", `${kind.replaceAll("_", " ")} text`);
-        await page.keyboard.type("discarded");
-        await expect.poll(() => text_of(page, id)).toBe("discarded");
-        await page.keyboard.press("Escape");
-        await expect(editor).toHaveCount(0);
-        expect(await page.evaluate(() => window.__chart.drawings().length), kind).toBe(0);
-      }
+      await place_with_tool(page, "note", tap(page));
+      const id = await page.evaluate(() => window.__chart.drawings().at(-1)?.id);
+      await expect(editor, "note").toBeFocused();
+      await expect(editor).toHaveAttribute("aria-label", "note text");
+      await page.keyboard.type("discarded");
+      await expect.poll(() => text_of(page, id)).toBe("discarded");
+      await page.keyboard.press("Escape");
+      await expect(editor).toHaveCount(0);
+      expect(await page.evaluate(() => window.__chart.drawings().length), "note").toBe(0);
+      // A price note shows its price: no editor opens, and the drawing stays with an empty text.
+      await place_with_tool(page, "price_note", tap(page));
+      await expect(editor, "price note").toHaveCount(0);
+      expect(await page.evaluate(() => window.__chart.wasm.editing_drawing())).toBeUndefined();
+      const price_note = await page.evaluate(() => {
+        const drawing = window.__chart.drawings().at(-1);
+        return drawing && { id: drawing.id, kind: drawing.kind() };
+      });
+      expect(price_note?.kind).toBe("price_note");
+      expect(await text_of(page, price_note.id)).toBe("");
     });
 
     test("placing an arrow marker or a price label opens no editor", async ({ page }) => {

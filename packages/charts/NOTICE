@@ -1,8 +1,10 @@
-Aeris Charts
+@aeristerminal/aeris-charts
 Copyright (c) Aeris Charts contributors. Licensed under the GNU Affero General Public License,
 version 3 (see LICENSE).
 
-This repository includes work derived from third-party software:
+This package's WebAssembly module (dist/aeris_charts_wasm_bg.wasm) is built from the Aeris
+Charts repository and includes work derived from third-party software. The paths below name the
+repository sources it was built from.
 
 KLineChart v10.0.3 — https://github.com/klinecharts/KLineChart
 Copyright (c) 2019 lihu. Licensed under the Apache License, Version 2.0

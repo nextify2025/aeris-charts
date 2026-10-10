@@ -1050,8 +1050,9 @@ fn migrate_fork_anchors(
         }
         // Apex and projected price; the time horizon anchor (the sector radius) has no place.
         (DrawingKind::Projection, 3) => Some(vec![keep(0), keep(2)]),
-        // The priced point; the label offset anchor has no place.
-        (DrawingKind::PriceNote, 2) => Some(vec![keep(0)]),
+        // The priced point; the label offset anchor has no place. Upstream stores two anchors
+        // too (its tag and its line's end), so only a fork document converts.
+        (DrawingKind::PriceNote, 2) if legacy_fork => Some(vec![keep(0)]),
         // The pole's top starts at its foot.
         (DrawingKind::Signpost, 1) => Some(vec![keep(0), keep(0)]),
         // The box between the two anchors stays; the target places the first copied bar's close
@@ -1518,8 +1519,7 @@ impl ChartEngine {
                         icon_name: (drawing.kind == DrawingKind::IconStamp)
                             .then(|| drawing.icon_name.clone())
                             .flatten(),
-                        icon_size: (drawing.kind == DrawingKind::IconStamp)
-                            .then_some(drawing.icon_size),
+                        icon_size: drawing.kind.has_icon_size().then_some(drawing.icon_size),
                         bars_pattern: (drawing.kind == DrawingKind::BarsPattern)
                             .then(|| drawing.bars_pattern.clone()),
                         bars_pattern_mirror_x: (drawing.kind == DrawingKind::BarsPattern
@@ -2367,9 +2367,11 @@ impl ChartEngine {
                 drawing.icon_name = Some(name);
             }
             if let Some(size) = style.icon_size {
-                if drawing.kind != DrawingKind::IconStamp
+                if !drawing.kind.has_icon_size()
                     || !size.is_finite()
-                    || !(8.0..=96.0).contains(&size)
+                    || !(crate::drawings::MIN_DRAWING_ICON_DISPLAY_SIZE
+                        ..=crate::drawings::MAX_DRAWING_ICON_DISPLAY_SIZE)
+                        .contains(&size)
                 {
                     return Err(invalid(format!(
                         "drawing {} has invalid icon size",
@@ -6188,7 +6190,7 @@ mod tests {
         assert_eq!(chart.drawing(18).unwrap().wave_degree, "intermediate");
         let icon = chart.drawing(17).unwrap();
         assert_eq!(icon.icon_name.as_deref(), Some("heart"));
-        assert_eq!(icon.icon_size, 96.0);
+        assert_eq!(icon.icon_size, 120.0);
         // The fixed square's `reverse` lives in its downward corner: the fans and arcs keep
         // pivoting on the anchor, as the fork's did.
         assert!(!chart.drawing(5).unwrap().level_reverse);

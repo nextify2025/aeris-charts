@@ -35,7 +35,10 @@ const TOOLS = [
   "simple_tag",
   "simple_annotation",
 ];
-const ANCHORS = { projection: 2, forecast: 2, bars_pattern: 3, price_range: 2, date_range: 2, date_price_range: 2, callout: 2, signpost: 2 };
+const ANCHORS = { projection: 2, forecast: 2, bars_pattern: 3, price_range: 2, date_range: 2, date_price_range: 2, note: 2, price_note: 2, callout: 2, signpost: 2 };
+// Placement clicks where they differ from the anchor count: the signpost drops from one click
+// (its preset places the text box above the clicked bar).
+const CLICKS = { signpost: 1 };
 const PINK = [233, 30, 99]; // #e91e63 — collides with no fixture pixel
 
 test.beforeEach(async ({ page }) => {
@@ -131,9 +134,10 @@ test("every Projection & Annotations tool places through the armed-tool flow and
     const b0 = await bar(page, l0);
     const b1 = await bar(page, l0 + 4);
     const count = ANCHORS[kind] ?? 1;
-    const spots = count === 1
+    const clicks = CLICKS[kind] ?? count;
+    const spots = clicks === 1
       ? [[l0, b0.high]]
-      : count === 2
+      : clicks === 2
         ? [[l0, b0.low], [l0 + 4, b1.high]]
         : [[l0, b0.close], [l0 + 5, b0.close], [l0 + 4, b1.high]];
     await page.evaluate((kind) => {
@@ -498,7 +502,7 @@ test("price range stats and fills are selection targets with typed options", asy
     return window.__chart.drawing_property_schema(icon);
   });
   const size = icon_schema.properties.find((property) => property.name === "icon_size");
-  expect([size.min, size.max, size.default]).toEqual([8, 96, 24]);
+  expect([size.min, size.max, size.default]).toEqual([8, 256, 24]);
 });
 
 test("anchored text stays pinned to its screen position while the chart scrolls and drags in pane fractions", async ({ page }) => {
@@ -585,8 +589,9 @@ test("a callout edits its tip by pointer and its box by keyboard, and honors hid
   const start = await px();
   const start_points = await points();
 
-  // Pointer: the tip handle follows the pointer onto the bar slot under it at the raw price, and
-  // the box stays; one undo restores it.
+  // Pointer: the tip handle follows the pointer onto the bar slot and the 0.01 price tick under
+  // it, and the box stays; one undo restores it.
+  const tick_price_at = (y) => page.evaluate((y) => Math.round(window.__main.coordinate_to_price(y) * 100) / 100, y);
   await page.mouse.move(start[0].x, start[0].y);
   await page.mouse.down();
   await page.mouse.move(start[0].x - 20, start[0].y + 15, { steps: 4 });
@@ -597,7 +602,8 @@ test("a callout edits its tip by pointer and its box by keyboard, and honors hid
   const tip_bars = (await points())[0].logical - l0;
   expect(Number.isInteger(tip_bars)).toBe(true);
   expect(Math.abs(dragged[0].x - (start[0].x - 40))).toBeLessThanOrEqual(spacing / 2 + 1e-6);
-  expect(dragged[0].y).toBeCloseTo(start[0].y + 30, 2);
+  expect((await points())[0].price).toBeCloseTo(await tick_price_at(start[0].y + 30), 9);
+  expect(Math.abs(dragged[0].y - (start[0].y + 30))).toBeLessThan(1);
   expect((await points())[1]).toEqual(start_points[1]);
   expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
   expect(await points()).toEqual(start_points);
@@ -623,7 +629,8 @@ test("a callout edits its tip by pointer and its box by keyboard, and honors hid
   const keyed = await px();
   expect((await points())[1].logical).toBe(start_points[1].logical + 1);
   expect(keyed[1].x).toBeCloseTo(start[1].x + spacing, 2);
-  expect(keyed[1].y).toBeCloseTo(start[1].y - 10, 2);
+  expect((await points())[1].price).toBeCloseTo(await tick_price_at(start[1].y - 10), 9);
+  expect(Math.abs(keyed[1].y - (start[1].y - 10))).toBeLessThan(1);
   expect((await points())[0]).toEqual(start_points[0]);
   expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
   expect(await points()).toEqual(start_points);
@@ -693,6 +700,24 @@ test("the projection_annotation block brings back the fork look on upstream's re
     await remove(fork);
     const diff = pixelmatch(plain.data, forked.data, null, plain.width, plain.height, { threshold: 0 });
     expect(diff, `${kind} takes the fork look`).toBeGreaterThan(20);
+  }
+
+  // An icon stamp has no fork look (owner question Q1, answer A): its glyph follows its name
+  // alone, so the block changes nothing for a name the built-in solid suite shares (star) or one
+  // only the fork glyphs have (check).
+  for (const icon_name of ["star", "check"]) {
+    const options = { icon_name, icon_size: 40 };
+    const upstream = await add("icon_stamp", [[l0, b0.high]], options);
+    await settle_frames(page);
+    const plain = await capture(page);
+    await remove(upstream);
+    const fork = await add("icon_stamp", [[l0, b0.high]], { ...options, ...FORK });
+    await settle_frames(page);
+    const forked = await capture(page);
+    await remove(fork);
+    expect(color_extent(plain, PINK), `${icon_name} paints`).not.toBeNull();
+    const diff = pixelmatch(plain.data, forked.data, null, plain.width, plain.height, { threshold: 0 });
+    expect(diff, `${icon_name} stamp ignores the block`).toBe(0);
   }
 
   // A fork-look note is a pin: its head selects it, and its box shows while it is hovered.

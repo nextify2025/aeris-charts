@@ -28,7 +28,7 @@ import type {
   deep_partial, drawing_api, drawing_created_handler, drawing_info, drawing_kind, drawing_options,
   depth_event_columns, depth_event_layer_options, depth_heatmap_options, depth_ladder_row, depth_options, depth_snapshot_columns, depth_study_snapshot, depth_update_columns,
   drawing_point, drawing_point_input, drawing_points_update, drawing_price_segment, drawing_magnet_mode,
-  drawing_tool_change_handler, drawing_interval, drawing_property_schema, drawing_kind_options, drawing_template,
+  drawing_tool_change_handler, drawing_interval, drawing_property_schema, drawing_kind_options, drawing_template, builtin_drawing_icon,
   ema_ribbon_options, ema_ribbon_periods, kst_periods,
   fair_value_gap_options, order_block_options, structure_break_on, structure_zone_options, study_calendar_policy, previous_period,
   feature_series_kind, frame_stats,
@@ -7501,6 +7501,10 @@ export class chart_impl implements chart_api {
     return removed;
   }
 
+  builtin_drawing_icons(): builtin_drawing_icon[] {
+    return JSON.parse(this.wasm.builtin_drawing_icons_json()) as builtin_drawing_icon[];
+  }
+
   drawing_object_tree(): unknown[] {
     return JSON.parse(this.wasm.drawing_object_tree_json()) as unknown[];
   }
@@ -7753,9 +7757,10 @@ export class chart_impl implements chart_api {
     // One-shot disarming happened inside the engine controller; mirror that public state change.
     this.tool_listener?.(null);
     for (const handler of this.tool_change_subs) handler(null);
-    // The engine decides which tools start in the editor (the text tool and the annotation boxes
-    // that begin from a default text); the host presents the one its layout describes.
-    if (this.wasm.drawing_requests_text_edit(created_id)) this.edit_drawing_text(created_id, controller_owned);
+    // The engine decides which creations start in the editor (it opens the session for the text
+    // tool and the annotations that request typing); the host presents only a session the engine
+    // opened for this drawing, so a Ctrl/Cmd-drag duplicate of a text drawing opens no editor.
+    if (this.wasm.editing_drawing() === created_id) this.edit_drawing_text(created_id, controller_owned);
     return true;
   }
 
@@ -7833,7 +7838,7 @@ export class chart_impl implements chart_api {
     ink: string,
     label: string,
     multiline: boolean,
-  ): { wrap: HTMLDivElement; editor: HTMLElement; caret: HTMLSpanElement } {
+  ): { wrap: HTMLDivElement; editor: HTMLElement; caret: HTMLSpanElement; restart_caret_blink: () => void } {
     const wrap = document.createElement("div");
     wrap.id = "aeris_charts-text-editor";
     // The accessibility layer leaves this class reachable (it hides every other chart control).
@@ -7845,6 +7850,7 @@ export class chart_impl implements chart_api {
     // only carries the transparent caret overlay.
     wrap.style.border = "none";
     wrap.style.borderRadius = "0";
+    // The engine paints every box (text tool and annotations); the wrap adds no ink of its own.
     wrap.style.background = "transparent";
     wrap.style.padding = "0";
     wrap.style.outline = "none";
@@ -7890,22 +7896,50 @@ export class chart_impl implements chart_api {
     caret.setAttribute("aria-hidden", "true");
     caret.style.position = "absolute";
     caret.style.top = "0";
-    caret.style.width = "1px";
     caret.style.height = `${font_size * 1.2}px`;
+    // Browser 1 px rule semantics: whole device pixels, rounded down, at least one, so the bar
+    // keeps one thickness on the device-pixel positions the editors snap it to.
+    const dpr = window.devicePixelRatio || 1;
+    caret.style.width = `${Math.max(1, Math.floor(dpr)) / dpr}px`;
     caret.style.background = ink;
     caret.style.pointerEvents = "none";
+    // The platform caret rhythm: solid while typing or moving, then a 1.06 s blink. The editors
+    // restart it on every input, key, and pointer change.
+    const caret_blink = "aeris_charts-caret-blink 1.06s step-end infinite";
+    caret.style.animation = caret_blink;
+    const restart_caret_blink = () => {
+      caret.style.animation = "none";
+      void caret.offsetWidth;
+      caret.style.animation = caret_blink;
+    };
 
     // Selection is painted by the browser in a separate phase and can remain visible even when
     // the editable element itself is transparent. Suppress it locally so a selected/composing
     // label cannot place theme-colored blocks over the canonical canvas glyphs.
     const selection_style = document.createElement("style");
     selection_style.textContent =
-      "#aeris_charts-text-input::selection{background:transparent!important;color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:none!important}";
+      "#aeris_charts-text-input::selection{background:transparent!important;color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:none!important}" +
+      "@keyframes aeris_charts-caret-blink{0%{opacity:1}50%{opacity:0}}";
 
     wrap.appendChild(editor);
     wrap.appendChild(caret);
     wrap.appendChild(selection_style);
-    return { wrap, editor, caret };
+    return { wrap, editor, caret, restart_caret_blink };
+  }
+
+  /**
+   * Device-pixel snapping of overlay (container CSS px) positions, done in page space: the chart
+   * container itself may sit at a fractional page offset, so a value snapped in container space
+   * could still straddle two device pixels. The overlay is DOM, so the window's device pixel
+   * ratio applies, not a canvas ratio a host may have set.
+   */
+  private editor_pixel_snap(): { x: (value: number) => number; y: (value: number) => number } {
+    const dpr = window.devicePixelRatio || 1;
+    const container_box = this.container.getBoundingClientRect();
+    return {
+      x: (value) => Math.round((value + container_box.left) * dpr) / dpr - container_box.left,
+      y: (value) => Math.round((value + container_box.top) * dpr) / dpr - container_box.top,
+    };
   }
 
   /** The editor surface's text. */
@@ -8013,7 +8047,7 @@ export class chart_impl implements chart_api {
       `${edit.italic ? "italic " : ""}${edit.weight} ${edit.size}px ${edit.font_family}`;
     const font = font_of(layout);
     const font_size = layout.size;
-    const { wrap, editor, caret } = this.text_editor_surface(
+    const { wrap, editor, caret, restart_caret_blink } = this.text_editor_surface(
       options.text,
       font,
       font_size,
@@ -8022,8 +8056,6 @@ export class chart_impl implements chart_api {
       `${drawing.kind().replaceAll("_", " ")} text`,
       false,
     );
-    // Only the text tool paints a container behind its run.
-    if (mode === "standalone_text") wrap.style.background = options.box_color || "transparent";
 
     const dpr = window.devicePixelRatio || 1;
     const measure_ctx = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
@@ -8060,21 +8092,38 @@ export class chart_impl implements chart_api {
       probe_canvas.height = 0;
     }
     let baseline_in_editor = 0;
+    // An unrotated run puts the wrap and the caret on whole device pixels, so the one-device-pixel
+    // caret keeps one thickness wherever it moves; a rotated run keeps its exact transform.
+    let wrap_left = 0;
     const position_caret = () => {
+      const edit = layout!;
       const text = editor.textContent ?? "";
       const before_caret = text.slice(0, chart_impl.text_editor_caret_offset(editor));
       if (measure_ctx !== null) measure_ctx.font = font;
       const x = measure_ctx === null ? 0 : measure_ctx.measureText(before_caret).width;
-      caret.style.left = `${Math.ceil(x)}px`;
+      if (edit.angle === 0) {
+        caret.style.left = `${this.editor_pixel_snap().x(edit.x + x) - wrap_left}px`;
+        caret.style.height = `${Math.round(font_size * 1.2 * dpr) / dpr}px`;
+      } else {
+        caret.style.left = `${Math.ceil(x)}px`;
+        caret.style.height = `${font_size * 1.2}px`;
+      }
     };
     // The wrap's left-middle sits on the run's start point and rotates about it, so the DOM run
     // lies exactly on the painted one whatever its alignment or slope.
     const position_editor = () => {
       const edit = layout!;
       const middle = baseline_in_editor - baseline_drop;
-      wrap.style.left = `${edit.x}px`;
-      wrap.style.top = `${edit.y - middle}px`;
-      wrap.style.transformOrigin = `0px ${middle}px`;
+      let wrap_top = edit.y - middle;
+      wrap_left = edit.x;
+      if (edit.angle === 0) {
+        const snap = this.editor_pixel_snap();
+        wrap_left = snap.x(wrap_left);
+        wrap_top = snap.y(wrap_top);
+      }
+      wrap.style.left = `${wrap_left}px`;
+      wrap.style.top = `${wrap_top}px`;
+      wrap.style.transformOrigin = `${edit.x - wrap_left}px ${edit.y - wrap_top}px`;
       wrap.style.transform = `rotate(${edit.angle}rad)`;
       caret.style.background = edit.color;
       position_caret();
@@ -8114,8 +8163,13 @@ export class chart_impl implements chart_api {
       push_live_text();
       position_editor();
     };
-    editor.addEventListener("keyup", position_caret);
-    editor.addEventListener("pointerup", position_caret);
+    // Moving the caret or typing shows it solid, then the blink resumes.
+    const caret_moved = () => {
+      position_caret();
+      restart_caret_blink();
+    };
+    editor.addEventListener("keyup", caret_moved);
+    editor.addEventListener("pointerup", caret_moved);
 
     this.container.appendChild(wrap);
     const probe = document.createElement("span");
@@ -8138,7 +8192,10 @@ export class chart_impl implements chart_api {
     this.text_editor_reposition = () => {
       if (this.text_editor !== null) relayout();
     };
-    this.attach_text_editor(drawing, mode, editor, return_focus, set_width);
+    this.attach_text_editor(drawing, mode, editor, return_focus, () => {
+      set_width();
+      restart_caret_blink();
+    });
     position_caret();
   }
 
@@ -8160,7 +8217,7 @@ export class chart_impl implements chart_api {
     }
     const font_of = (edit: text_edit_layout) =>
       `${edit.italic ? "italic " : ""}${edit.weight} ${edit.size}px ${edit.font_family}`;
-    const { wrap, editor, caret } = this.text_editor_surface(
+    const { wrap, editor, caret, restart_caret_blink } = this.text_editor_surface(
       drawing.options().text ?? "",
       font_of(layout),
       layout.size,
@@ -8187,13 +8244,20 @@ export class chart_impl implements chart_api {
       const widest = lines.reduce((width, line) => Math.max(width, measure(line)), 0);
       editor.style.width = `${Math.ceil(Math.max(widest, edit.size)) + 1}px`;
       editor.style.height = `${lines.length * edit.line_height}px`;
-      wrap.style.left = `${edit.x}px`;
-      wrap.style.top = `${edit.y - edit.line_height / 2}px`;
+      // The wrap and the caret sit on whole device pixels, so the one-device-pixel caret keeps one
+      // thickness on every line and column.
+      const snap = this.editor_pixel_snap();
+      const top = edit.y - edit.line_height / 2;
+      const wrap_left = snap.x(edit.x);
+      const wrap_top = snap.y(top);
+      wrap.style.left = `${wrap_left}px`;
+      wrap.style.top = `${wrap_top}px`;
       const before = text.slice(0, chart_impl.text_editor_caret_offset(editor)).split("\n");
       const row = before.length - 1;
-      caret.style.left = `${Math.ceil(measure(before[row] ?? ""))}px`;
-      caret.style.top = `${row * edit.line_height + (edit.line_height - edit.size * 1.2) / 2}px`;
-      caret.style.height = `${edit.size * 1.2}px`;
+      const caret_top = top + row * edit.line_height + (edit.line_height - edit.size * 1.2) / 2;
+      caret.style.left = `${snap.x(edit.x + measure(before[row] ?? "")) - wrap_left}px`;
+      caret.style.top = `${snap.y(caret_top) - wrap_top}px`;
+      caret.style.height = `${snap.y(caret_top + edit.size * 1.2) - snap.y(caret_top)}px`;
       caret.style.background = edit.color;
     };
     const push_live_text = () => {
@@ -8204,8 +8268,13 @@ export class chart_impl implements chart_api {
       // The repaint relays the box out through `text_editor_reposition`.
       this.repaint();
     };
-    editor.addEventListener("keyup", position);
-    editor.addEventListener("pointerup", position);
+    // Moving the caret or typing shows it solid, then the blink resumes.
+    const caret_moved = () => {
+      position();
+      restart_caret_blink();
+    };
+    editor.addEventListener("keyup", caret_moved);
+    editor.addEventListener("pointerup", caret_moved);
     this.container.appendChild(wrap);
     position();
     this.text_editor_reposition = () => {
@@ -8218,7 +8287,10 @@ export class chart_impl implements chart_api {
       layout = fresh;
       position();
     };
-    this.attach_text_editor(drawing, "part_label", editor, return_focus, push_live_text);
+    this.attach_text_editor(drawing, "part_label", editor, return_focus, () => {
+      push_live_text();
+      restart_caret_blink();
+    });
     position();
   }
 

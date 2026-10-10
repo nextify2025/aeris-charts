@@ -51,7 +51,15 @@ pub(crate) struct DrawingTextEditSession {
     anchor: Option<usize>,
     /// Native hosts have no editable surface of their own, so the frame paints the caret.
     pub(crate) paint_caret: bool,
+    /// The painted caret's blink phase: shown, and the host-clock time of its next toggle.
+    /// Every edit or caret move shows it and restarts the cycle (`None` until the next tick
+    /// supplies the clock).
+    pub(crate) caret_shown: bool,
+    pub(crate) caret_toggle_ms: Option<f64>,
 }
+
+/// Half of the painted caret's blink cycle (the common platform 1.06 s rate).
+pub(crate) const CARET_BLINK_MS: f64 = 530.0;
 
 /// The engine's text rules for one session. A run label stays on one line (a run of line breaks
 /// becomes one space) and a text box or block keeps its line breaks (`\r\n` and `\r` become `\n`);
@@ -105,11 +113,11 @@ fn word_right(chars: &[char], caret: usize) -> usize {
     index
 }
 
-/// Whether an emptied `kind` is removed when its session ends: the text tool and the text
-/// annotations are their text, so an empty one has nothing left to show. (Upstream's lifecycle
-/// for the annotations; the fork kept emptied annotation boxes.)
-fn removes_when_empty(kind: DrawingKind) -> bool {
-    kind == DrawingKind::Text || kind.is_text_annotation()
+/// Whether an emptied `drawing` is removed when its session ends: the text tool and the text
+/// annotations ([`crate::Drawing::text_annotation`]) are their text, so an empty one has nothing
+/// left to show. A fork-form signpost keeps its emptied plate, as the fork did.
+fn removes_when_empty(drawing: &crate::Drawing) -> bool {
+    drawing.kind == DrawingKind::Text || drawing.text_annotation()
 }
 
 fn byte_index(text: &str, caret: usize) -> usize {
@@ -163,6 +171,8 @@ impl ChartEngine {
             text,
             anchor: None,
             paint_caret,
+            caret_shown: true,
+            caret_toggle_ms: None,
         });
         // The open session gives an empty label its caret slot, which changes its culling pad.
         self.update_drawing_runtime(id);
@@ -175,6 +185,43 @@ impl ChartEngine {
         self.drawing_text_edit
             .as_ref()
             .map(|session| (session.id, session.text.as_str(), session.caret))
+    }
+
+    /// Advance the engine-painted caret's blink on the host clock (from [`Self::input_tick`]).
+    /// The first tick after an edit starts the cycle; returns whether the caret toggled.
+    pub(crate) fn tick_drawing_text_caret(&mut self, now_ms: f64) -> bool {
+        let Some(session) = self
+            .drawing_text_edit
+            .as_mut()
+            .filter(|session| session.paint_caret)
+        else {
+            return false;
+        };
+        match session.caret_toggle_ms {
+            None => {
+                session.caret_toggle_ms = Some(now_ms + CARET_BLINK_MS);
+                false
+            }
+            Some(deadline) if now_ms >= deadline => {
+                // A stalled host resumes on the cycle instead of replaying missed toggles.
+                let missed = ((now_ms - deadline) / CARET_BLINK_MS).floor();
+                if missed % 2.0 == 0.0 {
+                    session.caret_shown = !session.caret_shown;
+                }
+                session.caret_toggle_ms = Some(deadline + (missed + 1.0) * CARET_BLINK_MS);
+                self.invalidate_frame_drawings();
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// When the engine-painted caret next toggles, while one is blinking.
+    pub(crate) fn drawing_text_caret_deadline_ms(&self) -> Option<f64> {
+        self.drawing_text_edit
+            .as_ref()
+            .filter(|session| session.paint_caret)
+            .and_then(|session| session.caret_toggle_ms)
     }
 
     /// A host with a native text input surface paints its own caret over the shared label.
@@ -214,6 +261,9 @@ impl ChartEngine {
         }
         session.anchor = Some(0);
         session.caret = len;
+        // The caret moved: it shows solid and restarts the blink.
+        session.caret_shown = true;
+        session.caret_toggle_ms = None;
         self.invalidate_frame_drawings();
         true
     }
@@ -385,9 +435,10 @@ impl ChartEngine {
     }
 
     /// Enter / blur: keep the typed text, trimmed. A change records one `Update` undo step and one
-    /// sync revision; an emptied text tool or text annotation (note, comment, callout, price note,
-    /// anchored text) is then removed (so the history reads Update, Delete), while every other
-    /// drawing keeps its emptied label or box. False while no session is open.
+    /// sync revision; an emptied text tool or text annotation (`Drawing::text_annotation`: the
+    /// note, comment, callout, upstream-form signpost, anchored text, and fork-form price note) is
+    /// then removed (so the history reads Update, Delete), while every other drawing keeps its
+    /// emptied label or box. False while no session is open.
     pub fn commit_drawing_text_edit(&mut self) -> bool {
         let Some(session) = self.drawing_text_edit.take() else {
             return false;
@@ -409,7 +460,7 @@ impl ChartEngine {
             }
             self.update_drawing_runtime(id);
             let drawing = &self.drawings[index];
-            if removes_when_empty(drawing.kind) && drawing.text.is_empty() {
+            if removes_when_empty(drawing) && drawing.text.is_empty() {
                 self.remove_drawing(id);
             }
         }
@@ -427,7 +478,7 @@ impl ChartEngine {
         let id = session.id;
         let mut remove = false;
         if let Some(drawing) = self.drawings.iter_mut().find(|drawing| drawing.id == id) {
-            remove = removes_when_empty(drawing.kind) && session.original.trim().is_empty();
+            remove = removes_when_empty(drawing) && session.original.trim().is_empty();
             drawing.text = session.original;
             drawing.revision = session.original_revision;
         }
@@ -456,6 +507,9 @@ impl ChartEngine {
         session.text = text.clone();
         session.caret = caret;
         session.anchor = anchor;
+        // Typing or moving the caret shows it solid and restarts the blink.
+        session.caret_shown = true;
+        session.caret_toggle_ms = None;
         let Some(drawing) = self.drawings.iter_mut().find(|drawing| drawing.id == id) else {
             self.drawing_text_edit = None;
             return false;
@@ -477,6 +531,7 @@ impl ChartEngine {
 mod tests {
     use super::*;
     use crate::drawings::DrawingPoint;
+    use aeris_charts_render::draw_list::Prim;
 
     fn chart_with(kind: DrawingKind, text: &str) -> (ChartEngine, DrawingId) {
         let mut chart = ChartEngine::new(800.0, 400.0, 1.0);
@@ -545,6 +600,125 @@ mod tests {
         assert_eq!(text(&chart, id).as_deref(), Some("Breakout now"));
         assert_eq!(chart.editing_drawing(), None);
         assert!(chart.drawing_text_edit().is_none());
+    }
+
+    #[test]
+    fn an_upstream_signpost_stays_one_line_and_the_other_boxes_keep_their_lines() {
+        // Upstream's signpost box is one line (R9 approved multi-line for the note, comment,
+        // callout, price note, and anchored text only): a pasted or typed line break becomes a
+        // space and its editor is single-line.
+        for (kind, multiline) in [
+            (DrawingKind::Signpost, false),
+            (DrawingKind::Note, true),
+            (DrawingKind::Comment, true),
+            (DrawingKind::Callout, true),
+            (DrawingKind::PriceNote, true),
+        ] {
+            let (mut chart, id) = chart_with(kind, "");
+            assert_eq!(
+                chart
+                    .drawing_text_edit_layout(id)
+                    .map(|layout| layout.multiline),
+                Some(multiline),
+                "{kind:?}"
+            );
+            assert!(chart.begin_drawing_text_edit(id, false), "{kind:?}");
+            assert!(chart.drawing_text_edit_insert("up\nnow"));
+            assert!(chart.set_drawing_text_edit("up\nnow\r\nthen", 13));
+            let expected = if multiline {
+                "up\nnow\nthen"
+            } else {
+                "up now then"
+            };
+            assert_eq!(chart.drawing_text_edit().map(|edit| edit.1), Some(expected));
+            assert!(chart.commit_drawing_text_edit());
+            assert_eq!(chart.drawing(id).unwrap().text, expected, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn family_box_and_multi_line_annotation_carets_blink_with_the_session() {
+        // Every engine-painted caret follows the blink phase: a family text box's (and a
+        // fork-form box's, painted by the same parts path) and a multi-line box annotation's.
+        for (kind, text) in [
+            (DrawingKind::SimpleAnnotation, "Boxed"),
+            (DrawingKind::Note, "first\nsecond"),
+        ] {
+            let (mut chart, id) = chart_with(kind, text);
+            let rules = |chart: &mut ChartEngine| {
+                chart.build_frame().panes[0]
+                    .main
+                    .iter()
+                    .filter(|prim| {
+                        matches!(prim, Prim::Rect { rect, .. } if rect.w == 1 && rect.h > 10)
+                    })
+                    .count()
+            };
+            let baseline = rules(&mut chart);
+            assert!(chart.begin_drawing_text_edit(id, true), "{kind:?}");
+            assert_eq!(rules(&mut chart), baseline + 1, "{kind:?} shown");
+            assert!(!chart.input_tick(1_000.0));
+            assert!(chart.input_tick(1_000.0 + CARET_BLINK_MS));
+            assert_eq!(
+                rules(&mut chart),
+                baseline,
+                "{kind:?} hidden in the off phase"
+            );
+            assert!(chart.input_tick(1_000.0 + 2.0 * CARET_BLINK_MS));
+            assert_eq!(rules(&mut chart), baseline + 1, "{kind:?} shown again");
+        }
+    }
+
+    #[test]
+    fn the_painted_caret_blinks_on_the_host_clock_and_restarts_solid_on_edits() {
+        let (mut chart, id) = chart_with(DrawingKind::Text, "Blink");
+        // The caret: one crisp 1 px rule the height of the line box, over the rules the chart
+        // paints without a session.
+        let rules = |chart: &mut ChartEngine| {
+            chart.build_frame().panes[0]
+                .main
+                .iter()
+                .filter(
+                    |prim| matches!(prim, Prim::Rect { rect, .. } if rect.w == 1 && rect.h > 10),
+                )
+                .count()
+        };
+        let baseline = rules(&mut chart);
+        let caret_rects = |chart: &mut ChartEngine| rules(chart) - baseline;
+        assert!(chart.begin_drawing_text_edit(id, true));
+        assert_eq!(caret_rects(&mut chart), 1);
+        // The first tick starts the cycle; the caret hides after half a period, then returns.
+        assert!(!chart.input_tick(1_000.0));
+        assert_eq!(
+            chart.input_wake_deadline_ms(),
+            Some(1_000.0 + CARET_BLINK_MS)
+        );
+        assert!(!chart.input_tick(1_000.0 + CARET_BLINK_MS - 1.0));
+        assert!(chart.input_tick(1_000.0 + CARET_BLINK_MS));
+        assert_eq!(caret_rects(&mut chart), 0, "hidden in the off phase");
+        assert!(chart.input_tick(1_000.0 + 2.0 * CARET_BLINK_MS));
+        assert_eq!(caret_rects(&mut chart), 1, "shown again");
+        // A stalled host resumes in phase: three missed toggles leave it hidden.
+        assert!(chart.input_tick(1_000.0 + 5.0 * CARET_BLINK_MS + 10.0));
+        assert_eq!(caret_rects(&mut chart), 0);
+        assert_eq!(
+            chart.input_wake_deadline_ms(),
+            Some(1_000.0 + 6.0 * CARET_BLINK_MS)
+        );
+        // Typing shows the caret solid and restarts the cycle from the next tick.
+        assert!(chart.drawing_text_edit_insert("!"));
+        assert_eq!(caret_rects(&mut chart), 1);
+        assert_eq!(chart.input_wake_deadline_ms(), None);
+        assert!(!chart.input_tick(5_000.0));
+        assert_eq!(
+            chart.input_wake_deadline_ms(),
+            Some(5_000.0 + CARET_BLINK_MS)
+        );
+        // A host that paints its own caret (the browser) needs no blink wakes.
+        assert!(chart.commit_drawing_text_edit());
+        assert!(chart.begin_drawing_text_edit(id, false));
+        assert!(!chart.input_tick(6_000.0));
+        assert_eq!(chart.input_wake_deadline_ms(), None);
     }
 
     #[test]

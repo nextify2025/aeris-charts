@@ -65,6 +65,7 @@ use conflation::{
     visible_histogram_rows_with_work, visible_line_rows, visible_line_rows_with_work,
     visible_ohlc_with_values, visible_ohlc_with_work,
 };
+pub(crate) use drawings::ChromeTokens;
 
 const UP: Color = Color::rgb(MARKET_UP_RGB.0, MARKET_UP_RGB.1, MARKET_UP_RGB.2);
 const DOWN: Color = Color::rgb(MARKET_DOWN_RGB.0, MARKET_DOWN_RGB.1, MARKET_DOWN_RGB.2);
@@ -498,6 +499,11 @@ struct RetainedPane {
     drawing_parts: Vec<RetainedDrawingPart>,
     drawing_preview_prim_start: usize,
     drawing_preview_point_start: usize,
+    /// Data-driven Long/Short Position progress (travelled fill + run line). Rebuilt with chrome
+    /// so series ticks never rebuild drawings, but emitted right after its owning drawing part so
+    /// it keeps that drawing's z-order instead of floating above every other drawing.
+    position_progress: RetainedLayer,
+    position_progress_parts: Vec<RetainedDrawingPart>,
     trading: RetainedLayer,
     overlay: RetainedLayer,
     top_layer: RetainedLayer,
@@ -566,6 +572,7 @@ impl RetainedFrame {
                     + layer_bytes(&pane.chrome)
                     + layer_bytes(&pane.trading_regions)
                     + layer_bytes(&pane.drawings)
+                    + layer_bytes(&pane.position_progress)
                     + layer_bytes(&pane.trading)
                     + layer_bytes(&pane.overlay)
                     + layer_bytes(&pane.top_layer)
@@ -576,6 +583,8 @@ impl RetainedFrame {
                         .map(|series| layer_bytes(&series.layer))
                         .sum::<usize>()
                     + pane.drawing_parts.capacity() * std::mem::size_of::<RetainedDrawingPart>()
+                    + pane.position_progress_parts.capacity()
+                        * std::mem::size_of::<RetainedDrawingPart>()
             })
             .sum::<usize>()
             + self.panes.capacity() * std::mem::size_of::<RetainedPane>()
@@ -1545,6 +1554,9 @@ impl ChartEngine {
 
     /// Build pane geometry without resetting work already recorded by host layout preparation.
     pub fn build_frame_into_accumulating(&mut self, output: &mut ChartFrame) {
+        // A captured freehand stroke's newest coalesced sample becomes a knot of this frame, so
+        // every host's brush draws live without a separate per-frame input call.
+        self.flush_coalesced_input();
         self.sync_frame_input_invalidation();
 
         let layout_dirty = self.retained_frame.layout_generation != self.frame_invalidation.layout;
@@ -1778,6 +1790,9 @@ impl ChartEngine {
                     .retain(|layer| resolved.iter().any(|rs| rs.id == layer.id));
                 cache.chrome.prims.clear();
                 cache.chrome.points.clear();
+                cache.position_progress.prims.clear();
+                cache.position_progress.points.clear();
+                cache.position_progress_parts.clear();
                 cache.top_layer.prims.clear();
                 cache.top_layer.points.clear();
                 if let Some((from, to)) = visible {
@@ -2088,8 +2103,9 @@ impl ChartEngine {
                     );
                     self.build_position_progress_frame(
                         pi,
-                        &mut cache.chrome.prims,
-                        &mut cache.chrome.points,
+                        &mut cache.position_progress.prims,
+                        &mut cache.position_progress.points,
+                        &mut cache.position_progress_parts,
                         hpr,
                         vpr,
                     );
@@ -2112,6 +2128,8 @@ impl ChartEngine {
                 self.build_position_labels_frame(pi, &mut cache.chrome.prims, hpr, vpr);
                 cache.chrome.revision = self.frame_invalidation.chrome;
                 cache.chrome.coordinate_revision = self.frame_invalidation.coordinate;
+                cache.position_progress.revision = self.frame_invalidation.chrome;
+                cache.position_progress.coordinate_revision = self.frame_invalidation.coordinate;
                 cache.top_layer.revision = self.frame_invalidation.chrome;
                 cache.top_layer.coordinate_revision = self.frame_invalidation.coordinate;
             }
@@ -2261,6 +2279,10 @@ impl ChartEngine {
                 cache.top_layer.coordinate_revision,
                 self.frame_invalidation.coordinate
             );
+            debug_assert_eq!(
+                cache.position_progress.coordinate_revision,
+                self.frame_invalidation.coordinate
+            );
             debug_assert!(
                 cache
                     .series_layers
@@ -2283,9 +2305,11 @@ impl ChartEngine {
             // The first retained build knows its exact assembled size. Reserve once so initial
             // historical installs pay one retained-to-contract copy, not repeated Vec growth.
             if initial_build {
+                // A position's progress overlay joins its drawing's segment in `main`.
                 let mut main_prims = cache.chrome.prims.len()
                     + cache.trading_regions.prims.len()
                     + cache.drawings.prims.len()
+                    + cache.position_progress.prims.len()
                     + cache.trading.prims.len()
                     + cache.overlay.prims.len();
                 let mut point_count = cache.under.points.len()
@@ -2293,6 +2317,7 @@ impl ChartEngine {
                     + cache.chrome.points.len()
                     + cache.trading_regions.points.len()
                     + cache.drawings.points.len()
+                    + cache.position_progress.points.len()
                     + cache.trading.points.len()
                     + cache.overlay.points.len();
                 point_count += cache.top_layer.points.len();
@@ -2393,13 +2418,33 @@ impl ChartEngine {
                         &mut out.main,
                         &mut out.points,
                     );
+                    // A position's progress overlay shares its drawing's z-slot and segment; the
+                    // segment revision covers both caches so retained backends see tick updates.
+                    let mut revision = cache.drawings.revision;
+                    if let Some(progress) = cache
+                        .position_progress_parts
+                        .iter()
+                        .find(|progress| progress.id == id)
+                    {
+                        append_drawing_part(
+                            &cache.position_progress.prims,
+                            &cache.position_progress.points,
+                            progress.prim_start,
+                            progress.prim_end,
+                            progress.point_start,
+                            progress.point_end,
+                            &mut out.main,
+                            &mut out.points,
+                        );
+                        revision = revision.max(cache.position_progress.revision);
+                    }
                     // Empty drawings (e.g. empty text) emit no prims — no segment needed.
                     if out.main.len() != start {
                         segments.push(FrameDrawingSegment {
                             drawing_id: Some(id),
                             start,
                             end: out.main.len(),
-                            revision: cache.drawings.revision,
+                            revision,
                             coordinate_revision: cache.drawings.coordinate_revision,
                         });
                     }

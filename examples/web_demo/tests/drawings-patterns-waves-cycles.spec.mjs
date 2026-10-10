@@ -121,6 +121,21 @@ async function overlay_cursor(page) {
   });
 }
 
+/**
+ * The points 12 to 40 CSS px above `vertex` (within 24 px either side, 4 px steps) where the
+ * drawing hovers: clear of the strokes that leave a high downward, so only its label hovers there.
+ */
+async function label_hovers_above(page, vertex) {
+  const hits = [];
+  for (let dy = 12; dy <= 40; dy += 4) {
+    for (let dx = -24; dx <= 24; dx += 4) {
+      await page.mouse.move(vertex.x + dx, vertex.y - dy);
+      if (await overlay_cursor(page) === "move") hits.push([dx, dy]);
+    }
+  }
+  return hits;
+}
+
 test("every pattern, wave, and cycle tool places through the armed-tool flow and paints", async ({ page }) => {
   // Fourteen tools, each on a fresh chart so its pixels are its own.
   test.setTimeout(60_000);
@@ -284,10 +299,10 @@ test("vertex labels, ratio labels, and labels of a wave without its line hover a
   const id = await page.evaluate(({ anchors }) => window.__chart.add_drawing("pattern_xabcd", anchors, { color: "#e91e63" }).id, { anchors });
   await settle_frames(page);
   const point = (index) => spot(page, anchors[index].logical, anchors[index].price);
-  // The A label sits 8 px above its high, clear of both legs below it.
+  // The A label sits above its high, in the opening between its legs and the A-C ratio connector
+  // (clear of every stroke that leaves A), so it hovers as the drawing there.
   const a = await point(1);
-  await page.mouse.move(a.x, a.y - 8);
-  await expect.poll(() => overlay_cursor(page)).toBe("move");
+  expect((await label_hovers_above(page, a)).length).toBeGreaterThan(2);
   await page.mouse.move(a.x, a.y - 60);
   await expect.poll(() => overlay_cursor(page)).not.toBe("move");
 
@@ -317,8 +332,7 @@ test("vertex labels, ratio labels, and labels of a wave without its line hover a
   }), { wave });
   await settle_frames(page);
   const one = await spot(page, wave[1].logical, wave[1].price);
-  await page.mouse.move(one.x, one.y - 8);
-  await expect.poll(() => overlay_cursor(page)).toBe("move");
+  expect((await label_hovers_above(page, one)).length).toBeGreaterThan(2);
   const w2 = await spot(page, wave[2].logical, wave[2].price);
   const w3 = await spot(page, wave[3].logical, wave[3].price);
   await page.mouse.move((w2.x + w3.x) / 2, (w2.y + w3.y) / 2);

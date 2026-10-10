@@ -19,7 +19,9 @@ use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::LineStyle;
 use aeris_charts_render::shape::{self, Point};
 
-use super::super::geometry::CURVE_TOLERANCE;
+use super::super::geometry::{
+    CURVE_TOLERANCE, VERTEX_LABEL_GAP_CSS, clear_label_center, clear_label_max_reach,
+};
 use super::super::parts::{DrawingParts, PartContext, PartLabel, PartStroke, text_on};
 use super::super::{Drawing, DrawingTextHAlign, DrawingTextVAlign};
 use crate::{ChartEngine, DrawingKind, DrawingPropertyDescriptor, DrawingPropertyType};
@@ -205,10 +207,6 @@ impl Default for PatternToolOptions {
 /// Region fill alpha over the drawing color when `fill_color` is unset: TradingView's pattern
 /// transparency of 85 %.
 const FILL_ALPHA: u8 = 38;
-/// Upstream's vertex label offset: the label's center sits this many CSS px above its vertex.
-const LABEL_OFFSET: f64 = 8.0;
-/// Gap between a vertex and the bottom of its label's degree ring, in CSS px.
-const RING_GAP: f64 = 6.0;
 /// Space between an Elliott label's glyphs and its degree ring, in CSS px.
 const RING_PADDING: f64 = 2.0;
 /// Ratio label box padding (horizontal, vertical) in CSS px.
@@ -584,9 +582,11 @@ fn ring_radius(width: f64, size: f64, scale: f64) -> f64 {
 }
 
 /// The vertex labels of `drawing` at its anchors `px` (caller px, `scale` caller px per CSS px),
-/// with their glyph size in caller px: upstream's placement, each run centered [`LABEL_OFFSET`]
-/// above its vertex, except that a ringed label rises until its ring clears the vertex by
-/// [`RING_GAP`]. Paint (the polyline arm), hit testing and the culling pad share it.
+/// with their glyph size in caller px: upstream's placement, each label clear of every stroke
+/// that leaves its vertex ([`clear_label_center`], [`VERTEX_LABEL_GAP_CSS`] from the vertex):
+/// the legs, the ratio connectors drawn from it, the head-and-shoulders neckline through it, and
+/// the triangle pattern's sides. A ringed label clears as its ring's square. Paint (the polyline
+/// arm), hit testing and the culling pad share it.
 pub(crate) fn vertex_labels(
     engine: &ChartEngine,
     drawing: &Drawing,
@@ -594,23 +594,76 @@ pub(crate) fn vertex_labels(
     scale: f64,
 ) -> (f64, Vec<VertexLabel>) {
     let size = engine.drawing_text_size(drawing) * scale;
+    let gap = VERTEX_LABEL_GAP_CSS * scale;
+    let neck = (drawing.kind == DrawingKind::PatternHeadShoulders)
+        .then(|| neckline(px))
+        .flatten();
+    let sides = match px {
+        [a, b, c, d, ..] if drawing.kind == DrawingKind::PatternTriangle => {
+            match triangle_apex(drawing, [*a, *b, *c, *d]) {
+                (Some(apex), true) => Some([(0, apex), (1, apex), (2, apex), (3, apex)]),
+                (None, true) => Some([(0, *c), (2, *a), (1, *d), (3, *b)]),
+                (_, false) => None,
+            }
+        }
+        _ => None,
+    };
+    // The ratio connectors `ratio_parts` draws.
+    let connectors = if options(drawing).show_ratios {
+        ratios(drawing.kind)
+    } else {
+        &[]
+    };
     let labels = vertex_label_texts(drawing)
         .filter_map(|(index, text, ring)| {
-            let (x, y) = *px.get(index)?;
-            if ring {
-                let radius = ring_radius(label_width(engine, drawing, &text, size), size, scale);
-                Some(VertexLabel {
-                    center: (x, y - (RING_GAP * scale + radius)),
-                    text,
-                    ring: Some(radius),
-                })
-            } else {
-                Some(VertexLabel {
-                    center: (x, y - LABEL_OFFSET * scale),
-                    text,
-                    ring: None,
-                })
+            let vertex = *px.get(index)?;
+            // At most the two legs, three connectors, the neckline's two ends, or one side.
+            let mut toward = [(0.0, 0.0); 8];
+            let mut count = 0;
+            let ends = index
+                .checked_sub(1)
+                .and_then(|prior| px.get(prior))
+                .into_iter()
+                .chain(px.get(index + 1))
+                .copied()
+                .chain(connectors.iter().filter_map(|&ratio| {
+                    ratio_value(drawing, ratio)?;
+                    match (ratio.from == index, ratio.to == index) {
+                        (true, _) => px.get(ratio.to).copied(),
+                        (_, true) => px.get(ratio.from).copied(),
+                        _ => None,
+                    }
+                }))
+                .chain(
+                    neck.filter(|_| matches!(index, 2 | 4))
+                        .into_iter()
+                        .flat_map(|(start, end)| [start, end]),
+                )
+                .chain(
+                    sides
+                        .into_iter()
+                        .flatten()
+                        .filter(|&(corner, _)| corner == index)
+                        .map(|(_, end)| end),
+                );
+            for end in ends.take(toward.len()) {
+                toward[count] = end;
+                count += 1;
             }
+            let toward = &toward[..count];
+            let width = label_width(engine, drawing, &text, size);
+            let radius = ring.then(|| ring_radius(width, size, scale));
+            let (box_width, box_height) = match radius {
+                Some(radius) => (2.0 * radius, 2.0 * radius),
+                None => (width, size * 1.2),
+            };
+            let center =
+                clear_label_center(vertex, toward, box_width, box_height, gap, (0.0, -1.0));
+            Some(VertexLabel {
+                center,
+                text,
+                ring: radius,
+            })
         })
         .collect();
     (size, labels)
@@ -638,8 +691,8 @@ pub(crate) fn ring_points(label: &VertexLabel, out: &mut Vec<Point>) {
 
 /// Conservative CSS-px reach beyond the anchors' box of what the polyline arm paints for a
 /// vertex-label kind (the culling pad, see [`super::upstream_decoration_extent`]): each vertex
-/// label (its offset above the vertex plus half a line, or its ring and the ring's hit tolerance)
-/// and each ratio label, centered on a connector inside the box, by half its measured width plus
+/// label (the farthest [`clear_label_center`] places it from its vertex plus half its box, or
+/// its ring and the ring's hit tolerance) and each ratio label, centered on a connector inside the box, by half its measured width plus
 /// padding. The ratios are measured from the drawing's own prices (the cache refreshes on every
 /// mutation): a near-flat reference leg prints a ratio of any width. 0 for other kinds.
 pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
@@ -654,9 +707,12 @@ pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing
                 // The ring's hit area reaches the stroke tolerance past its edge (at its widest,
                 // the touch profile the screen bounds assume).
                 let radius = ring_radius(width, size, 1.0);
-                RING_GAP + 2.0 * radius + crate::HitProfile::TOUCH.drawing_stroke_tolerance
+                clear_label_max_reach(2.0 * radius, 2.0 * radius, VERTEX_LABEL_GAP_CSS)
+                    + radius
+                    + crate::HitProfile::TOUCH.drawing_stroke_tolerance
             } else {
-                (LABEL_OFFSET + size * 1.25 / 2.0).max(width / 2.0)
+                clear_label_max_reach(width, size * 1.2, VERTEX_LABEL_GAP_CSS)
+                    + (size * 1.25 / 2.0).max(width / 2.0)
             }
         })
         .fold(0.0_f64, f64::max);

@@ -619,14 +619,60 @@ pub(crate) fn square_stats(
     ));
 }
 
-/// The culling pad (CSS px) of what the Gann arms paint past a grid's box (see
-/// `kinds::upstream_decoration_extent`): a box's time-level labels above it (the 8 CSS px gap
-/// and the label's height, half its width either side of its line), and the squares' stats box,
-/// a template of its widest lines plus four ems of slack, since a screen square's price range
-/// follows the viewport.
+/// The culling pad (CSS px) of what the pitchfork and Gann arms paint past their anchors (see
+/// `kinds::upstream_decoration_extent`): a pitchfork's level labels as far as
+/// `clear_label_center` steps them out, a Gann grid's border labels left of and under its box, a
+/// box's time-level labels above it (the 8 CSS px gap and the label's height, half its width
+/// either side of its line), and the squares' stats box, a template of its widest lines plus
+/// four ems of slack, since a screen square's price range follows the viewport.
 pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
     let layout = &engine.options.get().layout;
     let mut extent: f64 = 0.0;
+    // Upstream's level labels: a pitchfork's clear of its tine and base
+    // (`clear_label_center`), a Gann box's or square's on its border (the price left of the
+    // box, the time under it). Price text follows the scale's formatter between text-key
+    // refreshes, so four ems of slack cover it.
+    let pitchfork = matches!(
+        drawing.kind,
+        DrawingKind::AndrewsPitchfork
+            | DrawingKind::SchiffPitchfork
+            | DrawingKind::ModifiedSchiffPitchfork
+            | DrawingKind::InsidePitchfork
+            | DrawingKind::Pitchfan
+    );
+    let border = matches!(
+        drawing.kind,
+        DrawingKind::GannBox | DrawingKind::GannSquare | DrawingKind::GannSquareFixed
+    );
+    if pitchfork || border {
+        let size = layout.font_size;
+        let width = drawing
+            .levels
+            .iter()
+            .filter(|level| level.visible && level.label_visible)
+            .filter_map(|level| engine.drawing_level_label(drawing, level.value, None))
+            .map(|text| {
+                engine.measure_text_run(
+                    &text,
+                    size,
+                    &layout.font_family,
+                    drawing.text_weight.unwrap_or(400),
+                    drawing.text_italic,
+                )
+            })
+            .fold(0.0_f64, f64::max);
+        if width > 0.0 {
+            let width = width + 4.0 * size;
+            let gap = crate::drawings::POINT_LABEL_GAP_CSS;
+            extent = extent.max(if pitchfork {
+                crate::drawings::clear_label_max_reach(width, size * 1.2, gap)
+                    + width / 2.0
+                    + size * 0.6
+            } else {
+                (gap + width).max(gap + size * 1.2)
+            });
+        }
+    }
     for level in box_time_levels(drawing)
         .into_iter()
         .flatten()
@@ -735,7 +781,7 @@ pub(crate) fn derived_handles(
             point: shape::midpoint(b, c),
             part: DrawingDragPart::Handle(0),
             cursor: "pointer",
-            shape: HandleShape::Disc,
+            shape: HandleShape::Round,
         });
     } else if drawing.kind == DrawingKind::GannSquareFixed {
         let (Some(&pivot), Some(&second)) = (px.first(), px.get(1)) else {
@@ -754,7 +800,7 @@ pub(crate) fn derived_handles(
             point: corner,
             part: DrawingDragPart::Handle(0),
             cursor,
-            shape: HandleShape::Disc,
+            shape: HandleShape::Round,
         };
         match handles
             .iter_mut()
@@ -800,18 +846,45 @@ pub(crate) fn drag_handle(
         // pointer crosses a bar; a keyboard target moved whole bars from the midpoint, so
         // rounding only drops the px round trip's noise. The prices follow the px move, and a
         // time-snapped pitchfork keeps both on the data.
+        // The prices shift by whole ticks the same way (B and C keep their own tick offsets);
+        // a keyboard step moves at least one tick the way the key points. Without a tick the
+        // prices follow the px move.
         let (&b, &c) = (sample.start_px.get(1)?, sample.start_px.get(2)?);
-        let dy = sample.target_px.1 - shape::midpoint(b, c).1;
+        let middle = shape::midpoint(b, c);
+        let dy = sample.target_px.1 - middle.1;
         let (start_b, start_c) = (sample.start_points.get(1)?, sample.start_points.get(2)?);
         let offset = sample.target.logical - (start_b.logical + start_c.logical) / 2.0;
         let shift = match sample.keyboard_step {
             Some(_) => offset.round(),
             None => offset.trunc(),
         };
+        let price_shift = engine
+            .drawing_from_px_for(drawing.pane_index, drawing.price_scale, middle.0, middle.1)
+            .and_then(|from| {
+                let tick = engine.position_price_tick_at(
+                    drawing.pane_index,
+                    drawing.price_scale,
+                    from.price,
+                )?;
+                let mut ticks = ((sample.target.price - from.price) / tick).round();
+                if let Some((_, key_y)) = sample.keyboard_step
+                    && key_y != 0.0
+                    && ticks == 0.0
+                {
+                    // Screen y grows downward: an up key raises the price.
+                    ticks = -key_y.signum();
+                }
+                Some(ticks * tick)
+            });
         let moved = |start: &DrawingPoint, (x, y): Point| {
-            let price = engine
-                .drawing_from_px_for(drawing.pane_index, drawing.price_scale, x, y + dy)?
-                .price;
+            let price = match price_shift {
+                Some(shift) => start.price + shift,
+                None => {
+                    engine
+                        .drawing_from_px_for(drawing.pane_index, drawing.price_scale, x, y + dy)?
+                        .price
+                }
+            };
             let point = DrawingPoint {
                 logical: start.logical + shift,
                 price,

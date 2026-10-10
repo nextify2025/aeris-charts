@@ -5,10 +5,12 @@
 //! default omission, clipboard, and sync.
 
 use aeris_charts_render::color::Color;
-use aeris_charts_render::draw_list::{IRect, LineStyle, Prim};
+use aeris_charts_render::draw_list::{IRect, LineStyle, Prim, TextAlign};
 use aeris_charts_render::shape;
 
 use super::super::super::DrawingTextLayout;
+use super::super::super::geometry::POINT_LABEL_GAP_CSS;
+use super::super::super::tests::{on_tick, painted_handle_centers, snapped_handle_center};
 use super::{GannToolOptions, MEDIAN_COLOR};
 use crate::{
     ChartEngine, DrawingAnchor, DrawingDragPart, DrawingId, DrawingKind, DrawingMagnetMode,
@@ -312,11 +314,14 @@ fn armed_tools_place_every_kind_with_a_guide_between_clicks() {
             if index == 1 && clicks.len() == 3 {
                 // Between the first and second click of a three-anchor tool the placed anchor
                 // and the preview join in a guide in the drawing's stroke; both ends sit on the
-                // bar slots under the pointer, at the raw prices.
+                // bar slots under the pointer, on the price ticks.
                 chart.drawing_tool_pointer_move(x, y, DrawingModifiers::default(), false);
                 let slot = |(x, y): (f64, f64)| {
                     let logical = chart.coordinate_to_logical(x).unwrap().round();
-                    (chart.logical_to_coordinate(logical).unwrap(), y)
+                    (
+                        chart.logical_to_coordinate(logical).unwrap(),
+                        on_tick(&chart, y),
+                    )
                 };
                 let (from, to) = (slot(clicks[0]), slot((x, y)));
                 let guide = polylines(&mut chart, INK);
@@ -856,6 +861,14 @@ fn gann_box_time_levels_split_the_axes() {
     assert!(labels.iter().any(|(text, x, y)| text.starts_with("0.5 ")
         && (f64::from(*x) - x_at(0.5)).abs() < 1e-3
         && (f64::from(*y) - (top - 8.0)).abs() < 1e-3));
+    // The time levels own the time labels: no price level labels a time under the box.
+    let bottom = a.1.max(b.1);
+    assert!(
+        labels
+            .iter()
+            .all(|(_, _, y)| f64::from(*y) <= bottom + 1e-3),
+        "{labels:?}"
+    );
     // A box just left of the view whose time label alone reaches into it stays a culling
     // candidate.
     let left = add(
@@ -869,25 +882,36 @@ fn gann_box_time_levels_split_the_axes() {
     assert!(at_x(&chart, -2.0) < -25.0);
     assert!(chart.take_drawing_candidates(0, None).contains(&left));
     chart.remove_drawing(left);
-    // A split box's price level past [0, 1] keeps upstream's label at the diagonal point, and
-    // the box stays a candidate while only that label is in view.
+    // A split box's price level past [0, 1] keeps upstream's border label, left of the box's
+    // left edge at the level's height, and a box just right of the view stays a candidate while
+    // only that label is in view.
     let mut hidden_label = level_json(0.0, "#00aa00", false, "");
     hidden_label["label_visible"] = serde_json::json!(false);
+    let left_edge = chart.pane_w + 10.0;
+    let zero = at_x(&chart, 0.0);
+    let start = (left_edge - zero) / (at_x(&chart, 1.0) - zero);
     let beyond = add(
         &mut chart,
         DrawingKind::GannBox,
-        vec![p(-20.0, 101.0), p(-4.0, 105.0)],
+        vec![p(start, 101.0), p(start + 16.0, 105.0)],
         &serde_json::json!({"levels": [level_json(1.5, "#0000aa", false, "")],
             "level_show_values": true,
             "tool_options": {"gann": {"time_levels": [hidden_label]}}})
         .to_string(),
     );
-    let label_x = at_x(&chart, 4.0);
-    assert!(at_x(&chart, -4.0) < -25.0 && label_x > 25.0);
+    let (first, second) = (anchor(&chart, beyond, 0), anchor(&chart, beyond, 1));
+    assert!((first.0 - left_edge).abs() < 1e-3 && first.0 > chart.pane_w);
+    let label = (
+        first.0 - POINT_LABEL_GAP_CSS,
+        first.1 + (second.1 - first.1) * 1.5,
+    );
     assert!(
         texts(&mut chart)
             .iter()
-            .any(|(text, x, _)| text.starts_with("1.5 ") && (f64::from(*x) - label_x).abs() < 1e-3)
+            .any(|(text, x, y)| text.starts_with("1.5 ")
+                && (f64::from(*x) - label.0).abs() < 1e-3
+                && (f64::from(*y) - label.1).abs() < 1e-3),
+        "{label:?}"
     );
     assert!(chart.take_drawing_candidates(0, None).contains(&beyond));
     chart.remove_drawing(beyond);
@@ -1230,8 +1254,8 @@ fn fixed_gann_square_scale_ratio_fixes_the_price_side() {
 }
 
 /// A pitchfork's (and the pitchfan's) fourth handle sits on its base midpoint between B and C,
-/// paints with the anchors' discs, and moves B and C together by pointer (one undo step, magnet
-/// snapped) and by keyboard.
+/// paints with the anchors' handles, and moves B and C together by pointer (one undo step, magnet
+/// snapped) and by keyboard, by whole bars and whole price ticks.
 #[test]
 fn a_pitchfork_base_midpoint_handle_moves_both_handle_anchors() {
     let mut chart = chart();
@@ -1246,15 +1270,31 @@ fn a_pitchfork_base_midpoint_handle_moves_both_handle_anchors() {
         );
         let base = mid(b, c);
         assert_eq!(chart.drawing_handle_count(id), Some(4), "{kind:?}");
-        let frame = chart.build_frame();
         assert!(
-            frame.panes[0].main.iter().any(|prim| matches!(
-                prim,
-                Prim::Circle { cx, cy, .. }
-                    if close((f64::from(*cx), f64::from(*cy)), base, 1e-3)
-            )),
+            painted_handle_centers(&chart.build_frame())
+                .into_iter()
+                .any(|center| close(center, snapped_handle_center(base), 1e-3)),
             "{kind:?} paints the base handle"
         );
+        // B and C shift by the whole ticks nearest the midpoint's price move.
+        let tick = chart
+            .position_price_tick(0, DrawingPriceScale::Right)
+            .unwrap();
+        let tick_shift = |chart: &ChartEngine, dy: f64| {
+            let price = |y: f64| chart.pane_coordinate_to_price(0, y).unwrap();
+            ((price(base.1 + dy) - price(base.1)) / tick).round() * tick
+        };
+        let assert_shifted = |chart: &ChartEngine, shift: f64, what: &str| {
+            let points = &chart.drawing(id).unwrap().points;
+            for index in [1, 2] {
+                assert!(
+                    (points[index].price - (before[index].price + shift)).abs() < 1e-9,
+                    "{kind:?} {what}: anchor {index} {} vs {}",
+                    points[index].price,
+                    before[index].price + shift
+                );
+            }
+        };
         let hit = chart.hit_test_drawing(base.0, base.1).unwrap();
         assert_eq!(
             (hit.part, hit.cursor),
@@ -1262,14 +1302,15 @@ fn a_pitchfork_base_midpoint_handle_moves_both_handle_anchors() {
             "{kind:?}"
         );
         // A pointer drag translates B and C by the midpoint's move in whole bars (13 px lands
-        // on the next 20 px slot) and by the raw vertical delta, as one undo step.
+        // on the next 20 px slot) and whole ticks, as one undo step.
         assert_eq!(chart.bar_spacing(), 20.0);
         assert!(chart.drawing_drag_start_at(base.0, base.1));
         chart.drawing_drag_to(base.0 + 13.0, base.1 - 12.0, DrawingModifiers::default());
         chart.drawing_drag_end();
         assert!(close(anchor(&chart, id, 0), a, 1e-9), "{kind:?}");
-        assert!(close(anchor(&chart, id, 1), (b.0 + 20.0, b.1 - 12.0), 1e-3));
-        assert!(close(anchor(&chart, id, 2), (c.0 + 20.0, c.1 - 12.0), 1e-3));
+        assert_shifted(&chart, tick_shift(&chart, -12.0), "pointer");
+        assert!((anchor(&chart, id, 1).0 - (b.0 + 20.0)).abs() < 1e-3);
+        assert!((anchor(&chart, id, 2).0 - (c.0 + 20.0)).abs() < 1e-3);
         let after = chart.drawing(id).unwrap().points.clone();
         assert_eq!(
             (after[1].logical, after[2].logical),
@@ -1280,8 +1321,9 @@ fn a_pitchfork_base_midpoint_handle_moves_both_handle_anchors() {
         assert_eq!(chart.drawing(id).unwrap().points, before);
         // Keyboard: the fourth handle nudges the base the same way.
         assert!(chart.nudge_selected_drawing(0.0, 10.0, Some(3)));
-        assert!(close(anchor(&chart, id, 1), (b.0, b.1 + 10.0), 1e-3));
-        assert!(close(anchor(&chart, id, 2), (c.0, c.1 + 10.0), 1e-3));
+        assert_shifted(&chart, tick_shift(&chart, 10.0), "keyboard");
+        assert!((anchor(&chart, id, 1).0 - b.0).abs() < 1e-3);
+        assert!((anchor(&chart, id, 2).0 - c.0).abs() < 1e-3);
         assert!(close(anchor(&chart, id, 0), a, 1e-9));
         assert!(chart.undo_drawing());
         // A cancelled drag restores the anchors.
@@ -2036,14 +2078,25 @@ fn restored_geometry_scales_with_the_device_pixel_ratio() {
         );
         chart.set_selected_drawing(Some(fork));
         let base = mid(anchor(&chart, fork, 1), anchor(&chart, fork, 2));
+        // The handle is one square of whole device pixels (12 CSS px at this ratio, rounded)
+        // whose corner snaps to the device grid around the base midpoint's device position.
+        let side = (12.0 * vpr).round();
+        let snapped = |center: f64| (center - side / 2.0).round() + side / 2.0;
+        let expected = (snapped(base.0 * hpr), snapped(base.1 * vpr));
         let frame = chart.build_frame();
         assert!(
             frame.panes[0].main.iter().any(|prim| matches!(
-                prim,
-                Prim::Circle { cx, cy, .. }
-                    if close((f64::from(*cx), f64::from(*cy)), (base.0 * hpr, base.1 * vpr), 1e-2)
+                *prim,
+                Prim::RoundRect { x, y, w, h, .. }
+                    if f64::from(w) == side
+                        && f64::from(h) == side
+                        && close(
+                            (f64::from(x) + side / 2.0, f64::from(y) + side / 2.0),
+                            expected,
+                            1e-3,
+                        )
             )),
-            "dpr {dpr}: the base handle"
+            "dpr {dpr}: the base handle at {expected:?}"
         );
         chart.remove_drawing(fork);
 
@@ -2060,5 +2113,230 @@ fn restored_geometry_scales_with_the_device_pixel_ratio() {
         assert_eq!(lines.len(), 1, "dpr {dpr}");
         assert!((lines[0].0[0].0 - x).abs() < 1e-3 && (lines[0].1 - vpr as f32).abs() < 1e-5);
         chart.remove_drawing(gann_box);
+    }
+}
+
+/// A Gann fan's rays run to the pane's right edge, so their level labels sit inside it, at the
+/// ray's end under the edge and lifted clear of the ray, never pushed past the pane (upstream's
+/// beside-the-end placement would put them off it).
+#[test]
+fn gann_fan_ray_labels_stay_inside_the_pane() {
+    let mut chart = chart();
+    let levels = [0.5, 1.0, 2.0].map(|value| level_json(value, INK, false, ""));
+    let id = add(
+        &mut chart,
+        DrawingKind::GannFan,
+        vec![p(30.0, 101.0), p(34.0, 101.5)],
+        &serde_json::json!({"fill_enabled": false, "levels": levels}).to_string(),
+    );
+    let (pane_w, pane_h) = (chart.pane_w, chart.pane_h);
+    let size = chart.options.get().layout.font_size;
+    // Every ray reaches the right edge inside the pane.
+    let rays = polylines(&mut chart, INK);
+    assert_eq!(rays.len(), 3);
+    for (ray, ..) in &rays {
+        let end = ray[ray.len() - 1];
+        assert!(
+            end.0 >= pane_w - 0.5 && end.1 > 0.0 && end.1 < pane_h,
+            "{ray:?}"
+        );
+    }
+    let frame = chart.build_frame();
+    let mut labels = Vec::new();
+    for prim in &frame.panes[0].main {
+        let Prim::Text {
+            text, x, y, align, ..
+        } = prim
+        else {
+            continue;
+        };
+        // The headless measure is 0.6 em per character.
+        let width = text.chars().count() as f64 * size * 0.6;
+        let left = match align {
+            TextAlign::Left => f64::from(*x),
+            TextAlign::Center => f64::from(*x) - width / 2.0,
+            TextAlign::Right => f64::from(*x) - width,
+        };
+        assert!(
+            left >= 0.0 && left + width <= pane_w,
+            "{text:?} spans {left}..{} in a {pane_w} px pane",
+            left + width
+        );
+        assert!(f64::from(*y) > 0.0 && f64::from(*y) < pane_h, "{text:?}");
+        labels.push(text.clone());
+    }
+    assert_eq!(labels.len(), 3, "one label per ray: {labels:?}");
+    assert!(chart.remove_drawing(id));
+}
+
+/// A Gann box or square lying wholly over the pane, past the touch slop every drawing's bounds
+/// get, labels its price levels' times under its bottom border, so only those labels reach down
+/// into the pane: it stays a candidate on the indexed path (more than 20 drawings) so they paint.
+#[test]
+fn a_gann_grid_over_the_pane_stays_a_candidate_while_its_border_labels_reach_into_it() {
+    use aeris_charts_core::model::price_range::PriceRange;
+    let mut chart = chart();
+    // A large chart font makes the labels tall.
+    chart
+        .apply_options(r#"{"layout":{"fontSize":24}}"#)
+        .unwrap();
+    for index in 0..22 {
+        add(
+            &mut chart,
+            DrawingKind::TrendLine,
+            vec![p(2.0 + f64::from(index) * 0.1, 105.0), p(3.0, 105.5)],
+            "{}",
+        );
+    }
+    chart.panes[0].price_scale.set_auto_scale(false);
+    chart.panes[0]
+        .price_scale
+        .set_price_range(Some(PriceRange::new(100.0, 110.0)));
+    chart.build_frame();
+    let top = chart.panes[0].top;
+    let price = |chart: &ChartEngine, y: f64| chart.pane_coordinate_to_price(0, y).unwrap();
+    for kind in [DrawingKind::GannBox, DrawingKind::GannSquare] {
+        let over = vec![
+            p(10.0, price(&chart, top - 26.0)),
+            p(20.0, price(&chart, top - 120.0)),
+        ];
+        let grid = add(
+            &mut chart,
+            kind,
+            over,
+            &serde_json::json!({"levels": [level_json(0.5, "#0000aa", false, "")],
+                "level_show_values": true})
+            .to_string(),
+        );
+        for index in 0..2 {
+            assert!(
+                anchor(&chart, grid, index).1 < top - 25.0,
+                "{kind:?}: anchor {index} is over the pane"
+            );
+        }
+        assert!(
+            chart.take_drawing_candidates(0, None).contains(&grid),
+            "{kind:?}"
+        );
+        let frame = chart.build_frame();
+        // A label's run reaches 0.6 em under its centre.
+        let reaching = frame.panes[0].main.iter().any(|prim| {
+            matches!(prim, Prim::Text { color, y, size, .. }
+                if *color == self::color("#0000aa") && f64::from(*y + 0.6 * *size) > top)
+        });
+        assert!(reaching, "{kind:?}: the time label paints into the pane");
+        assert!(chart.remove_drawing(grid));
+    }
+}
+
+/// A pitchfork lying wholly under the pane, past the touch slop every drawing's bounds get, its
+/// tines running away right, lifts its large level labels clear of its tines and base, so they
+/// reach up into the pane: it stays a candidate on the indexed path (more than 20 drawings) so
+/// those labels paint, and its culling pad covers every label the clearance places.
+#[test]
+fn a_pitchfork_under_the_pane_stays_a_candidate_while_its_labels_reach_into_it() {
+    use aeris_charts_core::model::price_range::PriceRange;
+    let mut chart = chart();
+    // A large chart font makes the labels tall.
+    chart
+        .apply_options(r#"{"layout":{"fontSize":24}}"#)
+        .unwrap();
+    for index in 0..22 {
+        add(
+            &mut chart,
+            DrawingKind::TrendLine,
+            vec![p(2.0 + f64::from(index) * 0.1, 105.0), p(3.0, 105.5)],
+            "{}",
+        );
+    }
+    chart.panes[0].price_scale.set_auto_scale(false);
+    chart.panes[0]
+        .price_scale
+        .set_price_range(Some(PriceRange::new(100.0, 110.0)));
+    chart.build_frame();
+    let bottom = chart.panes[0].top + chart.panes[0].height;
+    let price = |chart: &ChartEngine, y: f64| chart.pane_coordinate_to_price(0, y).unwrap();
+    let under = vec![
+        p(10.0, price(&chart, bottom + 40.0)),
+        p(20.0, price(&chart, bottom + 26.0)),
+        p(20.0, price(&chart, bottom + 60.0)),
+    ];
+    let fork = add(
+        &mut chart,
+        DrawingKind::AndrewsPitchfork,
+        under,
+        &serde_json::json!({"levels": [level_json(0.0, "#0000aa", false, "")],
+            "level_show_values": true})
+        .to_string(),
+    );
+    for index in 0..3 {
+        assert!(
+            anchor(&chart, fork, index).1 > bottom + 25.0,
+            "anchor {index} is under the pane"
+        );
+    }
+    assert!(chart.take_drawing_candidates(0, None).contains(&fork));
+    let frame = chart.build_frame();
+    // A label's run reaches 0.6 em over its centre.
+    let reaching = frame.panes[0].main.iter().any(|prim| {
+        matches!(prim, Prim::Text { color, y, size, .. }
+            if *color == self::color("#0000aa") && f64::from(*y - 0.6 * *size) < bottom)
+    });
+    assert!(reaching, "the median's label paints into the pane");
+
+    // The pad itself: however far the clearance moves a level label from its anchor, the
+    // culling extent covers it past the anchors' box.
+    chart.clear_drawings();
+    chart.panes[0].price_scale.set_auto_scale(true);
+    let levels = [-1.0, -0.5, 0.0, 0.5, 1.0].map(|value| level_json(value, "#0000aa", false, ""));
+    let options = serde_json::json!({"levels": levels, "level_show_values": true,
+        "level_show_prices": true})
+    .to_string();
+    for kind in [
+        DrawingKind::AndrewsPitchfork,
+        DrawingKind::SchiffPitchfork,
+        DrawingKind::InsidePitchfork,
+        DrawingKind::Pitchfan,
+    ] {
+        let fork = add(&mut chart, kind, anchors(kind), &options);
+        let drawing = chart.drawing(fork).unwrap().clone();
+        let px = (0..3)
+            .map(|index| anchor(&chart, fork, index))
+            .collect::<Vec<_>>();
+        let (left, right) = px
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(l, r), p| (l.min(p.0), r.max(p.0)));
+        let (top, low) = px
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(t, b), p| (t.min(p.1), b.max(p.1)));
+        let extent = super::upstream_decoration_extent(&chart, &drawing);
+        let frame = chart.build_frame();
+        let mut labels = 0;
+        for prim in &frame.panes[0].main {
+            let Prim::Text {
+                text, x, y, size, ..
+            } = prim
+            else {
+                continue;
+            };
+            // Centred runs; the headless measure is 0.6 em per character.
+            let (x, y, size) = (f64::from(*x), f64::from(*y), f64::from(*size));
+            let half = text.chars().count() as f64 * size * 0.3;
+            let beyond = [
+                left - (x - half),
+                x + half - right,
+                top - (y - 0.6 * size),
+                y + 0.6 * size - low,
+            ]
+            .into_iter()
+            .fold(0.0_f64, f64::max);
+            assert!(
+                beyond <= extent,
+                "{kind:?} {text:?} reaches {beyond} > {extent}"
+            );
+            labels += 1;
+        }
+        assert_eq!(labels, 5, "{kind:?} labels every level");
+        assert!(chart.remove_drawing(fork));
     }
 }

@@ -177,7 +177,6 @@ pub(crate) const PRICE_CHANNEL: DrawingToolSpec = DrawingToolSpec {
     family: Some(&FAMILY),
     text_layout: DrawingTextLayout::Segment,
     axis_price_label: false,
-    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };

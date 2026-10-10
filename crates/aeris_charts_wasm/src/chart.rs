@@ -6106,6 +6106,11 @@ impl AerisChart {
     pub fn remove_drawing_icon(&mut self, name: &str) -> bool {
         self.inner.borrow_mut().remove_drawing_icon(name)
     }
+    /// The built-in icon catalog as JSON `[{name, svg}, ...]`.
+    pub fn builtin_drawing_icons_json(&self) -> String {
+        serde_json::to_string(&aeris_charts_engine::ChartEngine::builtin_drawing_icons())
+            .unwrap_or_else(|_| "[]".to_string())
+    }
     pub fn drawing_object_tree_json(&self) -> String {
         self.inner.borrow().drawing_object_tree_json()
     }
@@ -6424,9 +6429,6 @@ impl AerisChart {
     }
     pub fn drawing_tool_sequence_active(&self) -> bool {
         self.inner.borrow().drawing_tool_sequence_active()
-    }
-    pub fn drawing_requests_text_edit(&self, id: u32) -> bool {
-        self.inner.borrow().drawing_requests_text_edit(id)
     }
     pub fn cancel_drawing_creation(&mut self) {
         self.inner.borrow_mut().cancel_drawing_creation();

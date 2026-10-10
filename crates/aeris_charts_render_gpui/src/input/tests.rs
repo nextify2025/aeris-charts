@@ -208,10 +208,24 @@ fn assert_near(actual: (f64, f64), expected: (f64, f64)) {
     );
 }
 
-/// Every drawing anchor but anchored text lands on the bar slot under the pointer, at the raw price.
+/// Every drawing anchor but anchored text lands on the bar slot under the pointer and on the
+/// price tick nearest the pointer's price.
 fn on_slot(chart: &ChartEngine, (x, y): (f64, f64)) -> (f64, f64) {
     let logical = chart.coordinate_to_logical(x).unwrap().round();
-    (chart.logical_to_coordinate(logical).unwrap(), y)
+    (
+        chart.logical_to_coordinate(logical).unwrap(),
+        on_tick(chart, y),
+    )
+}
+
+/// The y of the price tick nearest the series price under `y`: the fixture's series format
+/// steps 0.01.
+fn on_tick(chart: &ChartEngine, y: f64) -> f64 {
+    const TICK: f64 = 0.01;
+    let price = chart.series_coordinate_to_price(0, y).unwrap();
+    chart
+        .series_price_to_coordinate(0, (price / TICK).round() * TICK)
+        .unwrap()
 }
 
 /// The whole bars a drawing body moves when the pointer goes from `from_x` to `to_x`.
@@ -462,13 +476,13 @@ fn a_wobbling_click_moves_no_drawing_or_order_and_a_drag_past_the_slop_does() {
     assert_eq!(chart.drawing_revision(), revision);
     assert_eq!(chart.selected_drawing(), Some(id), "the press is a click");
 
-    // Past the slop the body moves by whole bars horizontally and exactly vertically.
+    // Past the slop the body moves by whole bars horizontally and by price ticks vertically.
     let dx = slot_shift(&chart, body.0, body.0 + 30.0);
     drag(&input, &mut chart, body, (body.0 + 30.0, body.1 - 20.0));
     for (index, before) in anchors.into_iter().enumerate() {
         assert_near(
             chart.drawing_point_to_coordinate(id, index).unwrap(),
-            (before.0 + dx, before.1 - 20.0),
+            (before.0 + dx, on_tick(&chart, before.1 - 20.0)),
         );
     }
     assert_eq!(chart.drawing_revision(), revision + 1);

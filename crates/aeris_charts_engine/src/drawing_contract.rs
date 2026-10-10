@@ -418,6 +418,9 @@ pub enum DrawingKindOptions {
         icon_name: Option<String>,
         icon_size: f64,
     },
+    ArrowMarker {
+        icon_size: f64,
+    },
     BarsPattern {
         mirror_x: bool,
         mirror_y: bool,
@@ -923,9 +926,12 @@ pub(crate) fn take_legacy_flat_options(
         });
     } else if kind == DrawingKind::IconStamp {
         legacy.icon_name = block.take("icon", text);
-        legacy.icon_size = block
-            .take("icon_size", number)
-            .map(|size| size.clamp(8.0, 96.0));
+        legacy.icon_size = block.take("icon_size", number).map(|size| {
+            size.clamp(
+                crate::drawings::MIN_DRAWING_ICON_DISPLAY_SIZE,
+                crate::drawings::MAX_DRAWING_ICON_DISPLAY_SIZE,
+            )
+        });
     } else {
         // Regression trend: the fork's deviation sides and their switches are per-side overrides
         // of `regression_deviations` and stay in the block. A fork document's band also folds
@@ -1193,13 +1199,15 @@ pub fn drawing_property_schema(kind: DrawingKind) -> DrawingPropertySchema {
             DrawingPropertyType::String,
             serde_json::json!(""),
         ));
+    }
+    if kind.has_icon_size() {
         let mut size = descriptor(
             "icon_size",
             DrawingPropertyType::Number,
             serde_json::json!(24.0),
         );
-        size.min = Some(8.0);
-        size.max = Some(96.0);
+        size.min = Some(crate::drawings::MIN_DRAWING_ICON_DISPLAY_SIZE);
+        size.max = Some(crate::drawings::MAX_DRAWING_ICON_DISPLAY_SIZE);
         properties.push(size);
     }
     if kind == DrawingKind::BarsPattern {
@@ -1491,12 +1499,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(offsets, [0, 2]);
         assert_eq!(options, serde_json::json!({}));
-        // An icon's size clamps into the upstream range.
+        // An icon's size clamps into the upstream range (8..=256): the fork's 120 restores
+        // exactly, and anything past the range clamps.
         let mut options =
             serde_json::json!({"projection_annotation": {"icon": "heart", "icon_size": 120.0}});
         let legacy = take_legacy_flat_options(DrawingKind::IconStamp, &mut options, false);
         assert_eq!(legacy.icon_name.as_deref(), Some("heart"));
-        assert_eq!(legacy.icon_size, Some(96.0));
+        assert_eq!(legacy.icon_size, Some(120.0));
+        let mut options =
+            serde_json::json!({"projection_annotation": {"icon": "heart", "icon_size": 400.0}});
+        let legacy = take_legacy_flat_options(DrawingKind::IconStamp, &mut options, false);
+        assert_eq!(legacy.icon_size, Some(256.0));
         // A fork document's absent block reads as the block's defaults, and stays absent.
         let mut options = serde_json::json!({});
         let legacy = take_legacy_flat_options(DrawingKind::ElliottImpulse, &mut options, true);

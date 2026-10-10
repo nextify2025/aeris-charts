@@ -26,10 +26,24 @@ fn assert_near(actual: (f64, f64), expected: (f64, f64), what: &str) {
     );
 }
 
-/// Every anchor but anchored text lands on the bar slot under the pointer, at the raw price.
+/// Every anchor but anchored text lands on the bar slot under the pointer and on the price tick
+/// nearest the pointer's price.
 fn on_slot(chart: &ChartEngine, (x, y): (f64, f64)) -> (f64, f64) {
     let logical = chart.coordinate_to_logical(x).unwrap().round();
-    (chart.logical_to_coordinate(logical).unwrap(), y)
+    (
+        chart.logical_to_coordinate(logical).unwrap(),
+        on_tick(chart, y),
+    )
+}
+
+/// The y of the price tick nearest the price under `y`: where anchors, handles and vertically
+/// moved bodies land.
+fn on_tick(chart: &ChartEngine, y: f64) -> f64 {
+    let tick = chart
+        .position_price_tick(0, DrawingPriceScale::Right)
+        .unwrap();
+    let price = (chart.pane_coordinate_to_price(0, y).unwrap() / tick).round() * tick;
+    chart.pane_price_to_coordinate(0, price).unwrap()
 }
 
 /// Drawings move horizontally by whole bars: `bars` bar spacings.
@@ -410,10 +424,10 @@ fn dragging_a_selected_drawings_anchor_moves_only_that_anchor_as_one_undo_step()
 
     let target = (a.0 + 30.0, a.1 - 25.0);
     drag(&mut chart, a, target);
-    // The anchor steps two whole bars (30 px) and keeps the raw price.
+    // The anchor steps two whole bars (30 px) and lands on the price tick.
     assert_near(
         chart.drawing_point_to_coordinate(id, 0).unwrap(),
-        (a.0 + bars(&chart, 2.0), target.1),
+        (a.0 + bars(&chart, 2.0), on_tick(&chart, target.1)),
         "dragged anchor",
     );
     assert_eq!(chart.drawing(id).unwrap().points[1], before[1]);
@@ -424,7 +438,8 @@ fn dragging_a_selected_drawings_anchor_moves_only_that_anchor_as_one_undo_step()
     assert_eq!(chart.drawing(id).unwrap().points, before);
 }
 
-/// Assert every anchor of `id` sits `delta` px from where it was in `start`.
+/// Assert every anchor of `id` sits `delta` px from where it was in `start`, each on its price
+/// tick once the body moved vertically.
 fn assert_shifted(
     chart: &ChartEngine,
     id: DrawingId,
@@ -435,7 +450,11 @@ fn assert_shifted(
     let anchors = anchor_px(chart, id);
     assert_eq!(anchors.len(), start.len(), "{what}");
     for (index, (actual, before)) in anchors.into_iter().zip(start).enumerate() {
-        let expected = (before.0 + delta.0, before.1 + delta.1);
+        let y = before.1 + delta.1;
+        let expected = (
+            before.0 + delta.0,
+            if delta.1 == 0.0 { y } else { on_tick(chart, y) },
+        );
         assert_near(actual, expected, &format!("{what}: anchor {index}"));
     }
 }
@@ -485,8 +504,8 @@ fn a_wobbling_click_on_a_drawing_selects_it_without_moving_it_or_recording_an_un
 }
 
 /// Past the slop a drawing catches up with the pointer at once and then follows it, bar by bar
-/// horizontally and exactly vertically, back inside the slop too, for a body and an anchor alike;
-/// each drag is one undo step.
+/// horizontally and tick by tick vertically, back inside the slop too, for a body and an anchor
+/// alike; each drag is one undo step.
 #[test]
 fn a_drawing_drag_past_the_slop_follows_the_pointer_back_near_its_start_as_one_undo_step() {
     let mut chart = chart();
@@ -520,12 +539,16 @@ fn a_drawing_drag_past_the_slop_follows_the_pointer_back_near_its_start_as_one_u
     chart.input_pointer_move(at(a.0 - 15.0, a.1 + 5.0), true);
     assert_near(
         anchor(&chart),
-        (a.0 - bar, a.1 + 5.0),
+        (a.0 - bar, on_tick(&chart, a.1 + 5.0)),
         "anchor crossing the slop",
     );
     chart.input_pointer_move(at(a.0 - 2.0, a.1 + 1.0), true);
     chart.input_pointer_up(at(a.0 - 2.0, a.1 + 1.0));
-    assert_near(anchor(&chart), (a.0, a.1 + 1.0), "anchor released");
+    assert_near(
+        anchor(&chart),
+        (a.0, on_tick(&chart, a.1 + 1.0)),
+        "anchor released",
+    );
     assert_near(
         chart.drawing_point_to_coordinate(id, 1).unwrap(),
         b,
@@ -607,8 +630,9 @@ fn a_wobbling_click_never_magnet_snaps_a_drawing() {
 
 /// Once a drag has moved, the drawing commits as last shown. Letting go of the magnet key
 /// (Ctrl/Cmd) or the straighten key (Shift) before the button changes nothing, even when no
-/// motion follows the key release: a line pulled onto a bar's close stays there, and a
-/// Shift-straightened body move stays horizontal.
+/// motion follows the key release: a line pulled by its anchor onto a bar's close stays there,
+/// and a Shift-straightened body move stays horizontal. Ctrl/Cmd on the body clones instead, so
+/// the source never moves.
 #[test]
 fn a_modifier_let_go_before_the_button_keeps_the_drag_as_shown() {
     let control = InputModifiers {
@@ -629,8 +653,12 @@ fn a_modifier_let_go_before_the_button_keeps_the_drag_as_shown() {
         )
         .unwrap();
     chart.build_frame();
-    let x = chart.time_scale.index_to_coordinate(30);
-    let y = chart.drawing_point_to_coordinate(id, 0).unwrap().1;
+    chart.set_selected_drawing(Some(id));
+    chart.build_frame();
+    let drawing = chart.drawing(id).unwrap().clone();
+    let (x, y) = chart
+        .drawing_handle_px(&drawing, DrawingDragPart::Anchor(0))
+        .unwrap();
     chart.input_pointer_down(held(x, y, control), 1);
     chart.input_pointer_move(held(x, y + 10.0, control), true);
     chart.input_pointer_move(held(x, y + 20.0, control), true);
@@ -642,6 +670,23 @@ fn a_modifier_let_go_before_the_button_keeps_the_drag_as_shown() {
     chart.input_modifiers_changed(InputModifiers::default());
     chart.input_pointer_up(at(x, y + 20.0));
     assert_eq!(chart.drawing(id).unwrap().points[0].price, shown);
+    assert_eq!(chart.drawings().len(), 1, "an anchor press never clones");
+
+    // The same key on the body, off the anchor, drags a copy; letting go of it first still
+    // commits the copy as shown and leaves the source where it was.
+    let source = chart.drawing(id).unwrap().clone();
+    let body_x = x + 120.0;
+    let body_y = chart.drawing_point_to_coordinate(id, 0).unwrap().1;
+    chart.input_pointer_down(held(body_x, body_y, control), 1);
+    chart.input_pointer_move(held(body_x, body_y + 10.0, control), true);
+    chart.input_pointer_move(held(body_x, body_y + 20.0, control), true);
+    chart.input_modifiers_changed(InputModifiers::default());
+    chart.input_pointer_up(at(body_x, body_y + 20.0));
+    assert_eq!(chart.drawing(id).unwrap().points, source.points);
+    assert_eq!(chart.drawings().len(), 2, "the body press cloned the line");
+    let copy = chart.selected_drawing().unwrap();
+    assert_ne!(copy, id);
+    assert_ne!(chart.drawing(copy).unwrap().points, source.points);
 
     let mut chart = super::tests::chart();
     let (id, body) = trend_line_body(&mut chart);
@@ -704,15 +749,16 @@ fn a_wobbling_double_click_on_a_selected_drawing_opens_its_editor_without_moving
 fn ctrl_or_cmd_held_while_placing_snaps_each_anchor_to_the_bars_ohlc() {
     let mut chart = chart();
     // Bar 20 is O 106 H 109 L 103 C 107; bar 40 is O 105 H 108 L 102 C 106. Each click lands
-    // just off its bar's center, nearest that bar's high or low. Without the magnet the anchor
-    // still lands on the bar slot, at the raw price; the magnet adds the bar's high or low.
+    // just off its bar's center and off the 0.01 price tick, nearest that bar's high or low.
+    // Without the magnet the anchor still lands on the bar slot, on the price tick; the magnet
+    // takes the bar's exact high or low instead.
     let high = (
         chart.time_scale.index_to_coordinate(20) + 1.0,
-        chart.series_price_to_coordinate(0, 108.6).unwrap(),
+        chart.series_price_to_coordinate(0, 108.637).unwrap(),
     );
     let low = (
         chart.time_scale.index_to_coordinate(40) - 1.0,
-        chart.series_price_to_coordinate(0, 102.4).unwrap(),
+        chart.series_price_to_coordinate(0, 102.364).unwrap(),
     );
     let none = InputModifiers::default();
 
@@ -721,8 +767,8 @@ fn ctrl_or_cmd_held_while_placing_snaps_each_anchor_to_the_bars_ohlc() {
         [held(high.0, high.1, none), held(low.0, low.1, none)],
     );
     let free = chart.drawing(free).unwrap().points.clone();
-    assert!((free[0].price - 108.6).abs() < 1e-6, "{free:?}");
-    assert!((free[1].price - 102.4).abs() < 1e-6, "{free:?}");
+    assert!((free[0].price - 108.64).abs() < 1e-9, "{free:?}");
+    assert!((free[1].price - 102.36).abs() < 1e-9, "{free:?}");
     assert_eq!(free[0].logical, 20.0, "{free:?}");
     assert_eq!(free[1].logical, 40.0, "{free:?}");
 
@@ -1254,9 +1300,10 @@ fn after_the_first_click_a_press_drag_release_only_moves_the_preview() {
 
 #[test]
 fn a_fork_form_signpost_opens_its_editor_on_placement_and_keeps_an_emptied_text() {
-    // Owner decisions A6/A7: only a fork-form signpost (the `projection_annotation` marker)
-    // starts from the fork's starter text and opens the editor on placement; upstream's form
-    // opens nothing. A signpost is no text annotation, so emptying it keeps the drawing.
+    // Owner decision A6: only a fork-form signpost (the `projection_annotation` marker) starts
+    // from the fork's starter text; one click places either form and opens its editor (upstream
+    // now requests it, superseding A7). A fork-form signpost is no text annotation, so emptying
+    // it keeps the drawing; upstream's signpost is its text, so an emptied one is removed.
     for (options, fork) in [
         (
             Some(r#"{"tool_options":{"projection_annotation":{}}}"#),
@@ -1266,21 +1313,17 @@ fn a_fork_form_signpost_opens_its_editor_on_placement_and_keeps_an_emptied_text(
     ] {
         let mut chart = chart();
         assert!(chart.set_drawing_tool(Some(DrawingKind::Signpost), options, None));
-        for (x, y) in [(300.0, 260.0), (300.0, 200.0)] {
-            chart.input_pointer_down(at(x, y), 1);
-            chart.input_pointer_up(at(x, y));
-        }
+        chart.input_pointer_down(at(300.0, 260.0), 1);
+        chart.input_pointer_up(at(300.0, 260.0));
         let events = chart.take_input_events();
-        let [ChartInputEvent::DrawingCreated(id)] = events[..] else {
+        let [ChartInputEvent::DrawingCreated(id), ..] = events[..] else {
             panic!("one signpost was created: {events:?}");
         };
-        assert_eq!(
-            chart.editing_drawing(),
-            fork.then_some(id),
-            "fork form {fork}"
-        );
+        assert_eq!(chart.editing_drawing(), Some(id), "fork form {fork}");
         if !fork {
-            assert_eq!(chart.drawing(id).unwrap().text, "");
+            assert_eq!(chart.drawing_text_edit(), Some((id, "", 0)));
+            assert!(chart.commit_drawing_text_edit());
+            assert!(chart.drawing(id).is_none(), "an emptied upstream signpost");
             continue;
         }
         assert_eq!(chart.drawing_text_edit(), Some((id, "Signpost", 8)));
@@ -1298,4 +1341,327 @@ fn a_fork_form_signpost_opens_its_editor_on_placement_and_keeps_an_emptied_text(
         assert_eq!(chart.editing_drawing(), None);
         assert!(chart.drawing(id).is_some());
     }
+}
+
+#[test]
+fn fork_form_text_boxes_keep_the_fork_form_chrome_and_editing_rules() {
+    use aeris_charts_render::draw_list::Prim;
+    const FORK: &str = r#"{"text":"Memo","tool_options":{"projection_annotation":{}}}"#;
+    const PLAIN: &str = r#"{"text":"Memo"}"#;
+    let mut chart = chart();
+    let at_px = |chart: &ChartEngine, x: f64, y: f64| {
+        chart
+            .drawing_from_px_for(0, DrawingPriceScale::Right, x, y)
+            .unwrap()
+    };
+    let (a, b) = (at_px(&chart, 300.0, 200.0), at_px(&chart, 380.0, 150.0));
+    let box_layout = |chart: &ChartEngine, id: DrawingId| {
+        let drawing = chart.drawing(id).unwrap();
+        let px = chart.drawing_px(drawing).unwrap();
+        chart.annotation_layout(drawing, &px, 1.0)
+    };
+    // The fork form is the one-anchor note and price note with the block; with two anchors the
+    // block stays stored but upstream's box paints.
+    for kind in [DrawingKind::Note, DrawingKind::PriceNote] {
+        let one = chart.add_drawing(kind, 0, vec![a], Some(FORK)).unwrap();
+        let two = chart.add_drawing(kind, 0, vec![a, b], Some(FORK)).unwrap();
+        assert!(box_layout(&chart, one).is_none(), "{kind:?} fork form");
+        assert!(box_layout(&chart, two).is_some(), "{kind:?} upstream box");
+        assert!(
+            chart
+                .drawing(two)
+                .unwrap()
+                .tool_options
+                .projection_annotation
+                .is_some()
+        );
+        chart.remove_drawing(one);
+        chart.remove_drawing(two);
+    }
+    let signpost = chart
+        .add_drawing(DrawingKind::Signpost, 0, vec![a, a], Some(FORK))
+        .unwrap();
+    assert!(box_layout(&chart, signpost).is_none(), "the fork's plate");
+    chart.remove_drawing(signpost);
+
+    // Fork-form note, comment, and price note keep a9ff55b's chrome: the focus frame and no
+    // handle when selected, the hover ring, and a body-only arrow-key nudge.
+    let frames = |chart: &mut ChartEngine| {
+        let frame = chart.build_frame();
+        frame.panes[0]
+            .main
+            .iter()
+            .fold((0, 0), |(frames, boxes), prim| match prim {
+                Prim::RectFrame { .. } => (frames + 1, boxes),
+                Prim::RoundRect { .. } | Prim::Circle { .. } => (frames, boxes + 1),
+                _ => (frames, boxes),
+            })
+    };
+    for kind in [
+        DrawingKind::Note,
+        DrawingKind::Comment,
+        DrawingKind::PriceNote,
+    ] {
+        let id = chart.add_drawing(kind, 0, vec![a], Some(FORK)).unwrap();
+        let idle = frames(&mut chart);
+        // The host marks a hovered text drawing both hovered and text-hovered.
+        chart.set_hovered_drawing(Some(id));
+        chart.set_hovered_text(Some(id));
+        let hovered = frames(&mut chart);
+        assert_eq!(hovered.0, idle.0 + 1, "{kind:?} hover ring");
+        chart.set_hovered_text(None);
+        chart.set_hovered_drawing(None);
+        chart.set_selected_drawing(Some(id));
+        assert_eq!(chart.drawing_handle_count(id), Some(0), "{kind:?}");
+        let selected = frames(&mut chart);
+        assert_eq!(selected.0, idle.0 + 1, "{kind:?} focus frame");
+        // A note reveals its box on focus; no handle paints on any of them.
+        let revealed = usize::from(kind == DrawingKind::Note);
+        assert!(
+            selected.1 <= idle.1 + revealed,
+            "{kind:?}: {idle:?} {selected:?}"
+        );
+        // The keyboard edit has no handle to Tab to, so an arrow key moves the body.
+        let target = ChartFocusTarget::Drawing(id);
+        let none = InputModifiers::default();
+        let before = chart.drawing_px(chart.drawing(id).unwrap()).unwrap()[0];
+        assert!(chart.input_target_key_down(target, ChartKey::Enter, none));
+        assert!(
+            !chart.input_target_key_down(target, ChartKey::Tab, none),
+            "{kind:?}"
+        );
+        assert!(chart.input_target_key_down(target, ChartKey::ArrowUp, none));
+        assert!(chart.input_target_key_down(target, ChartKey::Enter, none));
+        let after = chart.drawing_px(chart.drawing(id).unwrap()).unwrap()[0];
+        assert!(
+            after.1 < before.1 && (after.0 - before.0).abs() < 1e-9,
+            "{kind:?}"
+        );
+        chart.set_selected_drawing(None);
+        chart.remove_drawing(id);
+    }
+
+    // A click on the selected drawing re-opens the editor of a fork-form price note but not of
+    // a fork-form signpost; the block-less ones do the reverse (upstream's membership).
+    let reopen = |chart: &mut ChartEngine, kind: DrawingKind, points: Vec<_>, options: &str| {
+        let id = chart.add_drawing(kind, 0, points, Some(options)).unwrap();
+        chart.set_selected_drawing(Some(id));
+        let [left, top, right, bottom] = chart.drawing_text_edit_layout(id).unwrap().rect;
+        click(chart, (left + right) / 2.0, (top + bottom) / 2.0);
+        let opened = chart.editing_drawing() == Some(id);
+        chart.cancel_drawing_text_edit();
+        chart.remove_drawing(id);
+        opened
+    };
+    assert!(reopen(&mut chart, DrawingKind::PriceNote, vec![a], FORK));
+    assert!(!reopen(&mut chart, DrawingKind::Signpost, vec![a, a], FORK));
+    assert!(!reopen(
+        &mut chart,
+        DrawingKind::PriceNote,
+        vec![a, b],
+        PLAIN
+    ));
+    assert!(reopen(&mut chart, DrawingKind::Signpost, vec![a, b], PLAIN));
+
+    // An emptied fork-form price note is removed and an emptied fork-form signpost is kept.
+    for (kind, points, removed) in [
+        (DrawingKind::PriceNote, vec![a], true),
+        (DrawingKind::Signpost, vec![a, a], false),
+    ] {
+        let id = chart.add_drawing(kind, 0, points, Some(FORK)).unwrap();
+        assert!(chart.begin_drawing_text_edit(id, false));
+        assert!(chart.set_drawing_text_edit("", 0));
+        assert!(chart.commit_drawing_text_edit());
+        assert_eq!(chart.drawing(id).is_none(), removed, "{kind:?}");
+    }
+}
+
+#[test]
+fn escape_after_an_arrow_key_icon_resize_restores_the_icon_size_without_history() {
+    let mut chart = chart();
+    let point = chart
+        .drawing_from_px_for(0, DrawingPriceScale::Right, 300.0, 200.0)
+        .unwrap();
+    let id = chart
+        .add_drawing(
+            DrawingKind::IconStamp,
+            0,
+            vec![point],
+            Some(r#"{"icon_name":"star","icon_size":40}"#),
+        )
+        .unwrap();
+    let before = chart.drawing(id).unwrap().clone();
+    let revision = chart.drawing_revision();
+    let undo = chart.can_undo_drawing();
+    let target = ChartFocusTarget::Drawing(id);
+    let none = InputModifiers::default();
+    assert!(chart.input_target_key_down(target, ChartKey::Enter, none));
+    // Tab to the bottom-right corner, then grow it with arrow keys.
+    for _ in 0..3 {
+        assert!(chart.input_target_key_down(target, ChartKey::Tab, none));
+    }
+    assert!(chart.input_target_key_down(target, ChartKey::ArrowRight, none));
+    assert!(chart.input_target_key_down(target, ChartKey::ArrowDown, none));
+    assert!(chart.drawing(id).unwrap().icon_size > before.icon_size);
+    assert!(chart.input_target_key_down(target, ChartKey::Escape, none));
+    let after = chart.drawing(id).unwrap();
+    assert_eq!(after.icon_size, before.icon_size);
+    assert_eq!(after.points, before.points);
+    assert_eq!(chart.drawing_revision(), revision);
+    assert_eq!(chart.can_undo_drawing(), undo);
+}
+
+/// Ctrl/⌘ on a drawing's body clones it (upstream's gesture) instead of arming the magnet: the
+/// copy moves unsnapped and the crosshair does not snap either; a committed copy is one revision
+/// and a Ctrl-click none; a release that is the only sample past the slop still commits; the
+/// copy keeps the source's stored options (a fork document keeps its block); a locked drawing is
+/// never copied; a copied text gets no edit session; and after a Ctrl-click or a cancelled copy
+/// the selection is exactly the source, never the discarded copy.
+#[test]
+fn control_on_a_body_clones_unsnapped_and_leaves_the_source_selected_when_discarded() {
+    let control = InputModifiers {
+        control: true,
+        ..InputModifiers::default()
+    };
+    let mut chart = chart();
+    let line = chart
+        .add_drawing(
+            DrawingKind::HorizontalLine,
+            0,
+            vec![DrawingPoint {
+                logical: 30.0,
+                price: 104.4,
+            }],
+            None,
+        )
+        .unwrap();
+    chart.build_frame();
+    let source = chart.drawing(line).unwrap().clone();
+    // On the body, well off the anchor's handle (which keeps Ctrl as the magnet once selected).
+    let x = chart.time_scale.index_to_coordinate(30) + 120.0;
+    let y = chart.drawing_point_to_coordinate(line, 0).unwrap().1;
+
+    // A Ctrl-click ends like a click on the body: no copy, no revision, the source selected.
+    let revision = chart.drawing_revision();
+    chart.input_pointer_down(held(x, y, control), 1);
+    chart.input_pointer_up(held(x, y, control));
+    assert_eq!(chart.drawings().len(), 1);
+    assert_eq!(chart.drawing_revision(), revision);
+    assert_eq!(chart.selected_drawings(), [line]);
+
+    // A Ctrl drag there would magnet-snap the line itself to a bar's close; the copy instead
+    // takes the raw pointer's tick, and the crosshair is no magnet while the copy moves.
+    chart.input_pointer_down(held(x, y, control), 1);
+    chart.input_pointer_move(held(x, y + 10.0, control), true);
+    chart.input_pointer_move(held(x, y + 20.0, control), true);
+    assert!(!chart.crosshair_ohlc_magnet);
+    chart.input_pointer_up(held(x, y + 20.0, control));
+    assert_eq!(chart.drawings().len(), 2);
+    let copy = chart.selected_drawing().unwrap();
+    assert_ne!(copy, line);
+    assert_eq!(
+        chart.drawing(line).unwrap(),
+        &source,
+        "the source never moves"
+    );
+    let copied = chart.drawing(copy).unwrap().points[0].price;
+    let expected = chart
+        .pane_coordinate_to_price(0, on_tick(&chart, y + 20.0))
+        .unwrap();
+    assert!((copied - expected).abs() < 1e-9, "{copied} vs {expected}");
+    let close_of_the_bar = (chart.coordinate_to_logical(x).unwrap().round() as usize % 7) as f64;
+    assert!(
+        (copied - (101.0 + close_of_the_bar)).abs() > 0.01,
+        "not snapped to the close"
+    );
+    assert_eq!(chart.drawing_revision(), revision + 1, "one revision");
+    assert!(
+        chart
+            .take_input_events()
+            .contains(&ChartInputEvent::DrawingCreated(copy))
+    );
+    // Undoing the copy removes it from the selection too.
+    assert!(chart.undo_drawing());
+    assert!(chart.drawing(copy).is_none());
+    assert!(!chart.selected_drawings().contains(&copy));
+
+    // A release that is the only sample past the slop still drops the copy there.
+    chart.input_pointer_down(held(x, y, control), 1);
+    chart.input_pointer_move(held(x, y + 1.0, control), true);
+    chart.input_pointer_up(held(x, y + 30.0, control));
+    assert_eq!(chart.drawings().len(), 2);
+    let released = chart.selected_drawing().unwrap();
+    assert_ne!(released, line);
+    assert!(chart.undo_drawing());
+
+    // A copy cancelled mid-drag leaves the source alone and selected.
+    chart.input_pointer_down(held(x, y, control), 1);
+    chart.input_pointer_move(held(x, y + 30.0, control), true);
+    let pending = chart.selected_drawing().unwrap();
+    assert_ne!(pending, line);
+    chart.input_cancel();
+    assert_eq!(chart.drawings().len(), 1);
+    assert_eq!(chart.selected_drawings(), [line]);
+    assert!(chart.drawing(pending).is_none());
+    assert_eq!(chart.drawing(line).unwrap(), &source);
+
+    // A locked drawing is never copied (and does not move).
+    assert!(chart.set_drawing_locked(line, true));
+    chart.input_pointer_down(held(x, y, control), 1);
+    chart.input_pointer_move(held(x, y + 30.0, control), true);
+    chart.input_pointer_up(held(x, y + 30.0, control));
+    assert_eq!(chart.drawings().len(), 1);
+    assert_eq!(chart.drawing(line).unwrap().points, source.points);
+    assert!(chart.remove_drawing(line));
+
+    // A fork document's copy keeps its stored block.
+    let fork = chart
+        .add_drawing(
+            DrawingKind::TrendLine,
+            0,
+            vec![
+                DrawingPoint {
+                    logical: 10.0,
+                    price: 102.0,
+                },
+                DrawingPoint {
+                    logical: 40.0,
+                    price: 104.0,
+                },
+            ],
+            Some(r#"{"tool_options":{"line":{}}}"#),
+        )
+        .unwrap();
+    chart.build_frame();
+    let a = chart.drawing_point_to_coordinate(fork, 0).unwrap();
+    let b = chart.drawing_point_to_coordinate(fork, 1).unwrap();
+    let body = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    chart.input_pointer_down(held(body.0, body.1, control), 1);
+    chart.input_pointer_move(held(body.0, body.1 + 30.0, control), true);
+    chart.input_pointer_up(held(body.0, body.1 + 30.0, control));
+    let copy = chart.selected_drawing().unwrap();
+    assert_ne!(copy, fork);
+    assert_eq!(
+        chart.drawing(copy).unwrap().tool_options.line,
+        Some(Default::default())
+    );
+    assert!(chart.remove_drawing(fork) && chart.remove_drawing(copy));
+
+    // A copied text is created without an edit session.
+    let text = text_drawing(&mut chart, "note");
+    let (tx, ty) = text_center(&chart, text);
+    chart.take_input_events();
+    chart.input_pointer_down(held(tx, ty, control), 1);
+    chart.input_pointer_move(held(tx + 40.0, ty + 30.0, control), true);
+    chart.input_pointer_up(held(tx + 40.0, ty + 30.0, control));
+    let copy = chart.selected_drawing().unwrap();
+    assert_ne!(copy, text);
+    assert_eq!(chart.drawing(copy).unwrap().text, "note");
+    assert!(
+        chart
+            .take_input_events()
+            .contains(&ChartInputEvent::DrawingCreated(copy))
+    );
+    assert_eq!(chart.editing_drawing(), None);
+    assert!(chart.drawing_text_edit().is_none());
 }

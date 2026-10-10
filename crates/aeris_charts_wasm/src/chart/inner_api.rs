@@ -3621,10 +3621,6 @@ impl ChartInner {
         self.engine.drawing_tool_sequence_active()
     }
 
-    pub fn drawing_requests_text_edit(&self, id: u32) -> bool {
-        self.engine.drawing_requests_text_edit(id)
-    }
-
     pub fn cancel_drawing_creation(&mut self) {
         self.engine.cancel_drawing_creation();
     }

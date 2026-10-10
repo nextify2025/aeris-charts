@@ -92,6 +92,9 @@ pub(crate) fn level_band_pairs<'a>(
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DrawingBodyGeometry<'a> {
     Empty,
+    /// A box annotation; its box, text, and connector need text measurement, so they resolve
+    /// through `ChartEngine::annotation_layout` (annotations.rs).
+    Annotation,
     Segment {
         a: (f64, f64),
         b: (f64, f64),
@@ -334,6 +337,41 @@ impl FibonacciArcGeometry {
             self.center.0 + radius * angle.cos(),
             self.center.1 + radius * angle.sin(),
         )
+    }
+
+    /// Where along each level's arc its label goes: the point whose radius runs closest to
+    /// vertical (the top, else the bottom, else the nearer end of the sweep). Concentric levels
+    /// are spaced radially there, so their one-line labels stack instead of crossing the next
+    /// ring. The spiral keeps its middle.
+    pub(crate) fn label_t(self) -> f64 {
+        if self.kind == DrawingKind::FibonacciSpiral || self.sweep.abs() <= f64::EPSILON {
+            return 0.5;
+        }
+        let first = if self.kind == DrawingKind::FibonacciWedge {
+            self.start_angle
+        } else {
+            self.start_angle - self.sweep / 2.0
+        };
+        let tau = std::f64::consts::TAU;
+        let t_of = |angle: f64| {
+            // The sweep may run either way; measure the target along it.
+            let along = if self.sweep > 0.0 {
+                (angle - first).rem_euclid(tau)
+            } else {
+                -(first - angle).rem_euclid(tau)
+            };
+            along / self.sweep
+        };
+        let up = t_of(-std::f64::consts::FRAC_PI_2);
+        if (0.0..=1.0).contains(&up) {
+            return up;
+        }
+        let down = t_of(std::f64::consts::FRAC_PI_2);
+        if (0.0..=1.0).contains(&down) {
+            return down;
+        }
+        let top = |t: f64| self.point(1.0, t).1;
+        if top(0.0) <= top(1.0) { 0.0 } else { 1.0 }
     }
 
     /// Chords for every level up to `value` (the largest visible one), so level bands pair
@@ -748,33 +786,29 @@ impl SineGeometry {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MarkerGeometry {
-    pub(crate) kind: DrawingKind,
     pub(crate) anchor: (f64, f64),
+    /// The fork-form signpost's foot: its post runs from here up to `anchor`, the pennant's
+    /// top. `None` for a flag, whose stem hangs from `anchor`.
     pub(crate) base: Option<(f64, f64)>,
     pub(crate) radius: f64,
 }
 
 impl MarkerGeometry {
+    /// The flag's pennant, hanging right of the top of its stem.
     pub(crate) fn triangle(self) -> [(f64, f64); 3] {
         let (x, y) = self.anchor;
         let r = self.radius;
-        match self.kind {
-            DrawingKind::ArrowMarkerUp => [(x, y), (x - r, y + 2.0 * r), (x + r, y + 2.0 * r)],
-            DrawingKind::ArrowMarkerDown => [(x, y), (x - r, y - 2.0 * r), (x + r, y - 2.0 * r)],
-            DrawingKind::ArrowMarkerLeft => [(x, y), (x + 2.0 * r, y - r), (x + 2.0 * r, y + r)],
-            DrawingKind::ArrowMarkerRight => [(x, y), (x - 2.0 * r, y - r), (x - 2.0 * r, y + r)],
-            _ => [(x, y - 2.0 * r), (x + 2.0 * r, y - 1.5 * r), (x, y - r)],
-        }
+        [(x, y - 2.0 * r), (x + 2.0 * r, y - 1.5 * r), (x, y - r)]
     }
 
-    pub(crate) fn stem(self) -> Option<((f64, f64), (f64, f64))> {
-        match self.kind {
-            DrawingKind::FlagMark => Some((
+    /// The flag's stem, or the fork-form signpost's post from its foot to its top.
+    pub(crate) fn stem(self) -> ((f64, f64), (f64, f64)) {
+        match self.base {
+            Some(base) => (base, self.anchor),
+            None => (
                 self.anchor,
                 (self.anchor.0, self.anchor.1 - 2.0 * self.radius),
-            )),
-            DrawingKind::Signpost => Some((self.base?, self.anchor)),
-            _ => None,
+            ),
         }
     }
 }
@@ -1638,19 +1672,37 @@ pub(crate) fn resolve_drawing_geometry<'a>(
         DrawingKind::ArrowMarkerUp
         | DrawingKind::ArrowMarkerDown
         | DrawingKind::ArrowMarkerLeft
-        | DrawingKind::ArrowMarkerRight
-        | DrawingKind::FlagMark
-        | DrawingKind::Signpost => DrawingBodyGeometry::Marker(MarkerGeometry {
-            kind,
-            anchor: if kind != DrawingKind::Signpost {
-                *px.first()?
-            } else if options.signpost_pole > 0.0 {
-                // Coincident anchors stand the fork's pole up from the foot.
-                (px[0].0, px[0].1 - options.signpost_pole)
-            } else {
-                *px.get(1)?
-            },
-            base: (kind == DrawingKind::Signpost).then(|| px[0]),
+        | DrawingKind::ArrowMarkerRight => {
+            // The built-in arrow icon, placed so its tip lands on the anchor.
+            let (_, tip) = super::icons::arrow_marker_icon(kind)?;
+            let size = options.icon_size * options.device_scale;
+            let scale = size / super::icons::ICON_VIEWBOX;
+            let anchor = *px.first()?;
+            DrawingBodyGeometry::IconStamp {
+                center: (
+                    anchor.0 - (tip.0 - super::icons::ICON_VIEWBOX / 2.0) * scale,
+                    anchor.1 - (tip.1 - super::icons::ICON_VIEWBOX / 2.0) * scale,
+                ),
+                size,
+            }
+        }
+        // The fork-form signpost keeps its pennant on a post from its foot (owner decision A1).
+        DrawingKind::Signpost if options.annotation_fork_form => {
+            let base = *px.first()?;
+            DrawingBodyGeometry::Marker(MarkerGeometry {
+                anchor: if options.signpost_pole > 0.0 {
+                    // Coincident anchors stand the fork's pole up from the foot.
+                    (base.0, base.1 - options.signpost_pole)
+                } else {
+                    *px.get(1)?
+                },
+                base: Some(base),
+                radius: 7.0 * options.device_scale,
+            })
+        }
+        DrawingKind::FlagMark => DrawingBodyGeometry::Marker(MarkerGeometry {
+            anchor: *px.first()?,
+            base: None,
             radius: 7.0 * options.device_scale,
         }),
         DrawingKind::RotatedRectangle => {
@@ -1740,19 +1792,21 @@ pub(crate) fn resolve_drawing_geometry<'a>(
                 corners: [tip, (tip.0, base), (tip.0 + TAIL_WIDTH * scale, base)],
             }
         }
-        DrawingKind::Text
-        | DrawingKind::Note
-        | DrawingKind::Comment
-        | DrawingKind::AnchoredText => DrawingBodyGeometry::Empty,
-        DrawingKind::Callout => DrawingBodyGeometry::Segment {
-            a: *px.first()?,
-            b: *px.get(1)?,
-        },
-        DrawingKind::PriceNote => DrawingBodyGeometry::Horizontal {
-            y: px[0].1,
+        // The fork-form price note's line spans the pane at its one anchor's price.
+        DrawingKind::PriceNote if options.annotation_fork_form => DrawingBodyGeometry::Horizontal {
+            y: px.first()?.1,
             x0: 0.0,
             x1: pane_w,
         },
+        DrawingKind::Text | DrawingKind::AnchoredText => DrawingBodyGeometry::Empty,
+        DrawingKind::Note
+        | DrawingKind::Comment
+        | DrawingKind::Callout
+        | DrawingKind::PriceNote
+        | DrawingKind::Signpost => {
+            px.first()?;
+            DrawingBodyGeometry::Annotation
+        }
         DrawingKind::PriceLabel => DrawingBodyGeometry::PriceLabel {
             x: px[0].0,
             y: px[0].1,
@@ -1866,16 +1920,10 @@ pub(crate) fn resolve_drawing_geometry<'a>(
         }
     };
 
-    let text_box = if kind == DrawingKind::Callout {
-        let (x, y) = *px.get(1)?;
-        TextBox {
-            left: x,
-            right: x,
-            top: y,
-            bottom: y,
-        }
-    } else {
+    let text_box = {
         match body {
+            // Annotations size their box from measured text; the anchors bound the rest.
+            DrawingBodyGeometry::Annotation => points_box(px)?,
             DrawingBodyGeometry::Empty => {
                 let (x, y) = *px.first()?;
                 TextBox {
@@ -2068,6 +2116,129 @@ pub(crate) fn resolve_drawing_geometry<'a>(
         guides,
         text_box,
     })
+}
+
+/// Gap between a point label's text box and the point it names, in CSS px.
+pub(crate) const POINT_LABEL_GAP_CSS: f64 = 4.0;
+/// Vertices carry selection handles, so their labels clear the handle as well.
+pub(crate) const VERTEX_LABEL_GAP_CSS: f64 =
+    super::handles::ANCHOR_RADIUS + super::handles::ANCHOR_BORDER_WIDTH + POINT_LABEL_GAP_CSS;
+/// The most strokes one [`clear_label_center`] call avoids (a vertex's legs, ratio connectors,
+/// neckline and apex sides stay well under it).
+const MAX_LABEL_STROKES: usize = 8;
+/// Steps a [`clear_label_center`] label takes outward from its first placement, `gap` each.
+const LABEL_CLEAR_STEPS: u32 = 32;
+
+/// The center of a `width` x `height` text box naming `point`, placed so it never sits on the
+/// strokes that leave the point toward `toward` (their far ends or any point along them): in the
+/// widest angle between those strokes, along its bisector, with the whole box `gap` clear of the
+/// point. With no strokes, or between two equally wide openings, it leans toward `prefer` (a unit
+/// direction, e.g. up or radially outward). The center lies within [`clear_label_max_reach`] of
+/// `point`.
+pub(crate) fn clear_label_center(
+    point: Point,
+    toward: &[Point],
+    width: f64,
+    height: f64,
+    gap: f64,
+    prefer: Point,
+) -> Point {
+    debug_assert!(
+        toward.len() <= MAX_LABEL_STROKES,
+        "{} strokes",
+        toward.len()
+    );
+    let mut angles = [0.0_f64; MAX_LABEL_STROKES];
+    let mut count = 0;
+    for &(x, y) in toward.iter().take(MAX_LABEL_STROKES) {
+        if (x - point.0).hypot(y - point.1) > f64::EPSILON {
+            angles[count] = (y - point.1).atan2(x - point.0);
+            count += 1;
+        }
+    }
+    let angles = &mut angles[..count];
+    angles.sort_by(f64::total_cmp);
+    let prefer_angle = prefer.1.atan2(prefer.0);
+    let direction = if angles.is_empty() {
+        prefer_angle
+    } else {
+        // Each opening runs from one stroke to the next counterclockwise; the widest wins, and
+        // near-ties go to the opening whose bisector is closest to the preference.
+        let tau = std::f64::consts::TAU;
+        let mut best = (f64::MIN, f64::MIN, prefer_angle);
+        for (index, &start) in angles.iter().enumerate() {
+            let end = angles.get(index + 1).copied().unwrap_or(angles[0] + tau);
+            let span = end - start;
+            let bisector = start + span / 2.0;
+            let lean = (bisector - prefer_angle).cos();
+            let wider = span > best.0 + 1e-6;
+            let tie = (span - best.0).abs() <= 1e-6 && lean > best.1;
+            if wider || tie {
+                best = (span, lean, bisector);
+            }
+        }
+        best.2
+    };
+    let (dx, dy) = (direction.cos(), direction.sin());
+    // The box's support distance along the direction keeps its nearest corner `gap` away; in a
+    // narrow opening the box steps further out until it clears every stroke through the point.
+    let mut reach = gap + dx.abs() * width / 2.0 + dy.abs() * height / 2.0;
+    let clear = |reach: f64| {
+        let (cx, cy) = (point.0 + dx * reach, point.1 + dy * reach);
+        let bounds = [
+            cx - width / 2.0 - gap / 2.0,
+            cy - height / 2.0 - gap / 2.0,
+            cx + width / 2.0 + gap / 2.0,
+            cy + height / 2.0 + gap / 2.0,
+        ];
+        !toward
+            .iter()
+            .any(|&end| segment_crosses_box(point, end, bounds))
+    };
+    for _ in 0..LABEL_CLEAR_STEPS {
+        if clear(reach) {
+            break;
+        }
+        reach += gap;
+    }
+    (point.0 + dx * reach, point.1 + dy * reach)
+}
+
+/// The farthest a [`clear_label_center`] box's center can lie from its point: the first
+/// placement (at most `gap` plus half the box's width and height) and every outward step.
+pub(crate) fn clear_label_max_reach(width: f64, height: f64, gap: f64) -> f64 {
+    f64::from(LABEL_CLEAR_STEPS + 1) * gap + (width + height) / 2.0
+}
+
+/// Whether the segment `a`-`b` enters the box `[left, top, right, bottom]`.
+pub(crate) fn segment_crosses_box(
+    a: Point,
+    b: Point,
+    [left, top, right, bottom]: [f64; 4],
+) -> bool {
+    // Liang-Barsky clipping: the segment's parameter interval inside the box is non-empty.
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let (mut enter, mut leave) = (0.0_f64, 1.0_f64);
+    for (p, q) in [
+        (-dx, a.0 - left),
+        (dx, right - a.0),
+        (-dy, a.1 - top),
+        (dy, bottom - a.1),
+    ] {
+        if p.abs() <= f64::EPSILON {
+            if q < 0.0 {
+                return false;
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                enter = enter.max(t);
+            } else {
+                leave = leave.min(t);
+            }
+        }
+    }
+    enter <= leave
 }
 
 #[cfg(test)]
@@ -2731,8 +2902,12 @@ mod tests {
     }
 
     #[test]
-    fn marker_arrows_keep_the_anchor_at_the_tip_and_signpost_keeps_its_stem() {
-        let options = DrawingGeometryOptions::default();
+    fn marker_arrows_keep_the_anchor_at_the_tip_and_signpost_is_an_annotation() {
+        let options = DrawingGeometryOptions {
+            icon_size: 48.0,
+            device_scale: 1.0,
+            ..DrawingGeometryOptions::default()
+        };
         for kind in [
             DrawingKind::ArrowMarkerUp,
             DrawingKind::ArrowMarkerDown,
@@ -2742,11 +2917,22 @@ mod tests {
             let geometry =
                 resolve_drawing_geometry(kind, &[(40.0, 50.0)], 100.0, 0.0, 100.0, options)
                     .unwrap();
-            let DrawingBodyGeometry::Marker(marker) = geometry.body else {
-                panic!("arrow marker needs shared marker geometry");
+            let DrawingBodyGeometry::IconStamp { center, size } = geometry.body else {
+                panic!("arrow marker needs its icon box");
             };
-            assert_eq!(marker.triangle()[0], (40.0, 50.0));
-            assert!(marker.stem().is_none());
+            // The arrow icon's tip lands on the anchor, inside its box.
+            let (_, tip) = super::super::icons::arrow_marker_icon(kind).unwrap();
+            let scale = size / super::super::icons::ICON_VIEWBOX;
+            let tip_px = (
+                center.0 + (tip.0 - super::super::icons::ICON_VIEWBOX / 2.0) * scale,
+                center.1 + (tip.1 - super::super::icons::ICON_VIEWBOX / 2.0) * scale,
+            );
+            assert!(
+                (tip_px.0 - 40.0).abs() < 1e-9 && (tip_px.1 - 50.0).abs() < 1e-9,
+                "{kind:?}"
+            );
+            assert_eq!(size, 48.0);
+            assert_ne!(center, (40.0, 50.0));
         }
         let signpost = resolve_drawing_geometry(
             DrawingKind::Signpost,
@@ -2757,10 +2943,8 @@ mod tests {
             options,
         )
         .unwrap();
-        let DrawingBodyGeometry::Marker(signpost) = signpost.body else {
-            panic!("signpost needs marker geometry");
-        };
-        assert_eq!(signpost.stem(), Some(((20.0, 80.0), (40.0, 50.0))));
+        // The signpost is a box annotation laid out by `ChartEngine::annotation_layout`.
+        assert!(matches!(signpost.body, DrawingBodyGeometry::Annotation));
     }
 
     #[test]
@@ -2877,6 +3061,8 @@ mod tests {
             let options = DrawingGeometryOptions {
                 device_scale: scale,
                 signpost_pole: 40.0 * scale,
+                // The pole is the fork form's (upstream's signpost is a box on a post).
+                annotation_fork_form: true,
                 ..DrawingGeometryOptions::default()
             };
             let px = [(30.0, 80.0), (30.0, 80.0)];
@@ -2886,11 +3072,32 @@ mod tests {
             let DrawingBodyGeometry::Marker(marker) = geometry.body else {
                 panic!("signpost marker")
             };
-            assert_eq!(
-                marker.stem(),
-                Some(((30.0, 80.0), (30.0, 80.0 - 40.0 * scale)))
-            );
+            assert_eq!(marker.stem(), ((30.0, 80.0), (30.0, 80.0 - 40.0 * scale)));
             assert_eq!(marker.radius, 7.0 * scale);
         }
+    }
+
+    #[test]
+    fn clear_label_centers_stay_within_their_max_reach() {
+        // A box hemmed in on every side steps out the whole loop; its center stays bounded.
+        let point = (50.0, 50.0);
+        let toward: Vec<Point> = (0..8)
+            .map(|index| {
+                let angle = f64::from(index) * std::f64::consts::TAU / 8.0;
+                (point.0 + 400.0 * angle.cos(), point.1 + 400.0 * angle.sin())
+            })
+            .collect();
+        let (width, height, gap) = (40.0, 14.0, 4.0);
+        let center = clear_label_center(point, &toward, width, height, gap, (0.0, -1.0));
+        let reach = (center.0 - point.0).hypot(center.1 - point.1);
+        assert!(
+            reach <= clear_label_max_reach(width, height, gap) + 1e-9,
+            "{reach}"
+        );
+        assert!(reach > gap + (width + height) / 2.0, "{reach}");
+        // With no strokes the box sits `gap` clear toward the preference.
+        let free = clear_label_center(point, &[], width, height, gap, (0.0, -1.0));
+        assert!((free.0 - point.0).abs() < 1e-9);
+        assert!((point.1 - free.1 - (gap + height / 2.0)).abs() < 1e-9);
     }
 }

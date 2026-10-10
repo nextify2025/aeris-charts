@@ -9,6 +9,7 @@ use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, Prim};
 
 use super::super::super::DrawingTextLayout;
+use super::super::super::tests::on_tick;
 use super::{ElliottWaveDegree, WaveMark};
 use crate::{
     ChartEngine, DrawingAnchor, DrawingId, DrawingKind, DrawingMagnetMode, DrawingModifiers,
@@ -365,15 +366,19 @@ fn drags_nudges_and_undo_edit_patterns_as_single_history_entries() {
     for index in [0, 1, 3, 4] {
         assert_eq!(after[index], before[index], "only anchor 2 moves");
     }
-    // Bars are 20 px apart: the anchor steps one whole bar and keeps the raw price.
+    // Bars are 20 px apart: the anchor steps one whole bar and lands on the price tick.
     assert_eq!(chart.bar_spacing(), 20.0);
     assert_eq!(after[2].logical, before[2].logical + 1.0);
-    assert!(close(anchor(&chart, id, 2), (bx + 20.0, by + 10.0), 1e-6));
+    assert!(close(
+        anchor(&chart, id, 2),
+        (bx + 20.0, on_tick(&chart, by + 10.0)),
+        1e-6
+    ));
     assert!(chart.undo_drawing());
     assert_eq!(chart.drawing(id).unwrap().points, before);
 
     // Body drag from the first leg (a third of the way along, on bar 7) moves every anchor
-    // rigidly by whole bars: 45 px is two bars.
+    // by whole bars, 45 px is two bars, and each price onto its tick.
     let (x0, x1) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
     let grab = (x0.0 + (x1.0 - x0.0) / 3.0, x0.1 + (x1.1 - x0.1) / 3.0);
     chart.set_selected_drawing(None);
@@ -385,7 +390,11 @@ fn drags_nudges_and_undo_edit_patterns_as_single_history_entries() {
         let original = chart
             .drawing_to_px_for(0, DrawingPriceScale::Right, point)
             .unwrap();
-        assert!(close(moved, (original.0 + 40.0, original.1 - 12.0), 1e-6));
+        assert!(close(
+            moved,
+            (original.0 + 40.0, on_tick(&chart, original.1 - 12.0)),
+            1e-6
+        ));
         assert_eq!(
             chart.drawing(id).unwrap().points[index].logical,
             point.logical + 2.0
@@ -1128,20 +1137,31 @@ fn vertex_labels_are_body_targets_on_the_culled_path() {
     for kind in &KINDS[..11] {
         let id = add(&mut chart, *kind, zigzag_points(*kind), "{}");
         chart.build_frame();
-        let points = zigzag_points(*kind);
-        for (index, point) in points.iter().enumerate() {
-            let (x, y) = px(&chart, point.logical, point.price);
-            let Some((_, _, label_y)) = texts(&mut chart)
-                .into_iter()
-                .find(|(_, tx, ty)| (tx - x).abs() < 0.5 && *ty < y && y - ty < 30.0)
-            else {
-                assert!(kind.is_elliott() && index == 0, "{kind:?} label {index}");
-                continue;
-            };
+        // Each vertex label sits where the clearance placed it, clear of its incident strokes,
+        // and is painted and hit there.
+        let drawing = chart.drawing(id).unwrap().clone();
+        let vertices = (0..drawing.points.len())
+            .map(|index| anchor(&chart, id, index))
+            .collect::<Vec<_>>();
+        let (_, labels) = super::vertex_labels(&chart, &drawing, &vertices, 1.0);
+        let unlabeled = usize::from(kind.is_elliott());
+        assert_eq!(labels.len() + unlabeled, vertices.len(), "{kind:?}");
+        let painted = texts(&mut chart);
+        for label in &labels {
+            let (x, y) = label.center;
+            assert!(
+                painted.iter().any(|(text, tx, ty)| *text == label.text
+                    && (tx - x).abs() < 0.5
+                    && (ty - y).abs() < 0.5),
+                "{kind:?} label {} at {:?}: {painted:?}",
+                label.text,
+                label.center
+            );
             assert_eq!(
-                hit(&chart, (x, label_y)),
+                hit(&chart, (x, y)),
                 Some(id),
-                "{kind:?} label {index}"
+                "{kind:?} label {}",
+                label.text
             );
         }
         assert!(chart.remove_drawing(id));
@@ -1580,5 +1600,133 @@ fn pattern_decorations_scale_with_the_device_pixel_ratio() {
             main.iter()
                 .any(|prim| matches!(prim, Prim::Text { text, .. } if text == "a"))
         );
+    }
+}
+
+/// An XABCD pattern lying wholly over the pane, past the touch slop every drawing's bounds get,
+/// hangs the large label of its inner trough (B, between two rising legs) under the trough, clear
+/// of the legs and into the pane: the culling pad keeps it a candidate on the indexed path (more
+/// than 20 drawings) so it paints.
+#[test]
+fn a_pattern_over_the_pane_stays_a_candidate_while_its_trough_label_reaches_into_it() {
+    use aeris_charts_core::model::price_range::PriceRange;
+    let mut chart = chart();
+    crowd(&mut chart);
+    chart.panes[0].price_scale.set_auto_scale(false);
+    chart.panes[0]
+        .price_scale
+        .set_price_range(Some(PriceRange::new(100.0, 110.0)));
+    chart.build_frame();
+    let top = chart.panes[0].top;
+    let price = |chart: &ChartEngine, y: f64| chart.pane_coordinate_to_price(0, y).unwrap();
+    let points = [
+        (4.0, 30.0),
+        (8.0, 120.0),
+        (12.0, 30.0),
+        (16.0, 120.0),
+        (20.0, 30.0),
+    ]
+    .map(|(logical, above)| p(logical, price(&chart, top - above)))
+    .to_vec();
+    let id = add(
+        &mut chart,
+        DrawingKind::PatternXabcd,
+        points,
+        r#"{"text_size":30}"#,
+    );
+    for index in 0..5 {
+        assert!(
+            anchor(&chart, id, index).1 < top - 25.0,
+            "vertex {index} is over the pane"
+        );
+    }
+    assert!(viewport_candidate(&chart, id));
+    // A label's run reaches 0.6 em under its centre.
+    let painted = texts(&mut chart)
+        .into_iter()
+        .filter(|(_, _, y)| y + 0.6 * 30.0 > top)
+        .map(|(text, ..)| text)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        painted,
+        ["B"],
+        "the inner trough's label paints into the pane"
+    );
+}
+
+/// Every vertex label clears the strokes that leave its vertex, not just the legs: an XABCD's
+/// ratio connectors (`show_ratios`, on by default; the steep X → B connector runs right under
+/// B's label spot) and a head-and-shoulders' steep neckline through its neck vertices.
+#[test]
+fn vertex_labels_clear_the_ratio_connectors_and_the_neckline() {
+    let mut chart = chart();
+    let cases = [
+        (
+            DrawingKind::PatternXabcd,
+            // X sits just under B, so the X → B connector drops nearly straight down from B.
+            vec![
+                p(13.5, 100.0),
+                p(12.0, 106.0),
+                p(14.0, 103.0),
+                p(16.0, 106.0),
+                p(18.0, 100.5),
+            ],
+        ),
+        (
+            DrawingKind::PatternHeadShoulders,
+            // The neckline, steeper than the legs, runs on down-left past the left neck to meet
+            // the first leg, right where that neck's label would hang.
+            vec![
+                p(10.0, 94.0),
+                p(12.0, 104.0),
+                p(15.0, 101.0),
+                p(16.0, 107.0),
+                p(17.0, 103.0),
+                p(20.0, 105.0),
+                p(22.0, 100.0),
+            ],
+        ),
+    ];
+    for (kind, points) in cases {
+        let id = add(&mut chart, kind, points, "{}");
+        chart.build_frame();
+        let drawing = chart.drawing(id).unwrap().clone();
+        let px = (0..drawing.points.len())
+            .map(|index| anchor(&chart, id, index))
+            .collect::<Vec<_>>();
+        let mut strokes = px
+            .windows(2)
+            .map(|leg| (leg[0], leg[1]))
+            .collect::<Vec<_>>();
+        let connectors = super::ratios(kind)
+            .iter()
+            .filter(|&&ratio| super::ratio_value(&drawing, ratio).is_some())
+            .map(|ratio| (px[ratio.from], px[ratio.to]))
+            .collect::<Vec<_>>();
+        let neckline = super::neckline(&px).filter(|_| kind == DrawingKind::PatternHeadShoulders);
+        assert!(
+            !connectors.is_empty() || neckline.is_some(),
+            "{kind:?} draws the strokes under test"
+        );
+        strokes.extend(connectors);
+        strokes.extend(neckline);
+        let (size, labels) = super::vertex_labels(&chart, &drawing, &px, 1.0);
+        assert!(!labels.is_empty(), "{kind:?}");
+        for label in &labels {
+            // The headless measure is 0.6 em per character; shrunk by half a pixel so a label
+            // that only touches a stroke does not count.
+            let width = label.text.chars().count() as f64 * size * 0.6;
+            let (half_w, half_h) = (width / 2.0 - 0.5, size * 0.6 - 0.5);
+            let (cx, cy) = label.center;
+            let rect = [cx - half_w, cy - half_h, cx + half_w, cy + half_h];
+            for &(a, b) in &strokes {
+                assert!(
+                    !crate::drawings::geometry::segment_crosses_box(a, b, rect),
+                    "{kind:?}: {} at {rect:?} crosses {a:?}-{b:?}",
+                    label.text
+                );
+            }
+        }
+        assert!(chart.remove_drawing(id));
     }
 }

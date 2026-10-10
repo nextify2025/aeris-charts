@@ -301,12 +301,13 @@ test("curves place through points on the curve and edit through on-curve handles
   const list = await drawings(page);
   expect(list).toHaveLength(1);
   // Stored in order along the curve: its start, the clicked point it passes through, its end,
-  // each on its bar slot at the clicked price.
+  // each on its bar slot at the clicked price's 0.01 tick.
+  const tick = (price) => Math.round(price * 100) / 100;
   const stored = list[0].points;
   expect(stored.map((point) => point.logical)).toEqual([s.l0, mid, s.l1]);
-  expect(stored[0].price).toBeCloseTo(s.p_lo, 4);
-  expect(stored[1].price).toBeCloseTo(s.p_hi, 4);
-  expect(stored[2].price).toBeCloseTo(s.p_lo, 4);
+  expect(stored[0].price).toBeCloseTo(tick(s.p_lo), 9);
+  expect(stored[1].price).toBeCloseTo(tick(s.p_hi), 9);
+  expect(stored[2].price).toBeCloseTo(tick(s.p_lo), 9);
   expect(await page.evaluate(() => window.__chart.selected_drawing()?.kind())).toBe("curve");
   expect(await page.evaluate((id) => window.__chart.drawing_handle_count(id), list[0].id)).toBe(3);
   // The clicked point is an anchor handle on the curve; dragging it bends the curve through the
@@ -320,7 +321,7 @@ test("curves place through points on the curve and edit through on-curve handles
   const bent = (await drawings(page))[0].points;
   expect(bent[1].logical).toBe(mid);
   const dropped = await page.evaluate((y) => window.__main.coordinate_to_price(y), through.y + 40);
-  expect(bent[1].price).toBeCloseTo(dropped, 4);
+  expect(bent[1].price).toBeCloseTo(tick(dropped), 9);
   expect(bent[1].price).toBeLessThan(stored[1].price);
   expect(bent[0]).toEqual(stored[0]);
   expect(bent[2]).toEqual(stored[2]);

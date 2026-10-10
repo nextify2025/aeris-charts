@@ -2773,8 +2773,10 @@ export function is_footprint_series_kind(kind: series_kind): kind is "footprint"
  * placing, dragging, and moving its body, so drawings step bar by bar horizontally (a magnet's
  * chosen bar wins; Shift-straightening runs after the snap; freehand strokes stay unsnapped), and
  * a horizontal keyboard nudge steps whole bars (a rotated rectangle's width handle, a perpendicular
- * distance, moves by px). Prices stay raw except on the measuring tools and
- * the long and short positions, which also snap to price ticks. Every kind defaults to a 1 px
+ * distance, moves by px). Every kind except `anchored_text` also lands its prices on the price
+ * tick, and a vertical keyboard nudge moves at least one tick. A magnet's chosen OHLC price stays
+ * exact, freehand strokes stay unsnapped, and a drag that moves a time-only kind (such as
+ * `vertical_line` or `anchored_vwap`) in time keeps its stored price. Every kind defaults to a 1 px
  * line except the 12 px `highlighter`.
  *
  * The measuring tools (`price_range`, `date_range`, `date_price_range`) snap both anchors to
@@ -3162,7 +3164,10 @@ export type drawing_line_cap = "none" | "arrow" | "circle";
  * to the nearest rendered OHLC price, `weak` snaps only within 12 CSS px of it, and `off` keeps the
  * pointer's point. A drawing uses the stronger of its own and the chart mode. Holding Ctrl/Cmd
  * upgrades a drawing's own `weak` or `strong` magnet to `strong`; for a drawing whose own magnet
- * is `off` it toggles the chart mode (off becomes strong, weak or strong becomes off).
+ * is `off` it toggles the chart mode (off becomes strong, weak or strong becomes off). That applies
+ * while placing, on anchor and handle presses, and to the Shift measure: a Ctrl/Cmd press on an
+ * unlocked drawing's body clones the drawing instead, and the held key does not toggle the
+ * copy's magnet.
  */
 export type drawing_magnet_mode = "off" | "weak" | "strong";
 export type drawing_interval_unit = "seconds" | "minutes" | "hours" | "days" | "weeks" | "months" | "ticks" | "ranges";
@@ -3183,12 +3188,16 @@ export type drawing_wave_degree = "subminuette" | "minuette" | "minute" | "minor
 export type drawing_property_type = "boolean" | "number" | "integer" | "string" | "color" | "enum" | "points" | "levels" | "interval_set";
 export interface drawing_property_descriptor { name: string; property_type: drawing_property_type; default: unknown; min?: number; max?: number; enum_values: string[] }
 export interface drawing_property_schema { revision: number; kind: drawing_kind; properties: drawing_property_descriptor[] }
+
+/** A built-in vector icon: the `icon_name` value and inline SVG markup for pickers. */
+export interface builtin_drawing_icon { name: string; svg: string }
 export interface drawing_template { name: string; kind: drawing_kind; options: Partial<drawing_options> }
 export type drawing_kind_options =
   | { kind: "rectangle"; fill_color?: string; preview_fill_color?: string; border_visible: boolean; show_labels: boolean; axis_bands_visible: boolean; label_color?: string; label_text_color?: string; snap_time_to_data: boolean }
   | { kind: "text"; box_color?: string; box_border_color?: string; box_border_width: number }
   | { kind: "anchored_text"; screen_x: number; screen_y: number; box_color?: string; box_border_color?: string; box_border_width: number }
   | { kind: "icon_stamp"; icon_name?: string; icon_size: number }
+  | { kind: "arrow_marker"; icon_size: number }
   | { kind: "bars_pattern"; mirror_x: boolean; mirror_y: boolean; mode: bars_pattern_mode; bar_count: number }
   | { kind: "position"; levels: drawing_level[]; account_size: number; risk_percent: number }
   | { kind: "levels"; levels: drawing_level[]; reverse: boolean; log_scale: boolean; show_prices: boolean; show_values: boolean; show_percents: boolean; label_align: "left" | "center" | "right" }
@@ -3388,9 +3397,12 @@ export interface gann_tool_options {
  */
 export type bars_pattern_mode = "bars" | "oc_bars" | "line_open" | "line_high" | "line_low" | "line_close" | "hl_bars";
 /**
- * The built-in vector icon names. An `icon_stamp` whose `icon_name` has no registered raster
- * (see {@link chart_api.register_drawing_icon}) and is one of these names paints the built-in
- * glyph; any other unregistered name paints a placeholder.
+ * The earlier fork build's vector glyph names. An `icon_stamp` paints, in order: a raster
+ * registered under its `icon_name` (see {@link chart_api.register_drawing_icon}); the built-in
+ * solid icon of that name ({@link chart_api.builtin_drawing_icons}), which `star`, `heart`,
+ * `circle`, `square`, and `diamond` paint on every stamp, saved ones included; the fork glyph for
+ * `check`, `cross`, `triangle_up`, and `triangle_down`, which have no built-in solid icon;
+ * otherwise a placeholder.
  */
 export type drawing_icon =
   | "star"
@@ -3406,17 +3418,20 @@ export type drawing_icon =
  * Projection & Annotations options (`tool_options.projection_annotation`). The deprecated fields
  * are input aliases mapped onto flat drawing options on patch and restore and never written back.
  * The block's presence (even `{}`) selects the earlier fork build's look of `projection` (a
- * filled sector and a stats box beside the target), `note` (a pin whose text box shows while the
- * note is hovered, selected, or edited), `comment` and `price_label` (speech bubbles at the
- * anchor, the price label's price first, instead of the price label's rounded bubble above-right
- * of its anchor, whose inline editor sits on its text), `price_note` (its price and text in one box),
- * `signpost` (a text plate; placing it opens the editor), the arrow markers (their text past the
- * tail), and `forecast` (source and target boxes with `Success`/`Failure` on the market colors);
- * `null` restores the upstream look, which new drawings keep. Placing a note, comment, callout,
- * signpost, or anchored text with the block starts from that build's text (`"Note"`, ...). A
- * field is written only when it differs from its default, so a block at its defaults reads back
- * as `{}`: documents that build wrote (and its clipboard and sync items with its anchor counts)
- * restore those tools with that empty block.
+ * filled sector and a stats box beside the target), a one-anchor `note` (a pin whose text box
+ * shows while the note is hovered, selected, or edited), `comment` and `price_label` (speech
+ * bubbles at the anchor, the price label's price first, instead of the price label's rounded
+ * bubble above-right of its anchor, whose inline editor sits on its text), a one-anchor
+ * `price_note` (its price and text in one box on a line across the pane), `signpost` (a text
+ * plate on a pole), the arrow markers (their text past the tail), and `forecast` (source and
+ * target boxes with `Success`/`Failure` on the market colors); a two-anchor note or price note
+ * keeps the block but paints the upstream box. An `icon_stamp`'s look follows its name alone.
+ * `null` restores the upstream look, which new drawings keep. Placing a comment, callout, signpost,
+ * or anchored text with the block starts from that build's text (`"Comment"`, ...); a note is
+ * placed with two anchors, so it keeps the upstream box and an empty text. A field is written only
+ * when it differs from its default, so a block at its defaults reads back as `{}`: documents that
+ * build wrote (and its clipboard and sync items with its anchor counts) restore those tools with
+ * that empty block.
  */
 export interface projection_annotation_tool_options {
   /** @deprecated Input alias of `bars_pattern_mode` (`"hl_bars"` becomes `"bars"`). */
@@ -3432,7 +3447,7 @@ export interface projection_annotation_tool_options {
   bars?: [number, number, number, number][];
   /** @deprecated Input alias of `icon_name` (the built-in icon of that name). */
   icon?: drawing_icon;
-  /** @deprecated Input alias of `icon_size`, 8..96 CSS px (larger legacy values are clamped on restore). */
+  /** @deprecated Input alias of `icon_size`, 8..256 CSS px (larger legacy values are clamped on restore). */
   icon_size?: number;
   /** `note` with the block: paint its text box also while the note is neither hovered, selected, nor edited. */
   always_show_text?: boolean;
@@ -3547,11 +3562,12 @@ export interface drawing_options {
   screen_x: number;
   screen_y: number;
   /**
-   * Icon stamp: the name of a raster registered with {@link chart_api.register_drawing_icon}; an
-   * unregistered {@link drawing_icon} name paints that built-in vector glyph.
+   * Icon stamp: a registered image name ({@link chart_api.register_drawing_icon}), else a built-in
+   * solid icon name ({@link chart_api.builtin_drawing_icons}), else a legacy {@link drawing_icon}
+   * glyph name.
    */
   icon_name?: string;
-  /** Icon stamp size in CSS px, 8..96. */
+  /** Icon stamp and arrow marker size in CSS px, 8..256 (four corner handles resize it). */
   icon_size: number;
   bars_pattern_mirror_x: boolean;
   bars_pattern_mirror_y: boolean;
@@ -3665,8 +3681,13 @@ export interface persisted_drawing_style_v1 {
   wave_degree?: drawing_wave_degree;
   screen_x?: number;
   screen_y?: number;
+  /**
+   * Icon stamp: a registered image name ({@link chart_api.register_drawing_icon}), else a built-in
+   * solid icon name ({@link chart_api.builtin_drawing_icons}), else a legacy {@link drawing_icon}
+   * glyph name.
+   */
   icon_name?: string;
-  /** Icon stamp size in CSS px, 8..96. */
+  /** Icon stamp and arrow marker size in CSS px, 8..256. */
   icon_size?: number;
   /**
    * Frozen OHLC sample for a bars-pattern ghost copy; at most 512 bars, `offset` below 512. A
@@ -5580,7 +5601,9 @@ export interface chart_api {
    * placement and editing to the nearest OHLC value only within a small pixel distance,
    * `"strong"` always snaps. A drawing's own `magnet` option can raise it for that drawing.
    * Holding Ctrl/Cmd upgrades a drawing's own magnet to `"strong"` and otherwise toggles this
-   * mode temporarily. Touch input uses this mode.
+   * mode temporarily, while placing, on anchor and handle presses, and for the Shift measure; a
+   * Ctrl/Cmd press on an unlocked drawing's body duplicates the drawing instead. Touch input uses
+   * this mode.
    */
   set_drawing_magnet_mode(mode: drawing_magnet_mode): void;
   drawing_magnet_mode(): drawing_magnet_mode;
@@ -5592,6 +5615,11 @@ export interface chart_api {
   /** Register a bounded chart-local RGBA8 stamp by name. Re-register to replace its pixels. */
   register_drawing_icon(name: string, width: number, height: number, pixels: Uint8Array): void;
   remove_drawing_icon(name: string): boolean;
+  /**
+   * The built-in solid icons, in catalog order. Pass a `name` as an icon stamp's `icon_name`;
+   * `svg` is inline markup (`currentColor` fill) for icon pickers.
+   */
+  builtin_drawing_icons(): builtin_drawing_icon[];
   /** Return the object-tree snapshot as stable JSON-compatible records. */
   drawing_object_tree(): unknown[];
   /** Set host-supplied interval metadata used by interval visibility. */
@@ -5658,7 +5686,10 @@ export interface chart_api {
   /** Additive drawing-tool state subscription used by toolbar/controller features. */
   subscribe_drawing_tool_change(handler: drawing_tool_change_handler): void;
   unsubscribe_drawing_tool_change(handler: drawing_tool_change_handler): void;
-  /** Fire after an engine-owned interactive drawing is committed. */
+  /**
+   * Fire after an engine-owned interactive drawing is committed, including the copy a Ctrl/Cmd
+   * drag of an unlocked drawing's body commits (an unmoved copy is discarded and fires nothing).
+   */
   subscribe_drawing_created(handler: drawing_created_handler): void;
   unsubscribe_drawing_created(handler: drawing_created_handler): void;
   /**

@@ -55,7 +55,8 @@
 // ratio connectors and boxed ratios (`tool_options.pattern.show_ratios`, on through its stored
 // default, P6), the shaded XABCD and cypher triangles (`fill_enabled`), the triangle pattern's
 // sides to their apex by `extend_left`/`extend_right` (P3; its culling bounds pad by one pattern
-// width), vertex labels as body targets at upstream's placement (P1; the text-run hit box) and
+// width), vertex labels as body targets at upstream's placement, clear of every stroke leaving
+// the vertex, the ratio connectors and the neckline included (P1; the text-run hit box) and
 // `show_wave`; upstream behaviour changed by owner decision: the head-and-shoulders neckline on
 // every drawing with its shading by `fill_enabled` (P2), the 12-degree Frost-Prechter Elliott
 // notation with rings and the start unlabeled (P4), and the patterns' and waves' placement previews
@@ -87,44 +88,52 @@
 // the projection's sector (`DrawingBodyGeometry::Sector`, A2; its culling bounds leave time open)
 // and its stats box, the note's pin (`NotePin`) with its box shown while edited, focused (the
 // frame's focus key rebuilds the layer) or `always_show_text`, the comment's and the price label's
-// speech-bubble tails (`SpeechTail`, A5), the price note's boxed price and text (A4, additive
-// only), the signpost's plate and its editor on placement (A7), the arrow marks' text past the
-// tail, every box the drawing's one text block (`fork_text_box`, owned statically by kind and
-// block), the fork's starter texts at commit (A6), and the forecast's source dot and boxes (change,
-// target time, Success/Failure on the market colors, hit targets; A10); independent of the form,
-// the coincident signpost's 40 CSS px pole with its pole-top handle, the text annotations'
-// multi-line text blocks (`TextBlock`; one line stays upstream's run), and the bars pattern's
-// bucket aggregation of wide sources at bucket-index offsets (A9); channel `extend_*`, the
-// callout's tip and box handles, the highlighter's once-filled tube, the regression trend's dashed
-// anchor segment while it has no fit, and the clip-aware flattening of the ellipse, circle, arc,
-// curve and double curve (`geometry.rs`: within 0.1 px of the true curve at any zoom, bounded
-// points, paint and hit flattened by the same rule, dashed outlines as solid dash runs). Not
-// restored, by owner decision (they would change upstream's anchor or option contracts): a ray
-// turned into a segment and the extended line's `extend_*` toggles (upstream payloads carry them as
-// `false`), the five-stat default of new info lines (they keep upstream's seven in its statistics
-// card; fork documents keep five), the projection's independent sector radius (its third anchor;
-// A3), the price note's leader and label offset (its second anchor; A4), the bars pattern's box fit
-// (A8), multi-line blocks for the plain text tool (A11: it stays one run), the symmetric rotated
-// rectangle placed and edited around its center axis (S4: upstream's edge and depth placement
-// stays; only the width handles are restored), a numeric fixed-square size, the three drives'
-// seventh anchor (its last leg; upstream's contract has six), the triangle pattern's apex sides and
-// the patterns' shading on new drawings (opt-in through `extend_*` and `fill_enabled`; fork
-// documents set them), and the fork's look as the default of new Fibonacci drawings (palette levels
-// with bands, the dashed trend line, the fan grid; F1) and of new spirals (the golden spiral; F3):
-// hosts arm those options explicitly. Also kept as upstream draws them (docs/api/compatibility.md):
-// the fork's boxed pattern and Elliott point labels above highs and below lows (P1; upstream's
-// labels, a migrated triangle's D-E leg and E label, and the three drives' six labels stay), the
-// speed fan's time rays, ring, arc and wedge label placement, half speed arcs facing the other
-// anchor rather than up or down, exact log-scale fib prices, the pitchfork's unextended tines that
-// honour `extend_*` (upstream's tines always ray to the pane edge), A-B swing guide (upstream draws
-// the B-C base) and always-red median, the Gann fan's lines bounded by the anchors' box with "1x2"
-// angle names and the `extend_right` default (upstream's fan rays to the pane edge without the
-// fork's angle names), the Gann box's four-side labels (a split-axis box labels its time levels
-// above it only) and its angles under the levels (they paint above, as upstream's square fans do),
-// the straighten modes, the fork's band and zone alphas, the regression's sample deviation, and a
-// fork regression whose `middle_line` is off (upstream's solid centre, not none). New price labels,
-// trend angles and info lines without a fork block take upstream's bubble, dotted angle and
-// statistics card.
+// speech-bubble tails (`SpeechTail`, A5), the price note's boxed price and text on its pane-wide
+// line (A4; the fork's note and price note have one anchor, so a two-anchor one keeps the block
+// inert and paints upstream's box), the signpost's plate on its pole (A7, its editor on placement,
+// is upstream's own behaviour now), the arrow marks' text past the solid arrow's tail (upstream's
+// arrow icon paints on every arrow mark), every box the drawing's one text block (`fork_text_box`,
+// owned statically by kind and block), the fork's starter texts at commit (A6), and the forecast's
+// source dot and boxes (change, target time, Success/Failure on the market colors, hit targets;
+// A10); in the fork form only, the coincident signpost's 40 CSS px pole with its pole-top handle;
+// independent of the form, the multi-line text of the note, comment, callout, price note and
+// anchored text (R9: inside the shared annotation layout for upstream's boxes, a `TextBlock` for
+// the anchored text and the fork boxes; the block-less signpost stays one line, as upstream has
+// it), and the bars pattern's bucket aggregation of wide sources at bucket-index offsets (A9);
+// channel `extend_*`, the callout's tip and box handles (upstream keeps only the tip and cannot
+// move the box alone), the highlighter's once-filled tube, the regression trend's dashed anchor
+// segment while it has no fit, and the clip-aware flattening of the ellipse, circle, arc, curve and
+// double curve (`geometry.rs`: within 0.1 px of the true curve at any zoom, bounded points, paint
+// and hit flattened by the same rule, dashed outlines as solid dash runs). Not restored, by owner
+// decision (they would change upstream's anchor or option contracts): a ray turned into a segment
+// and the extended line's `extend_*` toggles (upstream payloads carry them as `false`), the
+// five-stat default of new info lines (they keep upstream's seven in its statistics card; fork
+// documents keep five), the projection's independent sector radius (its third anchor; A3), the fork
+// price note's leader and label offset (A4; upstream's two-anchor price note draws its own line to
+// its second anchor), the bars pattern's box fit (A8), multi-line blocks for the plain text tool
+// (A11: it stays one run), the symmetric rotated rectangle placed and edited around its center axis
+// (S4: upstream's edge and depth placement stays; only the width handles are restored), a numeric
+// fixed-square size, the three drives' seventh anchor (its last leg; upstream's contract has six),
+// the triangle pattern's apex sides and the patterns' shading on new drawings (opt-in through
+// `extend_*` and `fill_enabled`; fork documents set them), and the fork's look as the default of
+// new Fibonacci drawings (palette levels with bands, the dashed trend line, the fan grid; F1) and
+// of new spirals (the golden spiral; F3): hosts arm those options explicitly. Also kept as upstream
+// draws them (docs/api/compatibility.md): the fork's boxed pattern and Elliott point labels above
+// highs and below lows (P1; upstream's labels, a migrated triangle's D-E leg and E label, and the
+// three drives' six labels stay), the speed fan's time rays, ring, arc and wedge label placement,
+// half speed arcs facing the other anchor rather than up or down, exact log-scale fib prices, the
+// pitchfork's unextended tines that honour `extend_*` (upstream's tines always ray to the pane
+// edge), A-B swing guide (upstream draws the B-C base) and always-red median, the Gann fan's lines
+// bounded by the anchors' box with "1x2" angle names and the `extend_right` default (upstream's fan
+// rays to the pane edge without the fork's angle names), the Gann box's four-side labels (a
+// split-axis box labels its time levels above it only) and its angles under the levels (they paint
+// above, as upstream's square fans do), the straighten modes, the fork's band and zone alphas, the
+// regression's sample deviation, and a fork regression whose `middle_line` is off (upstream's solid
+// centre, not none). New price labels, trend angles and info lines without a fork block take
+// upstream's bubble, dotted angle and statistics card. Every icon stamp named star, heart, circle,
+// square or diamond, saved ones included, paints the solid suite's icon of that name, a little
+// smaller in the same box, not the fork's vector glyph (owner question Q1, answer A: no stored
+// marker); the fork glyph stays only for check, cross and the triangles, which the suite lacks.
 
 use super::DrawingKind;
 use super::kinds::DrawingFamily;
@@ -183,6 +192,15 @@ pub(crate) enum DrawingHandleMode {
     Anchors,
     Endpoints,
     RectangleBounds,
+    /// One handle on anchor `index`, square or round: the signpost's post top. The other
+    /// anchors move with the body.
+    OneAnchor {
+        index: u8,
+        square: bool,
+    },
+    /// An icon's square box with four round corner handles (`Anchor(0..4)`, clockwise from top
+    /// left) that resize it about its anchor.
+    IconBox,
     Position,
 }
 
@@ -267,10 +285,6 @@ pub(crate) struct DrawingToolSpec {
     pub(crate) text_layout: DrawingTextLayout,
     /// Paint the first anchor's price as a tag on the owning price axis (horizontal-line idiom).
     pub(crate) axis_price_label: bool,
-    /// Every tool's anchors land on the crosshair's time slot during creation, anchor drags, and
-    /// body moves. These tools also land prices on the instrument/scale tick, so derived
-    /// statistics read whole ticks.
-    pub(crate) price_tick_snap: bool,
     /// A coordinate every anchor shares (a horizontal segment's price, a vertical ray's bar).
     pub(crate) anchor_link: DrawingAnchorLink,
     /// The axis tag (`axis_price_label`) shows the drawing's `text` instead of its price when it
@@ -332,7 +346,6 @@ const TREND_LINE: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Segment,
     axis_price_label: false,
-    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -353,7 +366,6 @@ const HORIZONTAL_LINE: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: true,
-    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -374,7 +386,6 @@ const HORIZONTAL_RAY: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: true,
-    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -395,7 +406,6 @@ const VERTICAL_LINE: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
-    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -416,7 +426,6 @@ const RECTANGLE: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
-    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -437,7 +446,6 @@ const TEXT: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
-    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -458,7 +466,6 @@ const BRUSH: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
-    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -479,7 +486,6 @@ const PATH: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
-    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -500,7 +506,6 @@ const LONG_POSITION: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
-    price_tick_snap: true,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -521,7 +526,6 @@ const SHORT_POSITION: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
-    price_tick_snap: true,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -542,7 +546,6 @@ const FIXED_RANGE_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
-    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -563,7 +566,6 @@ const ANCHORED_VOLUME_PROFILE: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
-    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -584,7 +586,6 @@ const ANCHORED_VWAP: DrawingToolSpec = DrawingToolSpec {
     family: None,
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
-    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -856,16 +857,34 @@ const SINE_LINE: DrawingToolSpec = DrawingToolSpec {
     price_extent: DrawingPriceExtent::Full,
     ..shape_spec(DrawingKind::SineLine, 64, "sine_line", 2)
 };
+/// Icon-drawn tools select with a resizable box (`DrawingHandleMode::IconBox`).
+const fn icon_spec(kind: DrawingKind, wire_id: u8, name: &'static str) -> DrawingToolSpec {
+    DrawingToolSpec {
+        handles: DrawingHandleMode::IconBox,
+        ..shape_spec(kind, wire_id, name, 1)
+    }
+}
 const ARROW_MARKER_UP: DrawingToolSpec =
-    shape_spec(DrawingKind::ArrowMarkerUp, 65, "arrow_marker_up", 1);
+    icon_spec(DrawingKind::ArrowMarkerUp, 65, "arrow_marker_up");
 const ARROW_MARKER_DOWN: DrawingToolSpec =
-    shape_spec(DrawingKind::ArrowMarkerDown, 66, "arrow_marker_down", 1);
+    icon_spec(DrawingKind::ArrowMarkerDown, 66, "arrow_marker_down");
 const ARROW_MARKER_LEFT: DrawingToolSpec =
-    shape_spec(DrawingKind::ArrowMarkerLeft, 67, "arrow_marker_left", 1);
+    icon_spec(DrawingKind::ArrowMarkerLeft, 67, "arrow_marker_left");
 const ARROW_MARKER_RIGHT: DrawingToolSpec =
-    shape_spec(DrawingKind::ArrowMarkerRight, 68, "arrow_marker_right", 1);
+    icon_spec(DrawingKind::ArrowMarkerRight, 68, "arrow_marker_right");
 const FLAG_MARK: DrawingToolSpec = shape_spec(DrawingKind::FlagMark, 69, "flag_mark", 1);
-const SIGNPOST: DrawingToolSpec = shape_spec(DrawingKind::Signpost, 70, "signpost", 2);
+/// A signpost drops from one click: the post's base on the clicked bar and its text box a fixed
+/// height above (the preset owns the second point). Only the post top is a handle.
+const SIGNPOST: DrawingToolSpec = DrawingToolSpec {
+    placement: DrawingPlacement::SingleClickPreset { points: 2 },
+    handles: DrawingHandleMode::OneAnchor {
+        index: 1,
+        square: true,
+    },
+    ..text_annotation_spec(DrawingKind::Signpost, 70, "signpost", 2)
+};
+/// Note, comment, callout, price note, and signpost paint a text box resolved by the shared
+/// annotation layout (annotations.rs) and edit through the engine text editor.
 const fn text_annotation_spec(
     kind: DrawingKind,
     wire_id: u8,
@@ -877,23 +896,26 @@ const fn text_annotation_spec(
         wire_id,
         name,
         placement: DrawingPlacement::ClickAnchors { count },
+        handles: DrawingHandleMode::Anchors,
         requests_text_editor: true,
         ..TEXT
     }
 }
-const NOTE: DrawingToolSpec = text_annotation_spec(DrawingKind::Note, 71, "note", 1);
+/// A note pins a box (second anchor) to a point (first anchor) with a leader line.
+const NOTE: DrawingToolSpec = text_annotation_spec(DrawingKind::Note, 71, "note", 2);
 const COMMENT: DrawingToolSpec = text_annotation_spec(DrawingKind::Comment, 72, "comment", 1);
-// The tip and the box each keep a handle (the own line's callout editing; upstream's text
-// annotations have none), so the leader's tip moves without moving the box.
+/// A callout points a wedge from its tip (first anchor) to its box (second anchor). The tip and
+/// the box corner each keep a handle (upstream offers no way to move the box alone, and the
+/// fork's box handle predates the sync); a body drag moves both.
 const CALLOUT: DrawingToolSpec = DrawingToolSpec {
     handles: DrawingHandleMode::Anchors,
     ..text_annotation_spec(DrawingKind::Callout, 73, "callout", 2)
 };
-// The note's line spans the whole pane width at its price, so no time range bounds it.
+/// A price note tags its first anchor's price above a line to its second anchor; the tag shows
+/// the price, so it opens no text editor.
 const PRICE_NOTE: DrawingToolSpec = DrawingToolSpec {
-    logical_extent: DrawingLogicalExtent::Full,
-    price_extent: DrawingPriceExtent::Full,
-    ..text_annotation_spec(DrawingKind::PriceNote, 74, "price_note", 1)
+    requests_text_editor: false,
+    ..text_annotation_spec(DrawingKind::PriceNote, 74, "price_note", 2)
 };
 const PRICE_LABEL: DrawingToolSpec = DrawingToolSpec {
     logical_extent: DrawingLogicalExtent::Full,
@@ -903,9 +925,10 @@ const PRICE_LABEL: DrawingToolSpec = DrawingToolSpec {
 const ANCHORED_TEXT: DrawingToolSpec = DrawingToolSpec {
     logical_extent: DrawingLogicalExtent::Full,
     price_extent: DrawingPriceExtent::Full,
+    handles: DrawingHandleMode::None,
     ..text_annotation_spec(DrawingKind::AnchoredText, 76, "anchored_text", 1)
 };
-const ICON_STAMP: DrawingToolSpec = shape_spec(DrawingKind::IconStamp, 77, "icon_stamp", 1);
+const ICON_STAMP: DrawingToolSpec = icon_spec(DrawingKind::IconStamp, 77, "icon_stamp");
 const GANN_BOX: DrawingToolSpec = shape_spec(DrawingKind::GannBox, 78, "gann_box", 2);
 const GANN_SQUARE: DrawingToolSpec = shape_spec(DrawingKind::GannSquare, 79, "gann_square", 2);
 const GANN_SQUARE_FIXED: DrawingToolSpec =
@@ -1162,10 +1185,41 @@ impl DrawingKind {
         )
     }
 
+    /// Icon stamps and the icon-drawn arrow markers carry an editable `icon_size`.
+    pub(crate) const fn has_icon_size(self) -> bool {
+        matches!(
+            self,
+            Self::IconStamp
+                | Self::ArrowMarkerUp
+                | Self::ArrowMarkerDown
+                | Self::ArrowMarkerLeft
+                | Self::ArrowMarkerRight
+        )
+    }
+
+    /// Text-carrying annotations edited through the engine text editor, besides the text tool.
     pub(crate) const fn is_text_annotation(self) -> bool {
         matches!(
             self,
+            Self::Note | Self::Comment | Self::Callout | Self::Signpost | Self::AnchoredText
+        )
+    }
+
+    /// Kinds whose own text may span lines (owner decision R9): the note, comment, callout,
+    /// price note, and anchored text. The signpost's upstream box stays one line, as upstream
+    /// has it, and the plain text tool stays one run (A11).
+    pub(crate) const fn multiline_kind(self) -> bool {
+        matches!(
+            self,
             Self::Note | Self::Comment | Self::Callout | Self::PriceNote | Self::AnchoredText
+        )
+    }
+
+    /// Kinds whose box, text, and connector come from the shared annotation layout.
+    pub(crate) const fn is_annotation(self) -> bool {
+        matches!(
+            self,
+            Self::Note | Self::Comment | Self::Callout | Self::PriceNote | Self::Signpost
         )
     }
 

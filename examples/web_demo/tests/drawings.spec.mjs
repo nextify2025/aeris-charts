@@ -548,10 +548,10 @@ test("a drawing's own magnet mode snaps unmodified anchor drags and Ctrl upgrade
       expect(point.logical).toBe(target);
       expect(point.price).toBeCloseTo(expected.nearest, 9);
     } else {
-      // Every drawing lands on the bar under the cursor; only the magnet snaps the price.
+      // Every drawing lands on the bar and the 0.01 price tick under the cursor; only the magnet
+      // snaps to the bar's OHLC.
       expect(point.logical).toBe(target);
-      // Browser pointer coordinates are quantized, so the raw price is exact only to ~1e-6.
-      expect(point.price).toBeCloseTo(expected.raw, 4);
+      expect(point.price).toBeCloseTo(Math.round(expected.raw * 100) / 100, 9);
       expect(point.price).not.toBe(expected.nearest);
     }
   }
@@ -589,7 +589,8 @@ test("anchor drag re-anchors one point; body drag moves the whole drawing", asyn
 
   const reanchored = (await drawings(page))[0];
   expect(reanchored.points[0].logical).toBeCloseTo(before.points[0].logical + 4, 1);
-  expect(reanchored.points[0].price).toBeCloseTo(expected_price, 6);
+  // Drawings land on the 0.01 price tick under the cursor.
+  expect(reanchored.points[0].price).toBeCloseTo(Math.round(expected_price * 100) / 100, 6);
   // Anchor 1 untouched.
   expect(reanchored.points[1].logical).toBeCloseTo(before.points[1].logical, 6);
   expect(reanchored.points[1].price).toBeCloseTo(before.points[1].price, 6);
@@ -618,7 +619,7 @@ test("anchor drag re-anchors one point; body drag moves the whole drawing", asyn
   const moved = (await drawings(page))[0];
   expect(moved.points[0].logical).toBeCloseTo(reanchored.points[0].logical - 2, 1);
   expect(moved.points[1].logical).toBeCloseTo(reanchored.points[1].logical - 2, 1);
-  expect(moved.points[0].price).toBeCloseTo(expected_body_price0, 6);
+  expect(moved.points[0].price).toBeCloseTo(Math.round(expected_body_price0 * 100) / 100, 6);
   // The shape (anchor spacing) is preserved exactly by the coordinate-space translation.
   expect(moved.points[1].logical - moved.points[0].logical)
     .toBeCloseTo(reanchored.points[1].logical - reanchored.points[0].logical, 6);
@@ -1936,7 +1937,13 @@ test("text tool: press places and opens typing mode; typing commits; leaving emp
   expect(await drawings(page)).toHaveLength(1);
 });
 
-test("inline editor caret follows engine geometry for aligned and rotated labels", async ({ page }) => {
+/**
+ * The inline editor's wrap starts on the engine run and its caret sits after the typed prefix. An
+ * unrotated run snaps the wrap and the caret to whole device pixels in page space (within half a
+ * device pixel of the engine geometry), so the one-device-pixel caret keeps one thickness; a
+ * rotated run keeps the exact transform and a whole-CSS-px caret offset.
+ */
+async function check_inline_caret_geometry(page) {
   await goto_fixture(page);
   const s = await anchor_spots(page);
   const cases = [
@@ -1967,24 +1974,56 @@ test("inline editor caret follows engine geometry for aligned and rotated labels
       const caret = document.querySelector("#aeris_charts-text-caret");
       const context = document.createElement("canvas").getContext("2d");
       context.font = editor.style.font;
+      const container = wrap.parentElement.getBoundingClientRect();
       return {
         expected,
         left: parseFloat(wrap.style.left), top: parseFloat(wrap.style.top),
+        origin_x: parseFloat(wrap.style.transformOrigin.split(" ")[0]),
         origin_y: parseFloat(wrap.style.transformOrigin.split(" ")[1]),
-        caret_left: parseFloat(caret.style.left), angle: parseFloat(wrap.style.transform.slice(7)),
+        caret_left: parseFloat(caret.style.left), caret_width: parseFloat(caret.style.width),
+        angle: parseFloat(wrap.style.transform.slice(7)),
         before_caret: context.measureText("Car").width,
-        font: editor.style.font,
+        font: editor.style.font, dpr: window.devicePixelRatio,
+        page_left: container.left, page_top: container.top,
       };
     }, { ...item, s });
     expect(actual.expected).not.toBeNull();
-    // The wrap's left-middle sits on the run's start point and rotates about it.
-    expect(actual.left).toBeCloseTo(actual.expected.x, 2);
-    expect(actual.top + actual.origin_y).toBeCloseTo(actual.expected.y, 2);
+    // The wrap rotates about the run's start point (its left-middle), wherever the wrap sits
+    // (inline styles read back with three decimals).
+    expect(actual.left + actual.origin_x).toBeCloseTo(actual.expected.x, 3);
+    expect(actual.top + actual.origin_y).toBeCloseTo(actual.expected.y, 3);
+    // One device pixel wide: whole device pixels, rounded down, at least one.
+    expect(actual.caret_width * actual.dpr).toBeCloseTo(Math.max(1, Math.floor(actual.dpr)), 4);
+    const snap_tolerance = 0.5 / actual.dpr + 1e-3;
+    if (actual.expected.angle === 0) {
+      expect(Math.abs(actual.left - actual.expected.x)).toBeLessThanOrEqual(snap_tolerance);
+      expect(Math.abs(actual.left + actual.caret_left - (actual.expected.x + actual.before_caret)))
+        .toBeLessThanOrEqual(snap_tolerance);
+      // Wrap and caret land on whole device pixels in page space (to the read-back precision;
+      // an unsnapped position is off by up to half a device pixel).
+      const device = (value) => (value * actual.dpr) - Math.round(value * actual.dpr);
+      expect(Math.abs(device(actual.page_left + actual.left))).toBeLessThan(0.01);
+      expect(Math.abs(device(actual.page_top + actual.top))).toBeLessThan(0.01);
+      expect(Math.abs(device(actual.page_left + actual.left + actual.caret_left))).toBeLessThan(0.01);
+    } else {
+      expect(actual.left).toBeCloseTo(actual.expected.x, 3);
+      expect(actual.caret_left).toBe(Math.ceil(actual.before_caret));
+    }
     expect(actual.angle).toBeCloseTo(actual.expected.angle, 4);
-    expect(actual.caret_left).toBe(Math.ceil(actual.before_caret));
     expect(actual.font.replaceAll('"', "'")).toContain(actual.expected.font_family);
     await page.evaluate(() => window.__chart.close_text_editor(false));
   }
+}
+
+test("inline editor caret follows engine geometry for aligned and rotated labels", async ({ page }) => {
+  await check_inline_caret_geometry(page);
+});
+
+test.describe("at device pixel ratio 1", () => {
+  test.use({ deviceScaleFactor: 1 });
+  test("inline editor caret follows engine geometry for aligned and rotated labels", async ({ page }) => {
+    await check_inline_caret_geometry(page);
+  });
 });
 
 test("text tool: first click selects (focus border), a second click opens typing mode; Escape cancels", async ({ page }) => {
@@ -2415,15 +2454,17 @@ test("rectangle: middle pans unselected, drags selected, 8 anchors from the firs
   await page.keyboard.press("Escape");
 });
 
-test("a vertical line body-drag with Ctrl snaps to the bar center (the public reference magnet)", async ({ page }) => {
+test("a vertical line anchor-drag with Ctrl snaps to the bar center (the public reference magnet)", async ({ page }) => {
   await goto_fixture(page);
   const s = await anchor_spots(page);
-  await page.evaluate(({ l1 }) => {
-    window.__chart.add_drawing("vertical_line", [{ logical: l1, price: 0 }]);
+  await page.evaluate(({ l1, p_mid }) => {
+    window.__chart.add_drawing("vertical_line", [{ logical: l1, price: p_mid }]);
   }, s);
   await settle_frames(page);
-  // Grab the line's body (not its anchor handle) with Ctrl and drag between two bars � the
-  // single-anchor line's body drag IS the anchor drag, so the magnet snaps it to a bar center.
+  // Select the line with a plain click on its body, then grab its anchor handle with Ctrl: Ctrl
+  // on a handle is the magnet (Ctrl on a body duplicates the drawing instead).
+  const body = await spot(page, s.l1, s.p_lo);
+  await page.mouse.click(body.x, body.y);
   const grab = await spot(page, s.l1, s.p_mid);
   const between = await page.evaluate(({ l0, l1 }) => {
     const a = window.__chart.time_scale().logical_to_coordinate(l0);
@@ -2437,8 +2478,11 @@ test("a vertical line body-drag with Ctrl snaps to the bar center (the public re
   await page.mouse.up();
   await page.keyboard.up("Control");
   await settle_frames(page);
-  const points = (await drawings(page))[0].points;
+  const all = await drawings(page);
+  expect(all, "an anchor press never duplicates").toHaveLength(1);
+  const points = all[0].points;
   expect(Number.isInteger(points[0].logical), "snapped onto a bar center").toBe(true);
+  expect(points[0].logical).not.toBe(s.l1);
 });
 
 test("Ctrl OHLC magnet engages only during drawing creation or drag", async ({ page }) => {
@@ -2470,7 +2514,7 @@ test("Ctrl OHLC magnet engages only during drawing creation or drag", async ({ p
   await hover();
   expect(await magnet()).toBe(false);
 
-  // Grabbing an existing drawing also counts as drawing work, even with no tool armed.
+  // Grabbing an existing drawing's handle also counts as drawing work, even with no tool armed.
   const drag = await page.evaluate(() => {
     const range = window.__chart.time_scale().get_visible_logical_range();
     const index = Math.floor((range.from + range.to) / 2);
@@ -2482,6 +2526,10 @@ test("Ctrl OHLC magnet engages only during drawing creation or drag", async ({ p
     };
   });
   await settle_frames(page);
+  // Select it with a plain click on its body, away from the anchor handle.
+  await page.keyboard.up("Control");
+  await page.mouse.click(box.x + drag.x + 60, box.y + drag.y);
+  await page.keyboard.down("Control");
   await page.mouse.move(box.x + drag.x, box.y + drag.y);
   await page.mouse.down();
   await page.mouse.move(box.x + drag.x + 8, box.y + drag.y + 8);
@@ -2489,5 +2537,88 @@ test("Ctrl OHLC magnet engages only during drawing creation or drag", async ({ p
   expect(await magnet()).toBe(true);
   await page.mouse.up();
   expect(await magnet()).toBe(false);
+
+  // Ctrl on the body duplicates it: the copy moves unsnapped, so the crosshair takes no magnet.
+  // The magnet drag above moved the line onto a bar's price; press its body where it is now.
+  const line_y = await page.evaluate(() => window.__main.price_to_coordinate(window.__chart.drawings()[0].points()[0].price));
+  await page.mouse.move(box.x + drag.x + 60, box.y + line_y);
+  await page.mouse.down();
+  await page.mouse.move(box.x + drag.x + 68, box.y + line_y + 8);
+  expect(await page.evaluate(() => window.__chart.wasm.drawing_drag_active())).toBe(true);
+  expect(await magnet()).toBe(false);
+  await page.mouse.up();
   await page.keyboard.up("Control");
+  expect(await page.evaluate(() => window.__chart.drawings().length)).toBe(2);
 });
+
+for (const key of ["Control", "Meta"]) {
+  test(`a ${key}-drag on a drawing's body duplicates it as one undoable creation`, async ({ page }) => {
+    await goto_fixture(page);
+    const s = await anchor_spots(page);
+    const source = await page.evaluate(({ l0, l1, p_lo, p_hi }) => window.__chart.add_drawing("trend_line", [
+      { logical: l0, price: p_lo },
+      { logical: l1, price: p_hi },
+    ]).id, s);
+    await settle_frames(page);
+    const before = await drawings(page);
+    const created = [];
+    await page.evaluate(() => {
+      window.__created_ids = [];
+      window.__chart.subscribe_drawing_created((drawing) => window.__created_ids.push(drawing.id));
+    });
+    const mid = await page.evaluate(({ l0, l1, p_lo, p_hi }) => ({
+      x: (window.__chart.time_scale().logical_to_coordinate(l0) + window.__chart.time_scale().logical_to_coordinate(l1)) / 2,
+      y: (window.__main.price_to_coordinate(p_lo) + window.__main.price_to_coordinate(p_hi)) / 2,
+    }), s);
+    // A click with the key held (no movement) makes no copy and selects the source.
+    await page.keyboard.down(key);
+    await page.mouse.click(mid.x, mid.y);
+    await page.keyboard.up(key);
+    await settle_frames(page);
+    expect(await drawings(page)).toEqual(before);
+    expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(source);
+
+    await page.keyboard.down(key);
+    await page.mouse.move(mid.x, mid.y);
+    await page.mouse.down();
+    await page.mouse.move(mid.x + 40, mid.y + 30, { steps: 5 });
+    await page.mouse.up();
+    await page.keyboard.up(key);
+    await settle_frames(page);
+    const after = await drawings(page);
+    expect(after).toHaveLength(2);
+    // The source never moves; the copy carries the dragged offset and is selected.
+    expect(after.find((drawing) => drawing.id === source)).toEqual(before[0]);
+    const copy = after.find((drawing) => drawing.id !== source);
+    expect(copy.kind).toBe("trend_line");
+    expect(copy.points[0].logical).toBeGreaterThan(before[0].points[0].logical);
+    expect(copy.points[1].logical - copy.points[0].logical)
+      .toBeCloseTo(before[0].points[1].logical - before[0].points[0].logical, 6);
+    created.push(...await page.evaluate(() => window.__created_ids));
+    expect(created).toEqual([copy.id]);
+    expect(await page.evaluate(() => window.__chart.selected_drawing()?.id)).toBe(copy.id);
+    // One undo removes exactly the copy.
+    expect(await page.evaluate(() => window.__chart.undo_drawing())).toBe(true);
+    await settle_frames(page);
+    expect(await drawings(page)).toEqual(before);
+
+    // A duplicated text drawing opens no editor: the engine opened no edit session for it.
+    const text = await page.evaluate(({ l0, p_mid }) => window.__chart.add_drawing("text", [
+      { logical: l0, price: p_mid },
+    ], { text: "Copy me", text_size: 16 }).id, s);
+    await settle_frames(page);
+    const text_at = await spot(page, s.l0, s.p_mid);
+    await page.keyboard.down(key);
+    await page.mouse.move(text_at.x + 8, text_at.y);
+    await page.mouse.down();
+    await page.mouse.move(text_at.x + 48, text_at.y + 30, { steps: 5 });
+    await page.mouse.up();
+    await page.keyboard.up(key);
+    await settle_frames(page);
+    const texts = (await drawings(page)).filter((drawing) => drawing.kind === "text");
+    expect(texts).toHaveLength(2);
+    expect(texts.some((drawing) => drawing.id !== text)).toBe(true);
+    expect(await page.evaluate(() => window.__chart.wasm.editing_drawing())).toBeUndefined();
+    await expect(page.locator("#aeris_charts-text-input")).toHaveCount(0);
+  });
+}

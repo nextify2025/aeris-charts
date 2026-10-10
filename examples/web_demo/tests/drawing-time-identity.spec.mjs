@@ -433,10 +433,12 @@ test("keyboard nudges move a rectangle's edge handle by the nudge distance", asy
     key("ArrowDown", true); // 10 CSS px
     key("Enter");
     const after = rectangle.points().map((point) => ({ ...point, y: y(point.price) }));
-    return { before, after };
+    return { before, after, target: window.__main.coordinate_to_price(before[1].y + 10) };
   });
-  // The top edge (the high-price anchor) moved down by 10 CSS px; nothing jumped to the pane's top-left corner.
-  expect(result.after[1].y).toBeCloseTo(result.before[1].y + 10, 3);
+  // The top edge (the high-price anchor) moved down by 10 CSS px onto the 0.01 price tick there;
+  // nothing jumped to the pane's top-left corner.
+  expect(result.after[1].price).toBeCloseTo(Math.round(result.target * 100) / 100, 9);
+  expect(Math.abs(result.after[1].y - (result.before[1].y + 10))).toBeLessThan(1);
   expect(result.after[1].logical).toBe(result.before[1].logical);
   expect(result.after[0]).toEqual(result.before[0]);
 });

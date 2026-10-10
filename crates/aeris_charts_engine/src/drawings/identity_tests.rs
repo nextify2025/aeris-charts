@@ -2,6 +2,7 @@
 //! clipboard between charts), chart/per-drawing magnet modes, keyboard handle nudges, undo during
 //! a drag, add_drawing option errors, and price-basis rescaling.
 
+use super::tests::on_tick;
 use super::*;
 
 const MINUTE: f64 = 60.0;
@@ -495,7 +496,11 @@ fn keyboard_nudge_moves_rectangle_and_position_handles_by_the_delta() {
     assert!(chart.nudge_selected_drawing(0.0, 3.0, Some(1)));
     assert!(chart.nudge_selected_drawing(2.0, 0.0, Some(3)));
     let (moved_top, moved_bottom) = (px(&chart, rectangle, 1), px(&chart, rectangle, 0));
-    assert_close(moved_top.1, top_left.1 + 3.0, "top edge moved by the nudge");
+    assert_close(
+        moved_top.1,
+        on_tick(&chart, top_left.1 + 3.0),
+        "top edge moved by the nudge onto the price tick",
+    );
     assert_close(
         moved_top.0,
         top_left.0 + chart.bar_spacing(),
@@ -604,7 +609,8 @@ fn a_projected_handle_drags_its_off_screen_anchor_by_the_bars_it_crosses() {
     assert!(handle.0 > 0.0 && handle.0 < chart.pane_w, "{handle:?}");
     let before = chart.drawing(id).unwrap().points.clone();
     let y = px(&chart, id, 2).1;
-    // 25 px is under half of an 80 px bar: the anchor keeps its bar and takes the raw price.
+    // 25 px is under half of an 80 px bar: the anchor keeps its bar and takes the price tick
+    // under the pointer.
     assert_eq!(chart.bar_spacing(), 80.0);
     for (dx, bars) in [(25.0, 0.0), (100.0, 1.0), (-130.0, -2.0)] {
         assert!(chart.drawing_drag_start_at(handle.0, handle.1));
@@ -613,7 +619,11 @@ fn a_projected_handle_drags_its_off_screen_anchor_by_the_bars_it_crosses() {
         let points = chart.drawing(id).unwrap().points.clone();
         assert_eq!(points[..2], before[..2], "{dx}");
         assert_eq!(points[2].logical, 20.0 + bars, "{dx}");
-        assert_close(px(&chart, id, 2).1, y + 6.0, &format!("{dx}: raw price"));
+        assert_close(
+            px(&chart, id, 2).1,
+            on_tick(&chart, y + 6.0),
+            &format!("{dx}: price tick"),
+        );
         assert!(chart.undo_drawing());
     }
 }

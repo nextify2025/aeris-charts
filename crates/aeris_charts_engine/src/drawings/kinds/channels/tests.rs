@@ -7,6 +7,7 @@ use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, Prim, TextAlign};
 use aeris_charts_render::shape::point_in_polygon;
 
+use super::super::super::tests::{on_tick, painted_handle_centers, snapped_handle_center};
 use super::super::super::{DrawingPlacement, DrawingTextHAlign, DrawingTextVAlign};
 use super::{FAMILY, regression_stats};
 use crate::{
@@ -1079,18 +1080,9 @@ fn live_bars_extend_regression_fits_without_a_full_pass() {
     assert_fresh(&chart, &live);
 }
 
-/// Centers of the selection handles painted in the first pane (outer disc of each pair).
+/// Centers of the selection handles painted in the first pane, in paint order.
 fn painted_handles(chart: &mut ChartEngine) -> Vec<(f64, f64)> {
-    let frame = chart.build_frame();
-    let circles = frame.panes[0]
-        .main
-        .iter()
-        .filter_map(|prim| match prim {
-            Prim::Circle { cx, cy, .. } => Some((f64::from(*cx), f64::from(*cy))),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    circles.into_iter().step_by(2).collect()
+    painted_handle_centers(&chart.build_frame())
 }
 
 #[test]
@@ -1116,7 +1108,10 @@ fn channel_handles_sit_on_the_painted_lines_and_drive_their_anchors() {
         let painted = painted_handles(&mut chart);
         assert_eq!(painted.len(), 3, "{kind:?}");
         for (painted, expected) in painted.iter().zip(expected) {
-            assert!(close(*painted, expected, 1e-3), "{kind:?} {painted:?}");
+            assert!(
+                close(*painted, snapped_handle_center(expected), 1e-3),
+                "{kind:?} {painted:?}"
+            );
         }
         assert_eq!(
             chart
@@ -1131,22 +1126,31 @@ fn channel_handles_sit_on_the_painted_lines_and_drive_their_anchors() {
             "{kind:?}: nothing to grab at the off-line click"
         );
 
-        // Dragging the handle down moves the second line with the pointer and nothing else.
+        // Dragging the handle down moves the second line with the pointer, onto the price
+        // tick, and nothing else.
         assert!(chart.drawing_drag_start_at(middle_x, middle_y));
         chart.drawing_drag_to(middle_x, middle_y + 25.0, DrawingModifiers::default());
         chart.drawing_drag_end();
         let points = chart.drawing(id).unwrap().points.clone();
         assert_eq!(points[..2], [a, b]);
-        let handle = painted_handles(&mut chart)[2];
+        let dragged = anchor(&chart, id, 2).1;
         assert!(
-            close(handle, (middle_x, middle_y + 25.0), 1e-3),
+            (dragged - on_tick(&chart, third.1 + 25.0)).abs() < 1e-6,
+            "{kind:?} {dragged}"
+        );
+        let handle = painted_handles(&mut chart)[2];
+        let shifted = (middle_x, middle_y + dragged - third.1);
+        assert!(
+            close(handle, snapped_handle_center(shifted), 1e-3),
             "{kind:?} {handle:?}"
         );
         // The keyboard reaches the same handle from its painted position.
         assert!(chart.nudge_selected_drawing(0.0, -5.0, Some(2)));
+        let nudged = anchor(&chart, id, 2).1;
+        assert!((nudged - on_tick(&chart, dragged - 5.0)).abs() < 1e-6);
         assert!(close(
             painted_handles(&mut chart)[2],
-            (middle_x, middle_y + 20.0),
+            snapped_handle_center((middle_x, middle_y + nudged - third.1)),
             1e-3
         ));
         assert!(chart.undo_drawing() && chart.undo_drawing());
@@ -1224,7 +1228,10 @@ fn three_click_placement_previews_the_base_line_then_the_channel() {
         assert!(lines[0].spans(a, b, 1e-3), "{kind:?}");
         assert!(fills(&mut chart, wash()).is_empty());
         let handles = painted_handles(&mut chart);
-        assert!(handles.len() == 1 && close(handles[0], a, 1e-3), "{kind:?}");
+        assert!(
+            handles.len() == 1 && close(handles[0], snapped_handle_center(a), 1e-3),
+            "{kind:?}"
+        );
         // Placing the third: the whole channel previews through the pointer.
         chart.drawing_tool_activate(b.0, b.1, DrawingModifiers::default());
         chart.drawing_tool_pointer_move(c.0, c.1 + 60.0, DrawingModifiers::default(), false);
@@ -1233,7 +1240,10 @@ fn three_click_placement_previews_the_base_line_then_the_channel() {
         assert!(!fills(&mut chart, wash()).is_empty(), "{kind:?}");
         let handles = painted_handles(&mut chart);
         assert_eq!(handles.len(), 2, "{kind:?}");
-        assert!(close(handles[0], a, 1e-3) && close(handles[1], b, 1e-3));
+        assert!(
+            close(handles[0], snapped_handle_center(a), 1e-3)
+                && close(handles[1], snapped_handle_center(b), 1e-3)
+        );
         let created = chart
             .drawing_tool_activate(c.0, c.1 + 60.0, DrawingModifiers::default())
             .created
@@ -2368,7 +2378,10 @@ fn regression_handles_sit_on_the_fitted_line_ends() {
     let painted = painted_handles(&mut chart);
     assert_eq!(painted.len(), 2);
     for (painted, end) in painted.iter().zip(ends) {
-        assert!(close(*painted, end, 1e-3), "{painted:?} {end:?}");
+        assert!(
+            close(*painted, snapped_handle_center(end), 1e-3),
+            "{painted:?} {end:?}"
+        );
     }
     assert_eq!(chart.drawing_handle_count(id), Some(2));
     assert_eq!(
@@ -2396,7 +2409,7 @@ fn regression_handles_sit_on_the_fitted_line_ends() {
     let refit = fit(&chart, id, IndicatorInputSource::Close);
     assert!(close(
         painted_handles(&mut chart)[1],
-        on_fit(&chart, refit, end.logical, 0.0),
+        snapped_handle_center(on_fit(&chart, refit, end.logical, 0.0)),
         1e-3
     ));
     // The keyboard reaches the handle from where it is painted.
@@ -2411,7 +2424,10 @@ fn regression_handles_sit_on_the_fitted_line_ends() {
     );
     let placeholder = [anchor(&chart, id, 0), anchor(&chart, id, 1)];
     let painted = painted_handles(&mut chart);
-    assert!(close(painted[0], placeholder[0], 1e-3) && close(painted[1], placeholder[1], 1e-3));
+    assert!(
+        close(painted[0], snapped_handle_center(placeholder[0]), 1e-3)
+            && close(painted[1], snapped_handle_center(placeholder[1]), 1e-3)
+    );
 }
 
 /// Placing a regression previews the fit, and the placed anchor's handle sits on the previewed
@@ -2439,7 +2455,10 @@ fn regression_placement_previews_its_handle_on_the_fitted_line() {
     let fitted_start = on_fit(&chart, stats, 6.0, 0.0);
     let handles = painted_handles(&mut chart);
     assert_eq!(handles.len(), 1);
-    assert!(close(handles[0], fitted_start, 1e-3), "{handles:?}");
+    assert!(
+        close(handles[0], snapped_handle_center(fitted_start), 1e-3),
+        "{handles:?}"
+    );
     let id = chart
         .drawing_tool_activate(end.0, end.1, DrawingModifiers::default())
         .created

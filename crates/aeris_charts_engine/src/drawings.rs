@@ -26,21 +26,25 @@ use aeris_charts_render::shape;
 
 use super::*;
 
+mod annotations;
 mod geometry;
 pub(crate) mod handles;
+mod icons;
 pub(crate) mod kinds;
 mod parts;
 mod stats;
 pub(crate) mod time_anchor;
 mod tools;
 
+pub(crate) use annotations::{SIGNPOST_PRESET_HEIGHT, annotation_text_weight};
 pub(crate) use geometry::{
     DrawingBodyGeometry, DrawingGeometryOptions, FibonacciArcGeometry, FibonacciGeometry,
-    MeasureAxes, PositionGeometry, PositionZone, TimeLevelGeometry, anchor_handle_points,
-    arc_segments, closed_outline, curve_clip, ellipse_outline, level_band_pairs,
-    resolve_drawing_geometry,
+    MeasureAxes, POINT_LABEL_GAP_CSS, PositionGeometry, PositionZone, TimeLevelGeometry,
+    anchor_handle_points, arc_segments, clear_label_center, clear_label_max_reach, closed_outline,
+    curve_clip, ellipse_outline, level_band_pairs, resolve_drawing_geometry,
 };
-pub(crate) use parts::{DrawingPart, DrawingParts, PartContext, arrow_cap_triangle, cap_radius};
+pub(crate) use icons::{BUILTIN_ICONS, IconRasterCache, arrow_marker_icon, builtin_icon};
+pub(crate) use parts::{DrawingPart, DrawingParts, PartContext, cap_radius};
 pub(crate) use stats::unsigned_zero;
 pub(crate) use tools::{
     DRAWING_TOOL_SPECS, DrawingHandleMode, DrawingLogicalExtent, DrawingPlacement,
@@ -65,8 +69,18 @@ pub type DrawingId = u32;
 /// Hard cap shared by live drawing APIs and persistence so variable-point tools remain bounded.
 pub(crate) const MAX_DRAWING_POINTS: usize = 100_000;
 pub const MAX_DRAWING_ICONS: usize = 32;
+
+/// One built-in icon for host pickers: the `icon_name` value and its inline SVG.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BuiltinDrawingIcon {
+    pub name: &'static str,
+    pub svg: String,
+}
 pub const MAX_DRAWING_ICON_SIZE: u32 = 96;
 pub const MAX_DRAWING_ICON_NAME_BYTES: usize = 64;
+/// Display size bounds for icon stamps and arrow markers, in CSS px.
+pub(crate) const MIN_DRAWING_ICON_DISPLAY_SIZE: f64 = 8.0;
+pub(crate) const MAX_DRAWING_ICON_DISPLAY_SIZE: f64 = 256.0;
 pub const MAX_BARS_PATTERN_BARS: usize = 512;
 
 /// Frozen source bar stored with a bars-pattern drawing. Offsets preserve whitespace gaps.
@@ -246,6 +260,18 @@ impl ChartEngine {
         }
         self.invalidate_frame_drawings();
         true
+    }
+
+    /// The built-in solid icons an icon stamp's `icon_name` can name, in catalog order, each
+    /// with inline SVG so host pickers show exactly what the chart paints.
+    pub fn builtin_drawing_icons() -> Vec<BuiltinDrawingIcon> {
+        BUILTIN_ICONS
+            .iter()
+            .map(|icon| BuiltinDrawingIcon {
+                name: icon.name,
+                svg: icon.svg(),
+            })
+            .collect()
     }
 
     pub fn remove_drawing_icon(&mut self, name: &str) -> bool {
@@ -532,6 +558,17 @@ impl DrawingBounds {
                 logical: LogicalBounds::Full,
                 min_price,
                 max_price,
+            };
+        }
+        // A fork-form price note's line spans the whole pane at its one anchor's price, so no
+        // time range bounds it (the fork's own extents for its one-anchor note).
+        if drawing.kind == DrawingKind::PriceNote
+            && kinds::projection_annotations::fork_form(drawing)
+        {
+            return Self {
+                logical: LogicalBounds::Full,
+                min_price: None,
+                max_price: None,
             };
         }
         // An extended body reaches the pane edge in its own direction, which the anchors'
@@ -1076,6 +1113,9 @@ impl DrawingKind {
     /// Whether `count` is a valid point count for a stored drawing of this kind.
     pub fn valid_point_count(self, count: usize) -> bool {
         self.spec().placement.valid_point_count(count)
+            // Notes and price notes saved before they gained their second anchor keep loading;
+            // the annotation layout places a one-anchor box on that anchor.
+            || (count == 1 && matches!(self, Self::Note | Self::PriceNote))
     }
 
     /// Whether the generic label pass paints this kind's `text` as a single run placed against
@@ -1478,11 +1518,7 @@ impl Drawing {
             locked: false,
             z_order: id as i32,
             interval_visibility: Default::default(),
-            stroke_start: if kind == DrawingKind::Callout {
-                crate::DrawingLineCap::Arrow
-            } else {
-                Default::default()
-            },
+            stroke_start: Default::default(),
             stroke_end: if kind == DrawingKind::ArrowLine {
                 crate::DrawingLineCap::Arrow
             } else {
@@ -1706,18 +1742,10 @@ impl Drawing {
             text_italic: false,
             text_h_align,
             text_v_align,
-            box_color: match kind {
-                DrawingKind::Note => Some("#facc1533".to_string()),
-                DrawingKind::Comment | DrawingKind::Callout => Some("#2962ff22".to_string()),
-                _ => None,
-            },
-            box_border_color: match kind {
-                DrawingKind::Note => Some("#eab308".to_string()),
-                DrawingKind::Comment | DrawingKind::Callout => {
-                    Some(DRAWING_DEFAULT_COLOR.to_string())
-                }
-                _ => None,
-            },
+            // Box annotations resolve unset box colors from the painted theme or the drawing
+            // color at frame time (`build_annotation_prims`), so they follow theme changes.
+            box_color: None,
+            box_border_color: None,
             box_border_width: aeris_charts_core::style::BORDER_WIDTH,
             tool_options: Default::default(),
             pending_times: Vec::new(),
@@ -1795,19 +1823,37 @@ impl Drawing {
     }
 
     /// Whether the drawing's own text paints as a block that may span lines (owner decisions:
-    /// the multi-line text owner) rather than one run: the text annotations (upstream's text
-    /// block, [`TextBlock`], or their fork-form box), and the fork-form signpost plate, arrow-mark
-    /// text, and price-label bubble (`kinds::projection_annotations::fork_text_box`). Static:
+    /// the multi-line text owner) rather than one run: the multi-line kinds (the annotation
+    /// layout's box, the anchored text's [`TextBlock`], or their fork-form box), and the fork-form
+    /// signpost plate, arrow-mark text, and price-label bubble
+    /// (`kinds::projection_annotations::fork_text_box`). Static:
     /// it never depends on the text or an open editor, so the editor a host opens on it keeps
     /// its form while the text changes. The plain text tool stays one run (owner decision A11).
     pub(crate) fn paints_text_block(&self) -> bool {
-        self.kind.is_text_annotation() || kinds::projection_annotations::fork_text_owner(self)
+        self.kind.multiline_kind() || kinds::projection_annotations::fork_text_owner(self)
     }
 
-    /// Lines of upstream's text block ([`TextBlock`]): a text annotation's text split at `\n`
-    /// (one line when empty); every other run is one line.
+    /// Whether this drawing is a text annotation for editing purposes (it is its text: a click
+    /// on it while selected re-opens the editor, its hover ring paints, a press on it while
+    /// edited keeps editing). A fork-form box keeps the fork's membership (note, comment, and
+    /// price note; owner policy: editing changes only where approved); every other drawing
+    /// takes its kind's ([`DrawingKind::is_text_annotation`]).
+    pub(crate) fn text_annotation(&self) -> bool {
+        if kinds::projection_annotations::fork_text_owner(self) {
+            matches!(
+                self.kind,
+                DrawingKind::Note | DrawingKind::Comment | DrawingKind::PriceNote
+            )
+        } else {
+            self.kind.is_text_annotation()
+        }
+    }
+
+    /// Lines of the drawing's text block: a multi-line kind's text
+    /// ([`DrawingKind::multiline_kind`]) split at `\n` (one line when empty); every other run is
+    /// one line.
     pub(crate) fn text_block_lines(&self) -> usize {
-        if self.kind.is_text_annotation() {
+        if self.kind.multiline_kind() {
             self.text.split('\n').count()
         } else {
             1
@@ -1906,6 +1952,12 @@ impl Drawing {
             },
             DrawingKind::IconStamp => crate::DrawingKindOptions::IconStamp {
                 icon_name: self.icon_name.clone(),
+                icon_size: self.icon_size,
+            },
+            DrawingKind::ArrowMarkerUp
+            | DrawingKind::ArrowMarkerDown
+            | DrawingKind::ArrowMarkerLeft
+            | DrawingKind::ArrowMarkerRight => crate::DrawingKindOptions::ArrowMarker {
                 icon_size: self.icon_size,
             },
             DrawingKind::BarsPattern => crate::DrawingKindOptions::BarsPattern {
@@ -2056,6 +2108,14 @@ pub(crate) struct DrawingDrag {
     pub(crate) history_bars_pattern: Vec<BarsPatternBar>,
     /// A keyboard nudge's media-px step; `None` for a pointer drag.
     pub(crate) keyboard_step: Option<(f64, f64)>,
+    /// Icon display size at the interaction baseline (corner resizes scale it) and at the
+    /// start, for cancellation and history.
+    pub(crate) start_icon_size: f64,
+    pub(crate) history_icon_size: f64,
+    /// A Ctrl/⌘ duplicate drag names its source: the dragged drawing is an unrecorded copy that
+    /// commits as one Create on a moved release, and is removed on cancellation or a release
+    /// without movement, which selects the source again.
+    pub(crate) duplicate_of: Option<DrawingId>,
 }
 
 /// Where the host's inline editor lays out a drawing's own `text`
@@ -2084,9 +2144,10 @@ pub struct DrawingTextEditLayout {
     /// for a rotated run, 0 for a level run or a box.
     pub angle: f64,
     /// Whether the label is a box that may span lines (a family text box, `line_height` 1.25 ×
-    /// `size`), rather than one run on one line (`line_height` 1.2 × `size`, `rect` the
-    /// axis-aligned bounds of the padded run). Hosts choose their editor by this flag; the
-    /// presence of a layout only means the drawing paints text.
+    /// `size`; a multi-line box annotation or text block, 1.2 × `size`), rather than one run on
+    /// one line (`line_height` 1.2 × `size`, `rect` the axis-aligned bounds of the padded run, or
+    /// a signpost's one-line box). Hosts choose their editor by this flag; the presence of a
+    /// layout only means the drawing paints text.
     pub multiline: bool,
 }
 
@@ -2463,19 +2524,27 @@ const MEASURE_DRAG_SLOP: f64 = 5.0;
 /// an icon stamp's half size, a forecast's result box. Screen culling and the semantic
 /// intersection test share it so they cannot drift.
 fn drawing_kind_pad(drawing: &Drawing) -> (f64, f64) {
-    if drawing.kind.is_marker() {
+    // An icon stamp centers on its anchor; an arrow marker's tip is its anchor, so its icon
+    // box reaches its full size from it.
+    let icon = if drawing.kind == DrawingKind::IconStamp {
+        drawing.icon_size / 2.0
+    } else if drawing.kind.has_icon_size() {
+        drawing.icon_size
+    } else {
+        0.0
+    };
+    let (x, y): (f64, f64) = if drawing.kind.is_marker() {
         // A signpost with coincident anchors stands its pole above its foot.
         (
             16.0,
             16.0 + kinds::projection_annotations::signpost_pole(drawing, 1.0),
         )
-    } else if drawing.kind == DrawingKind::IconStamp {
-        (drawing.icon_size / 2.0, drawing.icon_size / 2.0)
     } else if drawing.kind == DrawingKind::Forecast {
         (160.0, 24.0)
     } else {
         (0.0, 0.0)
-    }
+    };
+    (x.max(icon), y.max(icon))
 }
 
 /// reference `distanceToSegment` (renderers/hit-test-common.ts), duplicated from hit_test.rs so
@@ -2831,15 +2900,17 @@ impl Drawing {
         {
             return false;
         }
-        if (patch.icon_name.is_some() || patch.icon_size.is_some())
-            && (self.kind != DrawingKind::IconStamp
-                || patch
-                    .icon_name
-                    .as_ref()
-                    .is_some_and(|name| name.len() > MAX_DRAWING_ICON_NAME_BYTES)
-                || patch
-                    .icon_size
-                    .is_some_and(|size| !size.is_finite() || !(8.0..=96.0).contains(&size)))
+        if (patch.icon_name.is_some() && self.kind != DrawingKind::IconStamp)
+            || (patch.icon_size.is_some() && !self.kind.has_icon_size())
+            || patch
+                .icon_name
+                .as_ref()
+                .is_some_and(|name| name.len() > MAX_DRAWING_ICON_NAME_BYTES)
+            || patch.icon_size.is_some_and(|size| {
+                !size.is_finite()
+                    || !(MIN_DRAWING_ICON_DISPLAY_SIZE..=MAX_DRAWING_ICON_DISPLAY_SIZE)
+                        .contains(&size)
+            })
         {
             return false;
         }
@@ -2932,7 +3003,8 @@ impl Drawing {
             return false;
         };
         let Ok(icon_size) = with_legacy(patch.icon_size, legacy.icon_size, icon_kind, |size| {
-            size.is_finite() && (8.0..=96.0).contains(size)
+            size.is_finite()
+                && (MIN_DRAWING_ICON_DISPLAY_SIZE..=MAX_DRAWING_ICON_DISPLAY_SIZE).contains(size)
         }) else {
             return false;
         };
@@ -3279,6 +3351,8 @@ impl Drawing {
         }
         if self.kind == DrawingKind::IconStamp {
             options["icon_name"] = serde_json::json!(self.icon_name);
+        }
+        if self.kind.has_icon_size() {
             options["icon_size"] = serde_json::json!(self.icon_size);
         }
         if self.kind == DrawingKind::BarsPattern {
@@ -3826,7 +3900,7 @@ impl ChartEngine {
             let px = self.drawing_px(drawing)?;
             // A derived handle rebases onto its current position (kept while the geometry
             // cannot place it), an anchor's handle too (the pointer while it has none); a body
-            // translates from the pointer.
+            // translates from the pointer. An icon resize rebases on the current size.
             let handle = match drag.part {
                 DrawingDragPart::Handle(_) => self
                     .drawing_handle_px(drawing, drag.part)
@@ -3836,16 +3910,26 @@ impl ChartEngine {
                     .unwrap_or((drag.current_x, drag.current_y)),
                 DrawingDragPart::Body => (drag.current_x, drag.current_y),
             };
-            Some((points, px, handle, drag.current_x, drag.current_y))
+            Some((
+                points,
+                px,
+                handle,
+                drawing.icon_size,
+                drag.current_x,
+                drag.current_y,
+            ))
         });
-        if let (Some(drag), Some((start_points, start_px, handle_px, pointer_x, pointer_y))) =
-            (self.drawing_drag.as_mut(), drag_baseline)
+        if let (
+            Some(drag),
+            Some((start_points, start_px, handle_px, icon_size, pointer_x, pointer_y)),
+        ) = (self.drawing_drag.as_mut(), drag_baseline)
         {
             drag.start_x = pointer_x;
             drag.start_y = pointer_y;
             drag.start_points = start_points;
             drag.start_px = start_px;
             drag.handle_px = handle_px;
+            drag.start_icon_size = icon_size;
         }
 
         let brush_px =
@@ -3910,6 +3994,7 @@ impl ChartEngine {
         if self.selected_drawing == Some(id) {
             self.selected_drawing = None;
         }
+        self.selected_drawings.retain(|&selected| selected != id);
         if self.drawing_drag.as_ref().is_some_and(|drag| drag.id == id) {
             self.drawing_drag = None;
         }
@@ -4147,7 +4232,7 @@ impl ChartEngine {
         self.drawing_from_px_for(pane_index, DrawingPriceScale::Right, x, y)
     }
 
-    fn drawing_from_px_for(
+    pub(crate) fn drawing_from_px_for(
         &self,
         pane_index: usize,
         target: DrawingPriceScale,
@@ -4286,12 +4371,12 @@ impl ChartEngine {
     }
 
     /// Every anchor except anchored text's (which pins to a pane-relative screen position, not
-    /// a bar) lands on the crosshair's time slot under `x`, so drawings step bar by bar
-    /// horizontally; price-tick tools also land on the instrument/scale tick grid.
+    /// a bar or a price) lands on the crosshair's time slot under `x` and on the instrument/scale
+    /// price tick, so drawings step bar by bar horizontally and tick by tick vertically.
     /// `magnet_chose` holds when the magnet actually moved `point` onto a bar (it found a candle
-    /// to attract it); a magnet that is merely on, but kept the pointer's point (weak and too far
-    /// from every price, or no bar under the pointer), leaves the slot to this snap so every
-    /// anchor still lands on a whole bar.
+    /// to attract it): its exact bar and OHLC price win. A magnet that is merely on, but kept the
+    /// pointer's point (weak and too far from every price, or no bar under the pointer), leaves
+    /// the slot and the tick to this snap so every anchor still lands on the grid.
     fn grid_snap_point(
         &self,
         kind: DrawingKind,
@@ -4301,10 +4386,11 @@ impl ChartEngine {
         mut point: DrawingPoint,
         magnet_chose: bool,
     ) -> DrawingPoint {
-        if !magnet_chose && kind != DrawingKind::AnchoredText {
-            point.logical = self.snapped_crosshair_index(x) as f64;
+        if kind == DrawingKind::AnchoredText {
+            return point;
         }
-        if kind.spec().price_tick_snap {
+        if !magnet_chose {
+            point.logical = self.snapped_crosshair_index(x) as f64;
             point.price = self.snap_position_price(pane_index, price_scale, point.price);
         }
         point
@@ -4381,9 +4467,15 @@ impl ChartEngine {
             };
             // Only drag parts that apply the magnet move the crosshair (mirrors
             // `drawing_drag_apply`): a multi-anchor body moves rigidly with the pointer, anchored
-            // text never snaps, and a position tool's third handle keeps its raw point.
+            // text never snaps, a position tool's third handle keeps its raw point, and an icon
+            // box corner resizes continuously.
             let snaps = match drag.part {
                 _ if drawing.kind == DrawingKind::AnchoredText => false,
+                DrawingDragPart::Anchor(_)
+                    if self.drawing_handle_mode(drawing) == DrawingHandleMode::IconBox =>
+                {
+                    false
+                }
                 DrawingDragPart::Body => drawing.points.len() == 1,
                 DrawingDragPart::Anchor(index) => {
                     index != 2
@@ -4857,9 +4949,12 @@ impl ChartEngine {
         let mut extra_y = extra_x;
         extra_x = extra_x.max(HitProfile::TOUCH.drawing_anchor_radius);
         extra_y = extra_y.max(HitProfile::TOUCH.drawing_anchor_radius);
+        // Labels and glyphs (an icon box, a bubble) hit within the pointer tolerance beyond
+        // what they paint, so the hit candidates reach that far past them.
         let kind_pad = drawing_kind_pad(drawing);
-        extra_x = extra_x.max(label_pad.0).max(kind_pad.0);
-        extra_y = extra_y.max(label_pad.1).max(kind_pad.1);
+        let slack = HitProfile::TOUCH.drawing_stroke_tolerance;
+        extra_x = extra_x.max(label_pad.0 + slack).max(kind_pad.0 + slack);
+        extra_y = extra_y.max(label_pad.1 + slack).max(kind_pad.1 + slack);
         entry.screen_bounds = ScreenBounds {
             left: left.min(right) - extra_x,
             right: left.max(right) + extra_x,
@@ -4987,13 +5082,46 @@ impl ChartEngine {
         font_size: f64,
         font_family: &str,
     ) -> Option<(f64, f64, usize)> {
+        if drawing.kind.is_annotation() && !kinds::projection_annotations::fork_form(drawing) {
+            // An upstream box reaches up to its full width and height past an anchor (a
+            // comment's or callout's box grows right and up); the margins cover the box padding
+            // and price-tag digit changes.
+            if entry.text_key != key {
+                let (text, _) = self.annotation_text(drawing);
+                let size = drawing.resolved_text_size(font_size);
+                let weight = annotation_text_weight(drawing);
+                // The layout's lines: a multi-line kind's `\n`-separated lines, else one run.
+                let lines = text.splitn(
+                    if drawing.kind.multiline_kind() {
+                        usize::MAX
+                    } else {
+                        1
+                    },
+                    '\n',
+                );
+                let (width, count) = lines.fold((0.0_f64, 0), |(widest, count), line| {
+                    let advance =
+                        self.measure_text_run(line, size, font_family, weight, drawing.text_italic);
+                    (widest.max(advance), count + 1)
+                });
+                entry.text_width = width;
+                entry.text_size = size;
+                entry.text_lines = count;
+                entry.text_key = key;
+            }
+            return Some((
+                entry.text_width + 48.0,
+                entry.text_size + 16.0,
+                entry.text_lines,
+            ));
+        }
         // An open editor gives an empty label its one-em caret slot, which the frame paints
         // around and hit testing must not cull.
         let editing = self.editing_drawing() == Some(drawing.id);
         if drawing.text.is_empty()
             && !editing
             && !matches!(drawing.kind, DrawingKind::Text | DrawingKind::TrendLine)
-            && !drawing.kind.is_text_annotation()
+            && !drawing.text_annotation()
         {
             return None;
         }
@@ -5186,6 +5314,45 @@ impl ChartEngine {
     /// clock order from the top-left: 0 TL, 1 top-mid, 2 TR, 3 right-mid, 4 BR, 5 bottom-mid,
     /// 6 BL, 7 left-mid. Corners resize both adjacent edges, midpoints one edge — all with
     /// flip-on-cross (the opposite side stays put). Works on any px basis (media/bitmap).
+    /// An icon-drawn drawing's box as `(center, size)` in the basis of `px` (media px scaled by
+    /// `scale`): the square its icon paints in and its resize handles frame.
+    pub(crate) fn icon_box(
+        &self,
+        drawing: &Drawing,
+        px: &[(f64, f64)],
+        scale: f64,
+    ) -> Option<((f64, f64), f64)> {
+        let pane = self.panes.get(drawing.pane_index)?;
+        let geometry = resolve_drawing_geometry(
+            drawing.kind,
+            px,
+            self.pane_w * scale,
+            pane.top * scale,
+            pane.height * scale,
+            DrawingGeometryOptions {
+                line_width: drawing.width,
+                device_scale: scale,
+                icon_size: drawing.icon_size,
+                ..Default::default()
+            },
+        )?;
+        match geometry.body {
+            DrawingBodyGeometry::IconStamp { center, size } => Some((center, size)),
+            _ => None,
+        }
+    }
+
+    /// An icon box's corners, clockwise from top left (the `IconBox` handle order).
+    pub(crate) fn icon_box_corners((center, size): ((f64, f64), f64)) -> [(f64, f64); 4] {
+        let half = size / 2.0;
+        [
+            (center.0 - half, center.1 - half),
+            (center.0 + half, center.1 - half),
+            (center.0 + half, center.1 + half),
+            (center.0 - half, center.1 + half),
+        ]
+    }
+
     pub(crate) fn rectangle_anchors(px: &[(f64, f64)]) -> [(f64, f64); 8] {
         let (a, b) = (px[0], px[1]);
         let (l, r) = (a.0.min(b.0), a.0.max(b.0));
@@ -5368,7 +5535,7 @@ impl ChartEngine {
     }
 
     fn measure_drawing_text_with_family(&self, drawing: &Drawing, size: f64, family: &str) -> f64 {
-        if (drawing.kind == DrawingKind::Text || drawing.kind.is_text_annotation())
+        if (drawing.kind == DrawingKind::Text || drawing.text_annotation())
             && drawing.text.is_empty()
         {
             return size;
@@ -5404,7 +5571,7 @@ impl ChartEngine {
 
     /// One line of a parts label measured in its glyph size, weight and slant in the layout
     /// font: the measure every parts hit test and editor layout uses, so both match the paint.
-    fn measure_part_label(&self, label: &parts::PartLabel, line: &str) -> f64 {
+    pub(crate) fn measure_part_label(&self, label: &parts::PartLabel, line: &str) -> f64 {
         let family = &self.options.get().layout.font_family;
         self.measure_text_run(line, label.size, family, label.weight, label.italic)
     }
@@ -6560,6 +6727,16 @@ impl ChartEngine {
     /// (`frame::drawings::text_run_geometry`, in bitmap px), from the drawing's converted anchors.
     /// `None` when the geometry does not resolve, so no caret is ever placed at (0, 0).
     fn drawing_text_run(&self, drawing: &Drawing, px: &[(f64, f64)]) -> Option<DrawingTextRun> {
+        if let Some(layout) = self.annotation_layout(drawing, px, 1.0) {
+            // A box annotation's text starts inside its box (its first line).
+            return Some(DrawingTextRun {
+                x: layout.text_x,
+                y: layout.text_y,
+                angle: 0.0,
+                align: DrawingTextHAlign::Left,
+                size: layout.size,
+            });
+        }
         let pane = self.panes.get(drawing.pane_index)?;
         let size = drawing.resolved_text_size(self.options.get().layout.font_size);
         let (x, y, align, angle) = Self::try_drawing_text_placement(
@@ -6600,7 +6777,10 @@ impl ChartEngine {
     /// - a family text box (`multiline`) is the label its parts mark with
     ///   [`DrawingParts::text_label`]: lines left-aligned at `x`, line `i` centered at
     ///   `y + i * line_height`, never rotated;
-    /// - every other drawing (the text tool, the text annotations, trend lines, lines, channels,
+    /// - a box annotation (note, comment, callout, price note, signpost) edits in its box from
+    ///   the shared annotation layout: lines left-aligned at `x`, line `i` centered at
+    ///   `y + i * line_height`, `rect` the box, `multiline` for every kind but the signpost;
+    /// - every other drawing (the text tool, the anchored text, trend lines, lines, channels,
     ///   Fibonacci tools, pitchforks, patterns, shapes) paints one run placed against its
     ///   geometry: `x`, `y` are the run's start (left edge, vertical center) after rotation by
     ///   `angle`, so a host rotates a single-line editor about its own left-middle.
@@ -6613,6 +6793,26 @@ impl ChartEngine {
         let px = self.drawing_render_px(drawing)?;
         if kinds::projection_annotations::fork_text_owner(drawing) {
             self.box_text_edit_layout(drawing, &px, kinds::projection_annotations::fork_text_box)
+        } else if let Some(layout) = self.annotation_layout(drawing, &px, 1.0) {
+            // A box annotation edits in its box: lines from the box's text start, in the ink the
+            // frame paints (the shared annotation layout and paint).
+            let [left, top, width, height] = layout.rect;
+            Some(DrawingTextEditLayout {
+                x: layout.text_x,
+                y: layout.text_y,
+                line_height: layout.line_height,
+                size: layout.size,
+                font_family: self.options.get().layout.font_family.clone(),
+                weight: annotation_text_weight(drawing),
+                italic: drawing.text_italic,
+                color: self
+                    .annotation_paint(drawing)
+                    .text_color(drawing, false)
+                    .to_css(),
+                rect: [left, top, left + width, top + height],
+                angle: 0.0,
+                multiline: drawing.kind.multiline_kind(),
+            })
         } else if drawing.kind.paints_generic_text() {
             self.run_text_edit_layout(drawing, &px)
         } else {
@@ -6675,8 +6875,8 @@ impl ChartEngine {
         } else {
             self.measure_drawing_text(drawing, run.size)
         };
-        // A text annotation edits its text block (several lines); one line is the run itself.
-        let block_owner = drawing.kind.is_text_annotation();
+        // A multi-line kind (the anchored text) edits its text block; one line is the run itself.
+        let block_owner = drawing.kind.multiline_kind();
         if block_owner && drawing.text_block_lines() > 1 {
             // Upstream's text block: lines left-aligned at its left edge, over several lines.
             let block = TextBlock::new(
@@ -6723,8 +6923,8 @@ impl ChartEngine {
 
     /// The topmost drawing whose own text sits under a media-px point: the text of any drawing
     /// that paints a generic run (lines, channels, Fibonacci tools, pitchforks, patterns, shapes,
-    /// the callout and price note, and the trend line), never the text tool, the note, comment,
-    /// and anchored text, or a family text box, whose bodies are ordinary hits. A trend line with
+    /// and the trend line), never the text tool, the anchored text, a box annotation, or a family
+    /// text box, whose bodies are ordinary hits. A trend line with
     /// no text answers over its `+ Add text` prompt; any other drawing needs text to have a
     /// region. Locked, hidden, and interval-hidden drawings never answer, and a higher drawing's
     /// body or the selected drawing's anchor handle at the point wins over a label beneath it, as
@@ -6828,13 +7028,8 @@ impl ChartEngine {
         if !drawing.visible
             || drawing.locked
             || !drawing.interval_visibility.allows(self.drawing_interval)
-            || matches!(
-                drawing.kind,
-                DrawingKind::Text
-                    | DrawingKind::Note
-                    | DrawingKind::Comment
-                    | DrawingKind::AnchoredText
-            )
+            || matches!(drawing.kind, DrawingKind::Text | DrawingKind::AnchoredText)
+            || drawing.kind.is_annotation()
             || !drawing.kind.paints_generic_text()
             || kinds::projection_annotations::fork_text_owner(drawing)
         {
@@ -6852,9 +7047,6 @@ impl ChartEngine {
                 return false;
             };
             let width = width.unwrap_or_else(|| {
-                if drawing.text_block_lines() > 1 {
-                    return self.measure_drawing_text(drawing, run.size);
-                }
                 self.measure_text_run(
                     text,
                     run.size,
@@ -6863,17 +7055,6 @@ impl ChartEngine {
                     drawing.text_italic,
                 )
             });
-            if drawing.text_block_lines() > 1 {
-                // A callout's or price note's text block.
-                return TextBlock::new(
-                    (run.x, run.y, run.align),
-                    drawing.text_v_align,
-                    width,
-                    run.size,
-                    drawing.text_block_lines(),
-                )
-                .contains((x, y), TEXT_PAD);
-            }
             run.contains(width, x, y)
         })
         .unwrap_or(false)
@@ -6985,7 +7166,7 @@ impl ChartEngine {
             self.drawings.iter().any(|d| {
                 d.id == hid
                     && (matches!(d.kind, DrawingKind::Text | DrawingKind::TrendLine)
-                        || d.kind.is_text_annotation())
+                        || d.text_annotation())
             })
         });
         if valid != self.hovered_text {
@@ -7545,6 +7726,24 @@ impl ChartEngine {
             return true;
         }
         match geometry.body {
+            // The painted box, its connector, and the callout's whole outline (box and tail)
+            // are grab areas.
+            DrawingBodyGeometry::Annotation => self
+                .annotation_layout(drawing, px, 1.0)
+                .is_some_and(|layout| {
+                    layout.contains((x, y), 0.0)
+                        || layout.connector.is_some_and(|(a, b)| {
+                            distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
+                        })
+                        || layout.outline.as_deref().is_some_and(|outline| {
+                            point_in_polygon((x, y), outline)
+                                || outline.windows(2).any(|edge| {
+                                    distance_to_segment(
+                                        x, y, edge[0].0, edge[0].1, edge[1].0, edge[1].1,
+                                    ) <= tolerance
+                                })
+                        })
+                }),
             DrawingBodyGeometry::Segment { a, b } => {
                 distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
                     || line_parts_hit(Some((a, b)))
@@ -7643,7 +7842,13 @@ impl ChartEngine {
                         || (level.label_visible
                             && self.level_label_hit(
                                 drawing,
-                                self.fibonacci_level_label(drawing, (a, b), level.value, 1.0),
+                                self.fibonacci_level_label(
+                                    drawing,
+                                    (a, b),
+                                    level.value,
+                                    1.0,
+                                    self.pane_w,
+                                ),
                                 (x, y),
                             ))
                 }) || (kinds::fibonacci::draws_grid(drawing)
@@ -7780,9 +7985,10 @@ impl ChartEngine {
                         let b = triangle[(index + 1) % 3];
                         distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
                     })
-                    || marker.stem().is_some_and(|(a, b)| {
+                    || {
+                        let (a, b) = marker.stem();
                         distance_to_segment(x, y, a.0, a.1, b.0, b.1) <= tolerance
-                    })
+                    }
             }
             DrawingBodyGeometry::PriceLabel {
                 x: label_x,
@@ -8070,7 +8276,7 @@ impl ChartEngine {
                 })
             }
             DrawingBodyGeometry::Empty => {
-                if drawing.kind != DrawingKind::Text && !drawing.kind.is_text_annotation() {
+                if drawing.kind != DrawingKind::Text && !drawing.text_annotation() {
                     return false;
                 }
                 // The click/hover target is the interaction-chrome box (the label run while
@@ -8124,6 +8330,7 @@ impl ChartEngine {
         let start_points = drawing.points.clone();
         let screen_position = (drawing.screen_x, drawing.screen_y);
         let history_bars_pattern = drawing.bars_pattern.clone();
+        let icon_size = drawing.icon_size;
         let Some(start_px) = self.drawing_px(drawing) else {
             return false;
         };
@@ -8154,7 +8361,62 @@ impl ChartEngine {
             start_points,
             start_px,
             keyboard_step: None,
+            start_icon_size: icon_size,
+            history_icon_size: icon_size,
+            duplicate_of: None,
         });
+        true
+    }
+
+    /// Ctrl/⌘ + drag on a drawing's body (industry-standard clone gesture): an exact copy is
+    /// placed on top, selected, and dragged while the original stays put. The copy is not
+    /// recorded until [`Self::drawing_drag_end`] sees it moved, so the gesture is one undo step,
+    /// and a cancel or a release without movement leaves the chart unchanged. Anchor presses and
+    /// locked drawings return false so the caller falls back to the ordinary press.
+    pub fn drawing_duplicate_drag_start_at(&mut self, x: f64, y: f64) -> bool {
+        let Some(hit) = self.hit_test_drawing_with_profile(x, y, HitProfile::PRECISION) else {
+            return false;
+        };
+        let Some(source) = self
+            .drawing(hit.id)
+            .filter(|drawing| hit.part == DrawingDragPart::Body && !drawing.locked)
+        else {
+            return false;
+        };
+        let Some(start_px) = self.drawing_px(source) else {
+            return false;
+        };
+        let mut copy = source.clone();
+        let Some(id) = self.take_drawing_id() else {
+            return false;
+        };
+        copy.id = id;
+        copy.z_order = id as i32;
+        copy.revision = 1;
+        let start_points = copy.points.clone();
+        self.drawing_drag = Some(DrawingDrag {
+            id,
+            part: DrawingDragPart::Body,
+            start_x: x,
+            start_y: y,
+            current_x: x,
+            current_y: y,
+            handle_px: (x, y),
+            history_points: start_points.clone(),
+            history_tool_options: copy.tool_options.clone(),
+            history_screen_position: (copy.screen_x, copy.screen_y),
+            history_bars_pattern: copy.bars_pattern.clone(),
+            start_points,
+            start_px,
+            keyboard_step: None,
+            start_icon_size: copy.icon_size,
+            history_icon_size: copy.icon_size,
+            duplicate_of: Some(hit.id),
+        });
+        self.drawings.push(copy);
+        self.insert_drawing_runtime(id);
+        self.set_selected_drawing(Some(id));
+        self.invalidate_frame_drawings();
         true
     }
 
@@ -8172,7 +8434,10 @@ impl ChartEngine {
             .as_ref()
             .and_then(|drag| self.drawing(drag.id))
             .map_or(crate::DrawingMagnetMode::Off, |drawing| drawing.magnet);
-        let magnet = self.effective_drawing_magnet(own, modifiers.magnet);
+        // The Ctrl/⌘ held to duplicate is the clone gesture, not a magnet override; the copy
+        // still follows its own and the chart's magnet mode.
+        let toggle = modifiers.magnet && !self.drawing_duplicate_drag_active();
+        let magnet = self.effective_drawing_magnet(own, toggle);
         self.drawing_drag_apply(x, y, magnet, modifiers.straighten);
     }
 
@@ -8235,6 +8500,27 @@ impl ChartEngine {
                 if let Some(point) = market_point {
                     drawing.points[0] = point;
                 }
+            }
+            self.update_drawing_runtime(id);
+            return;
+        }
+        if kind.spec().handles == DrawingHandleMode::IconBox
+            && matches!(part, DrawingDragPart::Anchor(0..4))
+        {
+            // A corner resizes the icon about its anchor (a stamp's center, an arrow's tip): the
+            // size scales with the dragged corner's farther-axis reach from that point,
+            // uniformly. The corner's baseline is its handle, so a pointer drag and a keyboard
+            // nudge of the same delta resize alike, continuously (no bar or tick snap).
+            let (Some(&fixed), Some(drag)) = (start_px.first(), self.drawing_drag.as_ref()) else {
+                return;
+            };
+            let reach = |(px, py): (f64, f64)| (px - fixed.0).abs().max((py - fixed.1).abs());
+            let start_reach = reach(handle_px).max(1.0);
+            let size = (drag.start_icon_size * reach((handle_px.0 + dx, handle_px.1 + dy))
+                / start_reach)
+                .clamp(MIN_DRAWING_ICON_DISPLAY_SIZE, MAX_DRAWING_ICON_DISPLAY_SIZE);
+            if let Some(drawing) = self.drawings.iter_mut().find(|drawing| drawing.id == id) {
+                drawing.icon_size = size;
             }
             self.update_drawing_runtime(id);
             return;
@@ -8360,8 +8646,24 @@ impl ChartEngine {
                     // The dragged corner or edge steps bar by bar like an anchor, before Shift
                     // squares it; a keyboard nudge steps whole bars from the dragged side's own
                     // bar ([`Self::drag_slot_steps`]), even when that side is off screen.
+                    let raw_price = cursor_pt.price;
                     cursor_pt =
                         self.grid_snap_point(kind, pane, price_scale, x, cursor_pt, magnet_chose);
+                    // A keyboard nudge steps at least one tick the way the key points, from the
+                    // dragged corner's or edge's own price.
+                    if let Some((_, key_y)) = keyboard_step
+                        && key_y != 0.0
+                        && let Some(from) =
+                            self.drawing_from_px_for(pane, price_scale, handle_px.0, handle_px.1)
+                    {
+                        cursor_pt.price = self.keyboard_position_price(
+                            (pane, price_scale),
+                            from.price,
+                            raw_price,
+                            cursor_pt.price,
+                            key_y,
+                        );
+                    }
                     if keyboard_step.is_some() {
                         let (first, second) = (start_points[0].logical, start_points[1].logical);
                         let side = if matches!(index, 2..=4) {
@@ -8453,8 +8755,8 @@ impl ChartEngine {
                     }
                     // Every anchor steps bar by bar from its own slot by the slots the grabbed
                     // handle crossed ([`Self::drag_slot_steps`]), so a handle projected onto
-                    // another stroke, or an anchor off screen, never jumps; price-tick tools
-                    // also land on the tick grid.
+                    // another stroke, or an anchor off screen, never jumps, and lands on the
+                    // price tick grid.
                     let start = start_points[index];
                     if !magnet_chose {
                         point.logical = start.logical.round()
@@ -8470,7 +8772,11 @@ impl ChartEngine {
                         };
                         point = snapped;
                     }
-                    if kind.spec().price_tick_snap {
+                    // A magnet-chosen OHLC price stays exact. A time-only kind keeps its
+                    // stored price: the axis froze it, so a time drag never rewrites it.
+                    if !magnet_chose
+                        && kind.spec().movement_axis != tools::DrawingMovementAxis::HorizontalOnly
+                    {
                         point.price = self.snap_position_price(pane, price_scale, point.price);
                         // A keyboard nudge that snaps back to where it started still steps one
                         // tick the way the key points, like the position handles above.
@@ -8497,6 +8803,16 @@ impl ChartEngine {
                         {
                             point = snapped;
                         }
+                    }
+                    // An upstream signpost's post stays vertical: its top follows only the
+                    // cursor's price (the fork form's coincident top is derived instead).
+                    if kind == DrawingKind::Signpost
+                        && index == 1
+                        && self.drawing(id).is_some_and(|drawing| {
+                            !kinds::projection_annotations::fork_form(drawing)
+                        })
+                    {
+                        point.logical = points[0].logical;
                     }
                     points[index] = point;
                     // A horizontal or vertical segment drags its linked coordinate on every
@@ -8548,14 +8864,18 @@ impl ChartEngine {
                     // Single-anchor kinds drag by their line, not a handle — the body drag IS
                     // the anchor drag, so the magnet applies here too (a Ctrl-dragged vertical
                     // line snaps to bar centers, a horizontal one to the nearest rendered price).
+                    let mut magnet_chose = false;
                     if modifiers.magnet
                         && single_anchor
                         && let Some(snapped) =
                             self.magnet_snap_point_at(magnet, pane, price_scale, x, y)
                     {
                         point = kind.spec().movement_axis.constrain_snap(point, snapped);
+                        magnet_chose = true;
                     }
-                    if kind.spec().price_tick_snap {
+                    // Body moves step by price ticks once they move vertically; a freehand
+                    // stroke keeps its exact shape and a magnet-chosen OHLC price stays exact.
+                    if dy != 0.0 && !kind.spec().placement.is_freehand() && !magnet_chose {
                         let raw_price = point.price;
                         point.price = self.snap_position_price(pane, price_scale, raw_price);
                         if let Some((_, key_y)) = keyboard_step {
@@ -8594,15 +8914,15 @@ impl ChartEngine {
                 // kind resolves what that drives in whole bars (a pitchfork's base, a fixed
                 // square's corner, a signpost's top). A rotated rectangle's width handle encodes
                 // a perpendicular distance and stays continuous.
+                // It lands on the price tick too, unless the kind moves in time only (its stored
+                // price stays exact); a keyboard nudge steps at least one tick the way the key
+                // points.
                 let slot_snapped = !magnet_chose && kind != DrawingKind::RotatedRectangle;
                 if slot_snapped {
+                    let from =
+                        self.drawing_from_px_for(pane, price_scale, handle_px.0, handle_px.1);
                     target.logical = match keyboard_step {
-                        Some(_) => match self.drawing_from_px_for(
-                            pane,
-                            price_scale,
-                            handle_px.0,
-                            handle_px.1,
-                        ) {
+                        Some(_) => match from {
                             Some(from) => {
                                 from.logical + self.drag_slot_steps(handle_px.0, dx, true)
                             }
@@ -8610,6 +8930,21 @@ impl ChartEngine {
                         },
                         None => self.snapped_crosshair_index(handle_px.0 + dx) as f64,
                     };
+                    if kind.spec().movement_axis != tools::DrawingMovementAxis::HorizontalOnly {
+                        let raw_price = target.price;
+                        target.price = self.snap_position_price(pane, price_scale, raw_price);
+                        if let (Some((_, key_y)), Some(from)) = (keyboard_step, from)
+                            && key_y != 0.0
+                        {
+                            target.price = self.keyboard_position_price(
+                                (pane, price_scale),
+                                from.price,
+                                raw_price,
+                                target.price,
+                                key_y,
+                            );
+                        }
+                    }
                 }
                 // The data clamp checks the final target: the slot under the handle can lie in the
                 // empty area past the last bar. A keyboard step keeps a half-bar handle's fraction
@@ -8672,7 +9007,7 @@ impl ChartEngine {
     /// Close the drag session and report whether it committed an undoable change. A session that
     /// ends where it started (a clamped, axis-locked, or sub-bar move) records nothing, and so
     /// leaves the drawing's revision and the sync revision where they were.
-    fn commit_drawing_drag(&mut self) -> bool {
+    pub(crate) fn commit_drawing_drag(&mut self) -> bool {
         self.invalidate_frame_overlay();
         let Some(drag) = self.drawing_drag.take() else {
             return false;
@@ -8696,15 +9031,41 @@ impl ChartEngine {
             }
         }
         self.update_drawing_runtime(id);
+        // An icon corner resize painted each sample uncached (`IconRasterCache`): repaint once
+        // so the final size is cached.
+        if matches!(drag.part, DrawingDragPart::Anchor(_))
+            && self.drawing(id).is_some_and(|drawing| {
+                self.drawing_handle_mode(drawing) == DrawingHandleMode::IconBox
+            })
+        {
+            self.invalidate_frame_drawings();
+        }
         let Some(index) = self.drawings.iter().position(|drawing| drawing.id == id) else {
             return false;
         };
+        if let Some(source) = drag.duplicate_of {
+            // A copy that never left its source is no duplicate: drop it unrecorded. A moved
+            // copy is one new drawing; recording it advances the sync revision once.
+            let copy = &self.drawings[index];
+            if copy.points == drag.history_points
+                && (copy.screen_x, copy.screen_y) == drag.history_screen_position
+            {
+                self.discard_drawing_duplicate(id, source);
+                return false;
+            }
+            self.record_drawing_command(DrawingCommand::Create {
+                drawing: self.drawings[index].clone(),
+                index,
+            });
+            return true;
+        }
         let mut before = self.drawings[index].clone();
         before.points = drag.history_points;
         before.tool_options = drag.history_tool_options;
         before.screen_x = drag.history_screen_position.0;
         before.screen_y = drag.history_screen_position.1;
         before.bars_pattern = drag.history_bars_pattern;
+        before.icon_size = drag.history_icon_size;
         if before == self.drawings[index] {
             return false;
         }
@@ -8736,6 +9097,10 @@ impl ChartEngine {
         let Some(drag) = self.drawing_drag.take() else {
             return;
         };
+        if let Some(source) = drag.duplicate_of {
+            self.discard_drawing_duplicate(drag.id, source);
+            return;
+        }
         if let Some(drawing) = self
             .drawings
             .iter_mut()
@@ -8746,8 +9111,20 @@ impl ChartEngine {
             drawing.screen_x = drag.history_screen_position.0;
             drawing.screen_y = drag.history_screen_position.1;
             drawing.bars_pattern = drag.history_bars_pattern;
+            drawing.icon_size = drag.history_icon_size;
             self.update_drawing_runtime(drag.id);
             self.invalidate_frame_drawings();
+        }
+    }
+
+    /// Remove an unrecorded duplicate `copy` and select its `source` again, as a click on the
+    /// source's body would (a Ctrl-click ends like a click; a cancelled clone leaves the chart
+    /// as it was).
+    fn discard_drawing_duplicate(&mut self, copy: DrawingId, source: DrawingId) {
+        self.remove_drawing_snapshot(copy);
+        self.invalidate_frame_drawings();
+        if self.drawing(source).is_some() {
+            self.set_selected_drawing(Some(source));
         }
     }
 
@@ -8755,15 +9132,24 @@ impl ChartEngine {
         self.drawing_drag.is_some()
     }
 
+    pub(crate) fn drawing_duplicate_drag_active(&self) -> bool {
+        self.drawing_drag
+            .as_ref()
+            .is_some_and(|drag| drag.duplicate_of.is_some())
+    }
+
     /// Keyboard-equivalent movement through the same drag/history path as pointer input.
     /// `handle` selects one keyboard handle in [`ChartEngine::drawing_handle_count`] order (every
-    /// anchor, the brush's two ends, the rectangle's eight bounds handles, or the Long/Short
-    /// Position's target/entry/width/stop controls); `None` moves the whole drawing. The session
-    /// starts at the handle's own media position so handle kinds that follow the pointer move by
-    /// exactly the nudge delta. Drawings move horizontally in whole bars, so `dx_css` rounds to
-    /// a whole number of bar spacings, at least one; a rotated rectangle's width handle sets a
-    /// perpendicular distance and moves by `dx_css` unrounded. `dy_css` stays CSS px. Keyboard
-    /// nudges never magnet-snap, locked drawings do not move, and an active pointer drag is left
+    /// anchor, the brush's two ends, the rectangle's eight bounds handles, the Long/Short
+    /// Position's target/entry/width/stop controls, an icon's four box corners, or a derived
+    /// handle); `None` moves the whole drawing. The session starts at the handle's own media
+    /// position so handle kinds that follow the pointer move by exactly the nudge delta.
+    /// Drawings move horizontally in whole bars, so `dx_css` rounds to a whole number of bar
+    /// spacings, at least one; a rotated rectangle's width handle sets a perpendicular distance
+    /// and an icon's corner its size, so both move by the delta unrounded. Prices land on the
+    /// price tick, so `dy_css` moves at least one tick the way it points (a time-only kind's
+    /// stored price, a freehand stroke, anchored text and an icon's size stay continuous).
+    /// Keyboard nudges never magnet-snap, locked drawings do not move, and an active pointer drag is left
     /// untouched. Returns true only when the nudge recorded an undoable change: a nudge along an
     /// axis the drawing cannot move, one clamped at the pane edge, or one a family quantizes back
     /// to the same value returns false and records nothing.
@@ -8824,10 +9210,12 @@ impl ChartEngine {
             return false;
         };
         // Drawings move horizontally in whole bars, so a horizontal nudge steps at least one bar.
-        // A rotated rectangle's width handle sets a perpendicular distance and stays continuous
-        // (its pointer drag skips the slot snap too).
-        let continuous = drawing.kind == DrawingKind::RotatedRectangle
-            && matches!(part, DrawingDragPart::Handle(_));
+        // A rotated rectangle's width handle sets a perpendicular distance, and an icon box's
+        // corner a size, so both stay continuous (their pointer drags skip the slot snap too).
+        let continuous = (drawing.kind == DrawingKind::RotatedRectangle
+            && matches!(part, DrawingDragPart::Handle(_)))
+            || (drawing.kind.spec().handles == DrawingHandleMode::IconBox
+                && matches!(part, DrawingDragPart::Anchor(_)));
         let dx_css = if dx == 0.0 || continuous {
             dx
         } else {
@@ -8840,6 +9228,7 @@ impl ChartEngine {
             bars * spacing
         };
         let history_tool_options = drawing.tool_options.clone();
+        let icon_size = drawing.icon_size;
         self.drawing_drag = Some(DrawingDrag {
             id,
             part,
@@ -8855,6 +9244,9 @@ impl ChartEngine {
             start_points,
             start_px,
             keyboard_step: Some((dx_css, dy_css)),
+            start_icon_size: icon_size,
+            history_icon_size: icon_size,
+            duplicate_of: None,
         });
         self.drawing_drag_apply(
             start_x + dx_css,
@@ -8888,7 +9280,8 @@ impl ChartEngine {
     }
 
     /// Restore what a drag session edits (anchors, anchored text's screen position, family
-    /// options, a bars pattern's snapshot) from `before` without recording history.
+    /// options, a bars pattern's snapshot, an icon's size) from `before` without recording
+    /// history.
     pub(crate) fn restore_drawing_points(&mut self, before: Drawing) {
         let id = before.id;
         if let Some(drawing) = self.drawings.iter_mut().find(|drawing| drawing.id == id) {
@@ -8897,6 +9290,7 @@ impl ChartEngine {
             drawing.screen_y = before.screen_y;
             drawing.tool_options = before.tool_options;
             drawing.bars_pattern = before.bars_pattern;
+            drawing.icon_size = before.icon_size;
             self.update_drawing_runtime(id);
             self.invalidate_frame_drawings();
         }
@@ -8976,13 +9370,10 @@ impl ChartEngine {
     }
 
     /// Whether a newly created drawing requests the platform text editor. The editor remains a
-    /// host surface, while the decision to enter it is part of the canonical tool definition
-    /// (and, for a fork-form signpost, of its fork form: owner decision A7).
+    /// host surface, while the decision to enter it is part of the canonical tool definition.
     pub fn drawing_requests_text_edit(&self, id: DrawingId) -> bool {
-        self.drawing(id).is_some_and(|drawing| {
-            drawing.kind.spec().requests_text_editor
-                || kinds::projection_annotations::requests_text_editor(drawing)
-        })
+        self.drawing(id)
+            .is_some_and(|drawing| drawing.kind.spec().requests_text_editor)
     }
 
     /// Merge options into the armed template and any in-flight creation. Browser and native
@@ -9463,6 +9854,16 @@ impl ChartEngine {
         entry: DrawingPoint,
         snap_time_to_data: bool,
     ) -> Option<Vec<DrawingPoint>> {
+        if kind == DrawingKind::Signpost {
+            // The post stands on the clicked bar with its box a fixed height above, kept
+            // inside the pane.
+            let pane_geometry = self.panes.get(pane)?;
+            let (x, y) = self.drawing_to_px_for(pane, price_scale, entry)?;
+            let top_y = (y - SIGNPOST_PRESET_HEIGHT).max(pane_geometry.top + 8.0);
+            let mut top = self.drawing_from_px_for(pane, price_scale, x, top_y)?;
+            top.logical = entry.logical;
+            return Some(vec![entry, top]);
+        }
         if !matches!(kind, DrawingKind::LongPosition | DrawingKind::ShortPosition) {
             return None;
         }

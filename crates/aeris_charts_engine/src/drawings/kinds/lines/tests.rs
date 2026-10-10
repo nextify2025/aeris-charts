@@ -5,6 +5,7 @@
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, Prim};
 
+use super::super::super::tests::on_tick;
 use super::super::super::tools::DrawingAnchorLink;
 use super::super::super::{
     DrawingPlacement, DrawingStraightenMode, DrawingTextHAlign, DrawingTextLayout,
@@ -229,12 +230,12 @@ fn cross_lines_span_both_axes_and_tag_their_price() {
             .hit_test_drawing(x, chart.panes[0].top + 5.0)
             .is_some()
     );
-    // A body drag moves both coordinates.
+    // A body drag moves both coordinates, the price onto its tick.
     assert!(chart.drawing_drag_start_at(20.0, y));
     chart.drawing_drag_to(60.0, y - 40.0, DrawingModifiers::default());
     chart.drawing_drag_end();
     let moved = anchor(&chart, id, 0);
-    assert!(close(moved, (x + 40.0, y - 40.0), 1e-6));
+    assert!(close(moved, (x + 40.0, on_tick(&chart, y - 40.0)), 1e-6));
 }
 
 #[test]
@@ -1577,14 +1578,21 @@ fn a_line_block_trims_arrow_strokes_under_their_heads_and_caps_only_unextended_e
     assert!(chart.drawing_apply_options(id, r#"{"extend_right":true}"#));
     assert_eq!(ink_heads(&mut chart), (Vec::new(), 0));
 
-    // Without the block the arrow line is upstream's: an untrimmed stroke under a triangle head,
-    // on the pane edge when extended.
+    // Without the block the arrow line is upstream's: an untrimmed stroke ending in the Path
+    // tool's open chevron, stroked like the line, with no filled head.
     assert!(
         chart.drawing_apply_options(id, r#"{"extend_right":false,"tool_options":{"line":null}}"#)
     );
-    let stroke = ink_polylines(&mut chart).remove(0).0;
-    assert!(close(stroke[1], b, 0.01));
-    assert_eq!(ink_heads(&mut chart).1, 1);
+    let lines = ink_polylines(&mut chart);
+    assert_eq!(lines.len(), 2, "the stroke and its chevron");
+    assert!(close(lines[0].0[1], b, 0.01));
+    let chevron = crate::drawings::path_arrow_points(&[a, b], 2.0, 1.0).unwrap();
+    assert_eq!(lines[1].0.len(), 3);
+    for (painted, expected) in lines[1].0.iter().zip(chevron) {
+        assert!(close(*painted, expected, 1e-3), "{painted:?} {expected:?}");
+    }
+    assert_eq!(lines[1].1, 2.0, "the chevron takes the line's width");
+    assert_eq!(ink_heads(&mut chart), (Vec::new(), 0));
     chart.remove_drawing(id);
 
     // A ray's arrow end reaches the pane edge, so it carries no head.

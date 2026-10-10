@@ -158,9 +158,9 @@ pub use drawing_text_edit::DrawingTextEditKey;
 pub use drawings::kinds::patterns_elliott_cycles::{ElliottWaveDegree, PatternToolOptions};
 pub use drawings::kinds::shapes::ShapeToolOptions;
 pub use drawings::{
-    DRAWING_DEFAULT_COLOR, DRAWING_WEAK_MAGNET_DISTANCE, Drawing, DrawingAnchor,
-    DrawingCreationUpdate, DrawingDragPart, DrawingHit, DrawingId, DrawingKind, DrawingModifiers,
-    DrawingPoint, DrawingPriceScale, DrawingTextEditLayout, DrawingWorkStats,
+    BuiltinDrawingIcon, DRAWING_DEFAULT_COLOR, DRAWING_WEAK_MAGNET_DISTANCE, Drawing,
+    DrawingAnchor, DrawingCreationUpdate, DrawingDragPart, DrawingHit, DrawingId, DrawingKind,
+    DrawingModifiers, DrawingPoint, DrawingPriceScale, DrawingTextEditLayout, DrawingWorkStats,
     MAX_BARS_PATTERN_BARS, MAX_DRAWING_ICON_NAME_BYTES, MAX_DRAWING_ICON_SIZE, MAX_DRAWING_ICONS,
     TextCapCenterFn, TextMeasureFn,
 };
@@ -2248,6 +2248,8 @@ pub struct ChartEngine {
     /// text) in z-order, bottom first. See drawings.rs.
     drawings: Vec<Drawing>,
     drawing_icons: DrawingIconRegistry,
+    /// Rasterized built-in icons; frame construction (`&self`) fills it on demand.
+    icon_rasters: std::cell::RefCell<drawings::IconRasterCache>,
     /// Derived, chart-local drawing bounds, pane candidates, and coordinate geometry. Semantic
     /// anchors and styles in `drawings` remain authoritative and are the only serialized state.
     drawing_runtime: RefCell<DrawingRuntime>,
@@ -2466,6 +2468,7 @@ impl ChartEngine {
             drawings: Vec::new(),
             drawing_runtime: RefCell::new(DrawingRuntime::default()),
             drawing_icons: DrawingIconRegistry::default(),
+            icon_rasters: Default::default(),
             next_drawing_id: 1,
             selected_drawing: None,
             selected_drawings: Vec::new(),

@@ -8,6 +8,7 @@ use aeris_charts_render::draw_list::{LineStyle, Prim};
 use aeris_charts_render::shape::{self, MAX_FLATTEN_POINTS, Point, Rect};
 
 use super::super::super::DrawingTextLayout;
+use super::super::super::tests::{on_tick, painted_handle_centers, snapped_handle_center};
 use super::ShapeToolOptions;
 use crate::drawings::geometry::CURVE_TOLERANCE;
 use crate::drawings::{DrawingBodyGeometry, DrawingGeometryOptions, resolve_drawing_geometry};
@@ -1094,19 +1095,9 @@ fn part_at(chart: &ChartEngine, point: Point) -> Option<DrawingDragPart> {
     chart.hit_test_drawing(point.0, point.1).map(|hit| hit.part)
 }
 
-/// Anchor handles in the frame: the bordered discs at the handle radius.
+/// The centres of the handles painted in the first pane, in paint order.
 fn handle_centers(chart: &mut ChartEngine) -> Vec<Point> {
-    let frame = chart.build_frame();
-    frame.panes[0]
-        .main
-        .iter()
-        .filter_map(|prim| match prim {
-            Prim::Circle { cx, cy, radius, .. } if (*radius - 5.5).abs() < 1e-3 => {
-                Some((f64::from(*cx), f64::from(*cy)))
-            }
-            _ => None,
-        })
-        .collect()
+    painted_handle_centers(&chart.build_frame())
 }
 
 /// The ink arrowheads (`Prim::BandFill` in the stroke color, a triangle's convex ribbon) on the
@@ -1722,7 +1713,7 @@ fn ellipses_edit_with_the_rectangle_bounds_handles() {
     );
     assert!(chart.undo_drawing());
     assert_eq!(chart.drawing(id).unwrap().points, before);
-    // The top edge's midpoint moves the top edge only.
+    // The top edge's midpoint moves the top edge only, onto the price tick.
     let top = (a.0.min(b.0) + (a.0 - b.0).abs() / 2.0, a.1.min(b.1));
     assert_eq!(part_at(&chart, top), Some(DrawingDragPart::Anchor(1)));
     assert!(chart.drawing_drag_start_at(top.0, top.1));
@@ -1734,7 +1725,7 @@ fn ellipses_edit_with_the_rectangle_bounds_handles() {
         (a.0.min(b.0), a.0.max(b.0)),
         1e-6
     ));
-    assert!((a3.1.min(b3.1) - (top.1 - 20.0)).abs() < 1e-6);
+    assert!((a3.1.min(b3.1) - on_tick(&chart, top.1 - 20.0)).abs() < 1e-6);
     assert!((a3.1.max(b3.1) - a.1.max(b.1)).abs() < 1e-6);
     assert!(chart.undo_drawing());
     assert_eq!(chart.drawing(id).unwrap().points, before);
@@ -1750,14 +1741,18 @@ fn ellipses_edit_with_the_rectangle_bounds_handles() {
         .drawing_tool_activate(330.0, 290.0, modifiers)
         .created
         .unwrap();
-    // Both clicks land on their bar slots first; the square takes the snapped width.
+    // Both clicks land on their bar slots and price ticks first; the square takes the snapped
+    // width.
     let (a, b) = (anchor(&chart, id, 0), anchor(&chart, id, 1));
     let slot_x = |x: f64| {
         chart
             .logical_to_coordinate(chart.coordinate_to_logical(x).unwrap())
             .unwrap()
     };
-    assert!(close(a, (slot_x(200.0), 250.0), 1e-6), "{a:?}");
+    assert!(
+        close(a, (slot_x(200.0), on_tick(&chart, 250.0)), 1e-6),
+        "{a:?}"
+    );
     assert!(((b.0 - a.0).abs() - (b.1 - a.1).abs()).abs() < 1e-3);
     assert!(((b.0 - a.0) - (slot_x(330.0) - slot_x(200.0))).abs() < 1e-3);
 }
@@ -1808,8 +1803,8 @@ fn rotated_rectangle_width_handles_sit_on_its_long_sides() {
     assert_ne!(part_at(&chart, c), Some(DrawingDragPart::Anchor(2)));
 
     // Pulling the far handle 15 px outward, with 9 px of jitter along the side, moves the depth
-    // anchor by the pointer's bar steps from its own slot and by the raw vertical delta, in one
-    // undo step, keeping the edge.
+    // anchor by the pointer's bar steps from its own slot and by the vertical delta onto the
+    // price tick, in one undo step, keeping the edge.
     let out = offset.signum();
     let delta = (
         normal.0 * 15.0 * out + normal.1 * 9.0,
@@ -1832,7 +1827,7 @@ fn rotated_rectangle_width_handles_sit_on_its_long_sides() {
         chart
             .logical_to_coordinate(before[2].logical + steps)
             .unwrap(),
-        c.1 + delta.1,
+        on_tick(&chart, c.1 + delta.1),
     );
     let across = (moved.0 - a.0) * normal.0 + (moved.1 - a.1) * normal.1;
     assert!(close(anchor(&chart, id, 2), moved, 1e-6));
@@ -1882,21 +1877,25 @@ fn rotated_rectangle_width_handles_sit_on_its_long_sides() {
         chart
             .logical_to_coordinate(slot(&chart, quarter.0))
             .unwrap(),
-        quarter.1,
+        on_tick(&chart, quarter.1),
     );
     assert!(close(anchor(&chart, id, 1), quarter, 1e-3));
     assert!((depth(&chart, id) - offset.abs()).abs() < 1e-3);
     assert!(chart.undo_drawing());
     assert_eq!(chart.drawing(id).unwrap().points, before);
 
-    // Keyboard: the far handle (third) and the width handle (fourth) nudge only the width.
+    // Keyboard: the far handle (third) and the width handle (fourth) nudge only the width. The
+    // far handle drives the depth anchor, which lands on the price tick; the width handle moves
+    // continuously (owner decision S4a).
     assert!(chart.nudge_selected_drawing(0.0, -10.0, Some(2)));
-    let widened = (offset + normal.1 * -10.0).abs();
+    let far_dy = on_tick(&chart, c.1 - 10.0) - c.1;
+    let widened = (offset + normal.1 * far_dy).abs();
     assert!((depth(&chart, id) - widened).abs() < 1e-3);
     assert!(close(anchor(&chart, id, 0), a, 1e-9));
-    // The same step on the near side moves the edge with it: the width is back.
+    // The same step on the near side moves the edge with it: the width is back, up to the far
+    // side's tick rounding.
     assert!(chart.nudge_selected_drawing(0.0, -10.0, Some(3)));
-    assert!((depth(&chart, id) - offset.abs()).abs() < 1e-3);
+    assert!((depth(&chart, id) - (offset + normal.1 * (far_dy + 10.0)).abs()).abs() < 1e-3);
     let shifted = (
         a.0 - normal.0 * normal.1 * 10.0,
         a.1 - normal.1 * normal.1 * 10.0,
@@ -1961,10 +1960,14 @@ fn rotated_rectangle_width_handles_sit_on_its_long_sides() {
     );
 }
 
-/// The bar slot under media `x` (every anchor but anchored text lands on one), at `y`.
+/// The bar slot under media `x` and the price tick under `y` (every anchor but anchored text
+/// lands on both).
 fn on_slot(chart: &ChartEngine, (x, y): Point) -> Point {
     let logical = chart.coordinate_to_logical(x).unwrap();
-    (chart.logical_to_coordinate(logical).unwrap(), y)
+    (
+        chart.logical_to_coordinate(logical).unwrap(),
+        on_tick(chart, y),
+    )
 }
 
 /// Curves are placed and edited through points on the curve: a curve's anchors are its start,
@@ -2005,7 +2008,7 @@ fn curves_place_and_edit_through_points_on_the_curve() {
     ];
     for (kind, clicks) in cases {
         let id = place(&mut chart, kind, clicks);
-        // Each click lands on its bar slot, at the raw price.
+        // Each click lands on its bar slot, on the price tick.
         let clicks = clicks
             .iter()
             .map(|&click| on_slot(&chart, click))
@@ -2058,14 +2061,14 @@ fn curves_place_and_edit_through_points_on_the_curve() {
         None,
         "the control point is no handle"
     );
-    // Dragging it moves that anchor alone, a whole bar for 25 px, and the curve passes through
-    // it with its ends fixed, in one step.
+    // Dragging it moves that anchor alone, a whole bar for 25 px and onto the price tick, and
+    // the curve passes through it with its ends fixed, in one step.
     assert_eq!(chart.bar_spacing(), 20.0);
     let to = (middle.0 + 25.0, middle.1 - 30.0);
     assert!(chart.drawing_drag_start_at(middle.0, middle.1));
     chart.drawing_drag_to(to.0, to.1, DrawingModifiers::default());
     chart.drawing_drag_end();
-    let moved = (middle.0 + 20.0, to.1);
+    let moved = (middle.0 + 20.0, on_tick(&chart, to.1));
     assert!(close(anchor(&chart, id, 1), moved, 1e-6));
     assert_eq!(chart.drawing(id).unwrap().points[1].logical, 16.0);
     assert!(shape::distance_to_polyline(moved, &ink_line(&mut chart)) <= 0.11);
@@ -2076,14 +2079,18 @@ fn curves_place_and_edit_through_points_on_the_curve() {
     assert!(chart.drawing_drag_start_at(a.0, a.1));
     chart.drawing_drag_to(a.0 - 40.0, a.1 + 20.0, DrawingModifiers::default());
     chart.drawing_drag_end();
-    assert!(close(anchor(&chart, id, 0), (a.0 - 40.0, a.1 + 20.0), 1e-6));
+    assert!(close(
+        anchor(&chart, id, 0),
+        (a.0 - 40.0, on_tick(&chart, a.1 + 20.0)),
+        1e-6
+    ));
     assert!(close(anchor(&chart, id, 1), middle, 1e-9));
     assert!(chart.undo_drawing());
     // Keyboard: the second handle is the on-curve anchor.
     assert!(chart.nudge_selected_drawing(0.0, -10.0, Some(1)));
     assert!(close(
         anchor(&chart, id, 1),
-        (middle.0, middle.1 - 10.0),
+        (middle.0, on_tick(&chart, middle.1 - 10.0)),
         1e-6
     ));
     assert!(chart.undo_drawing());
@@ -2119,7 +2126,7 @@ fn curves_place_and_edit_through_points_on_the_curve() {
     assert!(chart.drawing_drag_start_at(two_thirds.0, two_thirds.1));
     chart.drawing_drag_to(to.0, to.1, DrawingModifiers::default());
     chart.drawing_drag_end();
-    let moved = (two_thirds.0 + 20.0, to.1);
+    let moved = (two_thirds.0 + 20.0, on_tick(&chart, to.1));
     assert!(close(anchor(&chart, id, 2), moved, 1e-6));
     assert!(close(anchor(&chart, id, 1), third, 1e-9));
     assert!(close(anchor(&chart, id, 3), end, 1e-9));
@@ -2136,7 +2143,7 @@ fn curves_place_and_edit_through_points_on_the_curve() {
         assert!(chart.nudge_selected_drawing(0.0, -10.0, Some(moved)));
         assert!(close(
             anchor(&chart, id, moved),
-            (from.0, from.1 - 10.0),
+            (from.0, on_tick(&chart, from.1 - 10.0)),
             1e-6
         ));
         assert!(close(anchor(&chart, id, kept), other, 1e-9));
@@ -2152,8 +2159,8 @@ fn curves_place_and_edit_through_points_on_the_curve() {
 }
 
 /// While a through-point tool is placed, the preview resolves the anchors its clicks will store
-/// (the curve bends through the pointer) and paints its handle discs on the clicks placed so far,
-/// each on its bar slot.
+/// (the curve bends through the pointer) and paints its handles on the clicks placed so far, each
+/// on its bar slot and price tick.
 #[test]
 fn through_point_previews_bend_through_the_pointer_with_discs_on_the_clicks() {
     let mut chart = chart();
@@ -2176,10 +2183,14 @@ fn through_point_previews_bend_through_the_pointer_with_discs_on_the_clicks() {
         if kind == DrawingKind::DoubleCurve {
             let through = slot(&chart, (260.0, 180.0));
             chart.drawing_tool_pointer_move(260.0, 180.0, modifiers, false);
-            assert_eq!(
-                ink_line(&mut chart),
-                vec![start, end, through],
-                "the guide through the ends and the pointer"
+            let guide = ink_line(&mut chart);
+            assert!(
+                guide.len() == 3
+                    && guide
+                        .iter()
+                        .zip([start, end, through])
+                        .all(|(&painted, expected)| close(painted, expected, 1e-3)),
+                "the guide through the ends and the pointer: {guide:?}"
             );
             chart.drawing_tool_activate(260.0, 180.0, modifiers);
             placed.push(through);
@@ -2196,8 +2207,11 @@ fn through_point_previews_bend_through_the_pointer_with_discs_on_the_clicks() {
         }
         assert_eq!(
             handle_centers(&mut chart),
-            placed,
-            "{kind:?} discs on the clicks"
+            placed
+                .iter()
+                .map(|&point| snapped_handle_center(point))
+                .collect::<Vec<_>>(),
+            "{kind:?} handles on the clicks"
         );
         assert!(chart.set_drawing_tool(None, None, None));
         assert!(polylines(&mut chart, ink()).is_empty());

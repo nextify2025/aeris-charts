@@ -6,6 +6,7 @@
 use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, Prim, TextAlign};
 
+use super::super::super::tests::on_tick;
 use super::super::super::{DrawingPlacement, DrawingTextHAlign, DrawingTextVAlign};
 use crate::{
     ChartEngine, DrawingDragPart, DrawingId, DrawingKind, DrawingLabelMetric, DrawingLineCap,
@@ -205,8 +206,6 @@ fn catalog_defaults_follow_each_tool() {
             assert!(!spec.requests_text_editor);
             assert_eq!(spec.placement, DrawingPlacement::ClickAnchors { count: 2 });
         }
-        // Only the measuring ranges snap their anchors to whole bars and price ticks.
-        assert_eq!(spec.price_tick_snap, ranged, "{kind:?}");
         let mut drawing = crate::Drawing::new(1, kind, 0, Vec::new());
         crate::drawings::kinds::apply_legacy_fork_defaults(&mut drawing);
         assert_eq!(
@@ -273,12 +272,25 @@ fn armed_tools_place_every_kind() {
         assert!(chart.set_drawing_tool(Some(kind), Some(r##"{"color":"#123456"}"##), None));
         let clicks = [(200.0, 260.0), (420.0, 150.0), (380.0, 120.0)];
         let mut created = None;
+        let mut used = 0;
         for &(x, y) in &clicks[..kind.anchor_count()] {
+            used += 1;
             created = chart
                 .drawing_tool_activate(x, y, DrawingModifiers::default())
                 .created;
+            if created.is_some() {
+                break;
+            }
         }
         let id = created.unwrap_or_else(|| panic!("{kind:?} committed"));
+        // A signpost drops from one click (its base, with the box preset above it); every other
+        // kind takes one click per anchor.
+        let clicks = if kind == DrawingKind::Signpost {
+            1
+        } else {
+            kind.anchor_count()
+        };
+        assert_eq!(used, clicks, "{kind:?}");
         let drawing = chart.drawing(id).unwrap();
         assert_eq!(drawing.kind, kind);
         assert_eq!(drawing.points.len(), kind.anchor_count());
@@ -582,6 +594,44 @@ fn indexed_hit_testing_matches_brute_force_for_every_tool() {
     assert!(hits > 100, "the grid meets the drawings ({hits} hits)");
 }
 
+/// An arrow marker's icon box, a large icon stamp and the price label's bubble hit within the
+/// pointer tolerance beyond what they paint, so the candidate index must keep them there too:
+/// every pixel around each one answers the same through the index as by brute force.
+#[test]
+fn icon_boxes_and_price_label_bubbles_hit_alike_through_the_index() {
+    for (kind, options) in [
+        (DrawingKind::ArrowMarkerUp, "{}"),
+        (DrawingKind::ArrowMarkerDown, "{}"),
+        (DrawingKind::ArrowMarkerLeft, "{}"),
+        (DrawingKind::ArrowMarkerRight, "{}"),
+        (DrawingKind::ArrowMarkerUp, r#"{"icon_size":96}"#),
+        (DrawingKind::IconStamp, r#"{"icon_size":96}"#),
+        (DrawingKind::PriceLabel, r#"{"text":"Hello"}"#),
+    ] {
+        let mut chart = chart();
+        let id = add(&mut chart, kind, points_for(kind), options);
+        chart.build_frame();
+        let (ax, ay) = anchor(&chart, id, 0);
+        let mut hits = 0;
+        for dy in -110..=110 {
+            for dx in -110..=110 {
+                let (x, y) = (ax.round() + f64::from(dx), ay.round() + f64::from(dy));
+                let indexed = chart.hit_test_drawing(x, y);
+                assert_eq!(
+                    indexed,
+                    chart.hit_test_drawing_bruteforce(x, y),
+                    "{kind:?} {options} ({x}, {y})"
+                );
+                hits += usize::from(indexed.is_some());
+            }
+        }
+        assert!(
+            hits > 100,
+            "{kind:?} {options}: the grid meets it ({hits} hits)"
+        );
+    }
+}
+
 #[test]
 fn schema_kind_options_and_option_patches_are_typed_and_atomic() {
     let find = |schema: &crate::DrawingPropertySchema, name: &str| {
@@ -696,8 +746,8 @@ fn anchors_px(chart: &ChartEngine, id: DrawingId) -> Vec<(f64, f64)> {
         .collect()
 }
 
-/// `now` sits on the bar slot nearest the raw pointer position `raw_px`: a whole bar, at the raw
-/// price, or on the nearest price tick for the tick-snapped tools (the measuring ranges).
+/// `now` sits on the bar slot nearest the raw pointer position `raw_px`: a whole bar, on the
+/// nearest price tick (`tick`: every tool but anchored text), or at the raw price.
 fn assert_on_the_slot(
     chart: &ChartEngine,
     now: DrawingPoint,
@@ -738,7 +788,8 @@ fn assert_on_the_slot(
 
 #[test]
 fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entries() {
-    // Upstream's text annotations edit like the text tool, without anchor handles.
+    // The kinds whose every anchor is a handle: the signpost's one post-top handle, the icon
+    // boxes' corners and anchored text (no handles) are covered by their own tests.
     for kind in KINDS
         .into_iter()
         .filter(|kind| kind.spec().handles == crate::drawings::DrawingHandleMode::Anchors)
@@ -751,10 +802,9 @@ fn every_tool_drags_and_nudges_each_handle_and_its_body_as_single_history_entrie
         assert_eq!(chart.drawing_handle_count(id), Some(count), "{kind:?}");
         let start = anchors_px(&chart, id);
         let start_points = chart.drawing(id).unwrap().points.clone();
-        // Every tool but the screen-pinned anchored text lands on whole bars; the measuring
-        // ranges also land on price ticks, the rest keep the raw price.
+        // Every tool but the screen-pinned anchored text lands on whole bars and price ticks.
         let bars = kind != DrawingKind::AnchoredText;
-        let tick = kind.spec().price_tick_snap;
+        let tick = kind != DrawingKind::AnchoredText;
         for handle in 0..count {
             // Pointer drag of the handle: only that anchor follows the pointer.
             let (x, y) = start[handle];
@@ -1200,9 +1250,9 @@ fn sync_revision(chart: &ChartEngine) -> u64 {
 #[test]
 fn text_boxes_are_editable_in_place_as_multiline_boxes() {
     let mut chart = chart();
-    // Every tool that paints text opens on its empty text: upstream-rendered tools as one-line
-    // runs, the text annotations' blocks and the simple annotation's family box over several
-    // lines.
+    // Every tool that paints text opens on its empty text: upstream-rendered tools (and the
+    // signpost's box) as one-line runs, the multi-line kinds' boxes and blocks and the simple
+    // annotation's family box over several lines.
     for kind in KINDS.into_iter().chain([DrawingKind::SimpleAnnotation]) {
         let id = add(&mut chart, kind, points_for(kind), "{}");
         let expected = !TEXTLESS.contains(&kind);
@@ -1211,7 +1261,7 @@ fn text_boxes_are_editable_in_place_as_multiline_boxes() {
             chart
                 .drawing_text_edit_layout(id)
                 .map(|layout| layout.multiline),
-            expected.then_some(kind == DrawingKind::SimpleAnnotation || kind.is_text_annotation()),
+            expected.then_some(kind == DrawingKind::SimpleAnnotation || kind.multiline_kind()),
             "{kind:?}"
         );
         assert_eq!(
@@ -1299,11 +1349,11 @@ fn every_tool_is_text_editable_exactly_when_it_paints_its_text() {
         let layout = chart.drawing_text_edit_layout(id);
         assert_eq!(layout.is_some(), expected, "{kind:?}");
         if let Some(layout) = layout {
-            // Family boxes and the text annotations' blocks take several lines; every other
-            // drawing edits one rotated or level run, which the engine keeps on one line.
+            // Family boxes and the multi-line kinds' boxes and blocks take several lines (owner
+            // decision R9); every other drawing, the signpost's box included, edits one line.
             assert_eq!(
                 layout.multiline,
-                spec.family.is_some_and(|family| family.owns_text) || kind.is_text_annotation(),
+                spec.family.is_some_and(|family| family.owns_text) || kind.multiline_kind(),
                 "{kind:?}"
             );
             assert!(layout.x.is_finite() && layout.y.is_finite() && layout.angle.is_finite());
@@ -2233,7 +2283,8 @@ fn fork_form_notes_stand_a_pin_and_reveal_their_box_on_focus() {
             .unwrap()
             .always_show_text
     );
-    // Upstream's note keeps its tinted box and rebuilds nothing on hover.
+    // Upstream's note paints its box in the theme's accent token (no longer a fixed tint) and
+    // rebuilds nothing on hover.
     let upstream = add(
         &mut chart,
         DrawingKind::Note,
@@ -2244,8 +2295,16 @@ fn fork_form_notes_stand_a_pin_and_reveal_their_box_on_focus() {
     chart.set_hovered_drawing(Some(upstream));
     chart.build_frame();
     assert_eq!(chart.frame_build_stats().drawing_rebuilds, 0);
+    let accent = crate::frame::ChromeTokens::for_theme(chart.surface_theme()).accent;
+    let frame = chart.build_frame();
     assert!(
-        rects(&mut chart)
+        frame.panes[0]
+            .main
+            .iter()
+            .any(|prim| matches!(prim, Prim::RoundRect { fill, .. } if *fill == accent))
+    );
+    assert!(
+        !rects(&mut chart)
             .iter()
             .any(|rect| rect.4 == Color::parse_css("#facc1533").unwrap())
     );
@@ -2384,12 +2443,14 @@ fn a_fork_form_price_note_boxes_its_price_and_text_in_its_text_slot() {
 
 #[test]
 fn coincident_signposts_stand_a_pole_whose_top_handle_drags_from_where_it_is_painted() {
+    // The pole is the fork form's (the fork's one-anchor signpost restores coincident anchors
+    // with the block).
     let mut chart = chart();
     let id = add(
         &mut chart,
         DrawingKind::Signpost,
         vec![p(15.0, 103.0), p(15.0, 103.0)],
-        "{}",
+        &fork(""),
     );
     let foot = anchor(&chart, id, 0);
     // The pole is 40 CSS px tall and hits along its length.
@@ -2400,10 +2461,15 @@ fn coincident_signposts_stand_a_pole_whose_top_handle_drags_from_where_it_is_pai
     let top = (foot.0, foot.1 - 40.0);
     let grabbed = chart.hit_test_drawing(top.0, top.1).unwrap();
     assert_eq!((grabbed.id, grabbed.part), (id, DrawingDragPart::Handle(0)));
-    // Dragging it 10 px up puts the top anchor under the pointer, not 40 px below it.
+    // Dragging it 10 px up puts the top anchor on the price tick under the pointer, not 40 px
+    // below it.
     assert!(chart.drawing_drag_start_at(top.0, top.1));
     chart.drawing_drag_to(top.0, top.1 - 10.0, DrawingModifiers::default());
-    assert!(close(anchor(&chart, id, 1), (top.0, top.1 - 10.0), 1e-3));
+    assert!(close(
+        anchor(&chart, id, 1),
+        (top.0, on_tick(&chart, top.1 - 10.0)),
+        1e-3
+    ));
     assert!(close(anchor(&chart, id, 0), foot, 1e-9));
     // Escape restores the coincident anchors.
     chart.drawing_drag_cancel();
@@ -2429,7 +2495,7 @@ fn dragging_a_coincident_signposts_foot_moves_its_pole_with_it() {
         &mut chart,
         DrawingKind::Signpost,
         vec![p(15.0, 103.0), p(15.0, 103.0)],
-        "{}",
+        &fork(""),
     );
     chart.set_selected_drawing(Some(id));
     let foot = anchor(&chart, id, 0);
@@ -2441,7 +2507,10 @@ fn dragging_a_coincident_signposts_foot_moves_its_pole_with_it() {
     let points = &chart.drawing(id).unwrap().points;
     assert_eq!(points[0], points[1]);
     let moved = anchor(&chart, id, 0);
-    assert!(close(moved, (foot.0, foot.1 + 5.0), 1e-3), "{moved:?}");
+    assert!(
+        close(moved, (foot.0, on_tick(&chart, foot.1 + 5.0)), 1e-3),
+        "{moved:?}"
+    );
     // The top handle stands on the moved foot's pole.
     let grabbed = chart.hit_test_drawing(moved.0, moved.1 - 40.0).unwrap();
     assert_eq!((grabbed.id, grabbed.part), (id, DrawingDragPart::Handle(0)));
@@ -2460,16 +2529,18 @@ fn a_foot_drag_sample_onto_a_distinct_signposts_top_does_not_capture_it() {
     let foot_point = p(15.0, 103.0);
     let probe = crate::Drawing::new(0, DrawingKind::Signpost, 0, Vec::new());
     let foot = chart.drawing_point_px(&probe, foot_point).unwrap();
-    // The exact price the drag converts the pointer at `foot.1 - 40` into.
-    let top_y = foot.1 + ((foot.1 - 40.0) - foot.1);
-    let top_point = chart
-        .drawing_from_px_for(0, crate::DrawingPriceScale::Right, foot.0, top_y)
-        .unwrap();
+    // The exact price the drag lands the pointer at `foot.1 - 40` on: the tick nearest it.
+    let top_point = p(
+        foot_point.logical,
+        chart
+            .pane_coordinate_to_price(0, on_tick(&chart, foot.1 - 40.0))
+            .unwrap(),
+    );
     let id = add(
         &mut chart,
         DrawingKind::Signpost,
         vec![foot_point, top_point],
-        "{}",
+        &fork(""),
     );
     chart.set_selected_drawing(Some(id));
     let grabbed = chart.hit_test_drawing(foot.0, foot.1).unwrap();
@@ -2512,7 +2583,7 @@ fn a_coincident_signposts_label_sits_on_its_pole_at_every_pixel_ratio() {
                 &mut chart,
                 DrawingKind::Signpost,
                 vec![foot, top],
-                &format!(r#"{{"text":"{text}"}}"#),
+                &fork(&format!(r#""text":"{text}""#)),
             );
             let (x, y, ..) = painted_run(&mut chart, text);
             let (mx, my) = chart.drawing_text_coordinate(id).unwrap();
@@ -2590,8 +2661,8 @@ fn fork_form_signposts_and_arrow_marks_box_their_text_and_keep_one_editor_owner(
         chart.remove_drawing(empty);
     }
     chart.remove_drawing(id);
-    // An arrow mark's text sits past its tail, aligned by direction, in the arrow's color.
-    let r = 7.0;
+    // An arrow mark's text sits past its tail, aligned by direction, in the arrow's color: past
+    // the solid icon's box, which reaches `icon_size` back from the tip.
     for (kind, direction) in [
         (DrawingKind::ArrowMarkerUp, (0.0, -1.0)),
         (DrawingKind::ArrowMarkerDown, (0.0, 1.0)),
@@ -2605,6 +2676,7 @@ fn fork_form_signposts_and_arrow_marks_box_their_text_and_keep_one_editor_owner(
             &fork(&format!(r##""text":"Go","color":"{INK}""##)),
         );
         let tip = anchor(&chart, id, 0);
+        let size = chart.drawing(id).unwrap().icon_size;
         let runs = text_runs(&mut chart);
         let (_, x, y, color) = run_of(&runs, "Go");
         assert_eq!(*color, ink(), "{kind:?}");
@@ -2622,15 +2694,22 @@ fn fork_form_signposts_and_arrow_marks_box_their_text_and_keep_one_editor_owner(
             DrawingKind::ArrowMarkerRight => back - width,
             _ => back,
         };
-        assert!(near > 2.0 * r - 1.0, "{kind:?}: {near}");
+        assert!(
+            near > size,
+            "{kind:?}: {near} within the {size} px icon box"
+        );
         assert_eq!(hit(&chart, x + 1.0, *y), Some(id), "{kind:?}");
         chart.remove_drawing(id);
-        // Upstream form centers the run on the marker box.
+        // Upstream form centers the run inside the icon box.
         let upstream = add(&mut chart, kind, vec![p(15.0, 103.0)], r#"{"text":"Go"}"#);
         let (ux, uy, ..) = painted_run(&mut chart, "Go");
+        let center = (
+            tip.0 - direction.0 * size / 2.0,
+            tip.1 - direction.1 * size / 2.0,
+        );
         assert!(
-            (ux - tip.0).abs() <= r + 1.0 && (uy - tip.1).abs() <= 2.0 * r + 1.0,
-            "{kind:?}"
+            (ux - center.0).abs() <= size / 2.0 && (uy - center.1).abs() <= size / 2.0,
+            "{kind:?}: ({ux}, {uy}) outside the box around {center:?}"
         );
         chart.remove_drawing(upstream);
     }
@@ -2638,8 +2717,10 @@ fn fork_form_signposts_and_arrow_marks_box_their_text_and_keep_one_editor_owner(
 
 #[test]
 fn fork_form_annotations_start_from_their_starter_text_and_upstream_form_starts_empty() {
+    // A note places upstream's two anchors, so even an armed block leaves it upstream's box,
+    // which starts empty (the fork form is the one-anchor note).
     for (kind, text) in [
-        (DrawingKind::Note, "Note"),
+        (DrawingKind::Note, ""),
         (DrawingKind::Comment, "Comment"),
         (DrawingKind::Callout, "Callout"),
         (DrawingKind::Signpost, "Signpost"),
@@ -2657,7 +2738,13 @@ fn fork_form_annotations_start_from_their_starter_text_and_upstream_form_starts_
             }
             let clicks = [(200.0, 260.0), (420.0, 150.0)];
             let mut update = Default::default();
-            for &(x, y) in &clicks[..kind.anchor_count()] {
+            // A signpost drops from one click (its preset places the second point).
+            let count = if kind == DrawingKind::Signpost {
+                1
+            } else {
+                kind.anchor_count()
+            };
+            for &(x, y) in &clicks[..count] {
                 update = chart.drawing_tool_activate(x, y, DrawingModifiers::default());
             }
             let crate::DrawingCreationUpdate {
@@ -2673,12 +2760,9 @@ fn fork_form_annotations_start_from_their_starter_text_and_upstream_form_starts_
                 expected,
                 "{kind:?} {armed}"
             );
-            // Placement opens the editor on it; a signpost only in fork form.
-            assert_eq!(
-                request_text_edit,
-                kind != DrawingKind::Signpost || !expected.is_empty(),
-                "{kind:?} {armed}"
-            );
+            // Placement opens the editor on it in either form (upstream's signpost now requests
+            // it too, superseding A7).
+            assert!(request_text_edit, "{kind:?} {armed}");
             assert_eq!(chart.drawing_requests_text_edit(id), request_text_edit);
         }
     }
@@ -2822,8 +2906,31 @@ fn indexed_hit_testing_matches_brute_force_for_every_fork_form_tool() {
     assert!(hits > 100, "the grid meets the drawings ({hits} hits)");
 }
 
+/// The rounded boxes a frame paints (bitmap px): left, top, right, bottom, and fill.
+fn round_rects(chart: &mut ChartEngine) -> Vec<(f64, f64, f64, f64, Color)> {
+    let frame = chart.build_frame();
+    frame.panes[0]
+        .main
+        .iter()
+        .filter_map(|prim| match prim {
+            Prim::RoundRect {
+                x, y, w, h, fill, ..
+            } => Some((
+                f64::from(*x),
+                f64::from(*y),
+                f64::from(*x + *w),
+                f64::from(*y + *h),
+                *fill,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn text_annotations_stack_multi_line_text_in_one_box() {
+    // Owner decision R9 on upstream's box (the shared annotation layout): one run per line in
+    // one box that grows from its fixed edge, one editor, the caret on its own line.
     let mut chart = chart();
     let id = add(
         &mut chart,
@@ -2831,22 +2938,22 @@ fn text_annotations_stack_multi_line_text_in_one_box() {
         vec![p(15.0, 103.0)],
         r#"{"text":"first\nsecond"}"#,
     );
-    let size = chart.drawing_text_size(chart.drawing(id).unwrap());
+    let drawing = chart.drawing(id).unwrap().clone();
+    let size = chart.drawing_text_size(&drawing);
     let runs = text_runs(&mut chart);
     let (_, x1, y1, _) = run_of(&runs, "first");
     let (_, x2, y2, _) = run_of(&runs, "second");
     assert_eq!(runs.len(), 2, "one run per line: {runs:?}");
     assert!((x1 - x2).abs() < 1e-3 && ((y2 - y1) - size * 1.2).abs() < 1e-3);
-    // One box covers both lines, centered on the anchor (Middle).
+    // One box covers both lines and hangs from the (legacy one-anchor) note's anchor.
     let anchor_y = anchor(&chart, id, 0).1;
-    assert!(((y1 + y2) / 2.0 - anchor_y).abs() < 1e-3);
-    let boxes = rects(&mut chart);
-    let tint = Color::parse_css("#facc1533").unwrap();
-    let boxes = boxes
-        .iter()
-        .filter(|rect| rect.4 == tint)
+    let fill = chart.annotation_paint(&drawing).fill;
+    let boxes = round_rects(&mut chart)
+        .into_iter()
+        .filter(|rect| rect.4 == fill)
         .collect::<Vec<_>>();
     assert_eq!(boxes.len(), 1);
+    assert!((boxes[0].1 - anchor_y).abs() <= 0.5);
     assert!(boxes[0].1 < y1 - size * 0.6 && boxes[0].3 > y2 + size * 0.6);
     // The second line is a target; the editor is multi-line on the painted lines.
     assert_eq!(hit(&chart, x2 + 2.0, *y2), Some(id));
@@ -2857,7 +2964,7 @@ fn text_annotations_stack_multi_line_text_in_one_box() {
     // The native caret stands on its own line.
     assert!(chart.begin_drawing_text_edit(id, true));
     let frame = chart.build_frame();
-    let ink_color = chart.drawing_label_color(chart.drawing(id).unwrap());
+    let ink_color = chart.annotation_paint(&drawing).text_color(&drawing, false);
     let caret = frame.panes[0]
         .main
         .iter()
@@ -2869,28 +2976,102 @@ fn text_annotations_stack_multi_line_text_in_one_box() {
     let center = f64::from(caret.y) + f64::from(caret.h) / 2.0;
     assert!((center - y2).abs() <= 1.0, "{center} vs {y2}");
     assert!(chart.cancel_drawing_text_edit());
-    // A single line paints upstream's one centered run.
+    // A single line paints upstream's one left-aligned run in the box.
     assert!(chart.drawing_apply_options(id, r#"{"text":"single"}"#));
     let frame = chart.build_frame();
     assert!(frame.panes[0].main.iter().any(|prim| matches!(
         prim,
-        Prim::Text { text, align: TextAlign::Center, .. } if text == "single"
+        Prim::Text { text, align: TextAlign::Left, .. } if text == "single"
     )));
-    // Culling covers every line: a five-line note above its anchor, which sits below the pane,
-    // still paints its upper lines.
+    // Culling covers every line: a five-line comment, which grows up from its anchor below the
+    // pane, still paints its upper lines.
     let bottom = chart.panes[0].top + chart.panes[0].height;
     let below = chart
         .drawing_from_px_for(0, crate::DrawingPriceScale::Right, 300.0, bottom + 40.0)
         .unwrap();
     let tall = add(
         &mut chart,
-        DrawingKind::Note,
+        DrawingKind::Comment,
         vec![below],
-        r#"{"text":"1\n2\n3\n4\n5","text_v_align":"top"}"#,
+        r#"{"text":"1\n2\n3\n4\n5"}"#,
     );
     let runs = text_runs(&mut chart);
     assert!(run_of(&runs, "1").2 < bottom);
     assert!(chart.drawing_viewport_candidate_reference(chart.drawing(tall).unwrap()));
+}
+
+#[test]
+fn two_line_box_annotations_align_text_editor_caret_and_hit_at_every_pixel_ratio() {
+    // The shared annotation layout feeds the painted lines, the editor, the painted caret, and
+    // the hit box, so a two-line note, comment, and callout agree on all four at DPR 1 and 2.
+    for dpr in [1.0, 2.0] {
+        for (kind, points) in [
+            (DrawingKind::Note, vec![p(10.0, 101.0), p(15.0, 103.0)]),
+            (DrawingKind::Comment, vec![p(15.0, 103.0)]),
+            (DrawingKind::Callout, vec![p(10.0, 101.0), p(15.0, 103.0)]),
+        ] {
+            let mut chart = chart_with(&hourly(40), dpr);
+            let id = add(&mut chart, kind, points, r#"{"text":"first\nsecond"}"#);
+            let drawing = chart.drawing(id).unwrap().clone();
+            let size = chart.drawing_text_size(&drawing);
+            let runs = text_runs(&mut chart);
+            let (_, x1, y1, _) = run_of(&runs, "first");
+            let (_, x2, y2, _) = run_of(&runs, "second");
+            let (x1, y1, x2, y2) = (x1 / dpr, y1 / dpr, x2 / dpr, y2 / dpr);
+            assert!((x1 - x2).abs() < 1e-3, "{kind:?} {dpr}");
+            assert!(((y2 - y1) - size * 1.2).abs() < 1e-3, "{kind:?} {dpr}");
+            // The editor sits on the painted lines and its box holds both.
+            let layout = chart.drawing_text_edit_layout(id).unwrap();
+            assert!(layout.multiline, "{kind:?}");
+            assert!(
+                (layout.x - x1).abs() < 1e-3 && (layout.y - y1).abs() < 1e-3,
+                "{kind:?} {dpr}: {layout:?} vs {x1},{y1}"
+            );
+            assert!((layout.line_height - size * 1.2).abs() < 1e-9);
+            let [left, top, right, bottom] = layout.rect;
+            assert!(
+                top < y1 - size * 0.6 && bottom > y2 + size * 0.6,
+                "{kind:?}"
+            );
+            // The painted box is that rect, snapped to device px.
+            let fill = chart.annotation_paint(&drawing).fill;
+            assert!(
+                round_rects(&mut chart).iter().any(|rect| rect.4 == fill
+                    && (rect.0 / dpr - left).abs() <= 1.0
+                    && (rect.1 / dpr - top).abs() <= 1.0
+                    && (rect.3 / dpr - bottom).abs() <= 1.0),
+                "{kind:?} {dpr}"
+            );
+            // Both lines, and nothing just right of the box at the second line, are targets
+            // exactly as painted.
+            assert_eq!(hit(&chart, x2 + 2.0, y2), Some(id), "{kind:?} {dpr}");
+            assert_eq!(hit(&chart, x1 + 2.0, y1), Some(id), "{kind:?} {dpr}");
+            assert_eq!(hit(&chart, right + 4.0, y2), None, "{kind:?} {dpr}");
+            // The painted caret at the end stands on the second line, in the text's ink.
+            assert!(chart.begin_drawing_text_edit(id, true));
+            let ink = chart.annotation_paint(&drawing).text_color(&drawing, false);
+            let frame = chart.build_frame();
+            let caret = frame.panes[0]
+                .main
+                .iter()
+                .find_map(|prim| match prim {
+                    Prim::Rect { rect, color } if *color == ink && rect.w == dpr.round() as i32 => {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{kind:?} {dpr}: a caret bar"));
+            let center = (f64::from(caret.y) + f64::from(caret.h) / 2.0) / dpr;
+            assert!(
+                (center - y2).abs() <= 1.0,
+                "{kind:?} {dpr}: {center} vs {y2}"
+            );
+            assert!(
+                f64::from(caret.x) / dpr > x2,
+                "{kind:?} {dpr}: after the prefix"
+            );
+        }
+    }
 }
 
 /// `count` hourly bars whose highs and lows vary bar to bar, and their OHLC columns.

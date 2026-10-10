@@ -279,7 +279,8 @@ pub(crate) fn label_gap(scale: f64) -> f64 {
 
 /// Conservative CSS-px reach of the level labels beyond a level arm's lines (the culling pad, see
 /// [`super::upstream_decoration_extent`]): the widest label plus the gap and four ems of slack,
-/// since price text follows the scale's formatter between text-key refreshes. Every kind the
+/// since price text follows the scale's formatter between text-key refreshes, or the farthest a
+/// label kept clear of its strokes can step out, whichever is larger. Every kind the
 /// Fibonacci, time-level and Fibonacci-arc arms paint (the Gann fan shares the Fibonacci arm);
 /// 0 without a labeled level.
 pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing) -> f64 {
@@ -316,7 +317,15 @@ pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing
     if width <= 0.0 {
         return 0.0;
     }
-    LABEL_GAP + width + 4.0 * size
+    // A label kept clear of its own strokes (an arc's, a sloped level's centered one) steps out
+    // at most `clear_label_max_reach` from its point, plus half its box.
+    let cleared = crate::drawings::clear_label_max_reach(
+        width,
+        size * 1.2,
+        crate::drawings::POINT_LABEL_GAP_CSS,
+    ) + width / 2.0
+        + size * 0.6;
+    (LABEL_GAP + width + 4.0 * size).max(cleared)
 }
 
 fn descriptor(

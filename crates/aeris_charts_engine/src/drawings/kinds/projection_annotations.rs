@@ -6,8 +6,9 @@
 //! Upstream renders the catalog's projection and annotation tools (forecast, bars pattern,
 //! projection, anchored text, note, price note, callout, comment, price label, signpost, flag mark,
 //! arrow markers, icon stamp). This module keeps the data readers re-applied on upstream's
-//! forecast ([`forecast_status`], memoized in [`ForecastMemo`]), the built-in vector icon glyphs
-//! upstream's icon stamp falls back to ([`built_in_icon_parts`]), the fork's public option block
+//! forecast ([`forecast_status`], memoized in [`ForecastMemo`]), the fork's vector glyphs upstream's
+//! icon stamp falls back to for the names its solid suite lacks ([`ForkGlyph`],
+//! [`fork_glyph_parts`]), the fork's public option block
 //! ([`ProjectionAnnotationToolOptions`], [`BarsPatternMode`], [`DrawingIcon`]), for documents the
 //! fork wrote its pre-merge kind defaults ([`legacy_defaults`]), and the fork form those
 //! documents' block selects on upstream's lowering ([`fork_form`]): its predicates, its text boxes
@@ -60,8 +61,9 @@ pub enum BarsPatternMode {
     LineClose,
 }
 
-/// The bounded built-in icon set: the fork's `icon` tool stamps, and the vector glyphs upstream's
-/// icon stamp paints for these names when no raster of that name is registered.
+/// The bounded built-in icon set: the fork's `icon` tool stamps. Upstream's icon stamp paints the
+/// vector glyph of the four names its built-in solid suite lacks (check, cross, triangle up and
+/// down) when no raster of that name is registered; the other five paint the suite's icon.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DrawingIcon {
@@ -207,8 +209,6 @@ const ANNOTATION_HEAD: f64 = 5.0;
 const ANNOTATION_HEAD_HALF: f64 = 4.0;
 /// Icon stroke width as a fraction of the icon size (check and cross).
 const ICON_STROKE: f64 = 0.14;
-/// Heart outline samples.
-const HEART_SAMPLES: usize = 48;
 
 /// Shared placement and editing behavior; every spec below overrides its identity.
 const TOOL: DrawingToolSpec = DrawingToolSpec {
@@ -230,7 +230,6 @@ const TOOL: DrawingToolSpec = DrawingToolSpec {
     family: Some(&FAMILY),
     text_layout: DrawingTextLayout::Box,
     axis_price_label: false,
-    price_tick_snap: false,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
 };
@@ -246,7 +245,6 @@ pub(crate) const PRICE_RANGE: DrawingToolSpec = DrawingToolSpec {
     wire_id: 13,
     name: "price_range",
     // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
-    price_tick_snap: true,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
     ..TOOL
@@ -257,7 +255,6 @@ pub(crate) const DATE_RANGE: DrawingToolSpec = DrawingToolSpec {
     wire_id: 14,
     name: "date_range",
     // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
-    price_tick_snap: true,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
     ..TOOL
@@ -268,7 +265,6 @@ pub(crate) const DATE_PRICE_RANGE: DrawingToolSpec = DrawingToolSpec {
     wire_id: 15,
     name: "date_price_range",
     // Anchors snap to whole bars and price ticks so the statistics read integral bars and ticks.
-    price_tick_snap: true,
     anchor_link: DrawingAnchorLink::None,
     axis_tag_text: false,
     ..TOOL
@@ -370,14 +366,15 @@ pub(super) fn legacy_defaults(drawing: &mut Drawing) {
 
 /// The fork-form marker (see `kinds::legacy_fork_tool_options`): an empty
 /// `tool_options.projection_annotation` block on the annotations whose fork look (projection
-/// sector, note pin, speech bubbles, boxed price note, signpost plate and pole editor, arrow-mark
-/// text, forecast boxes) upstream does not draw. The block's presence selects that look on
-/// upstream's lowering, so documents the fork wrote keep it and new drawings keep upstream's.
+/// sector, note pin, speech bubbles, boxed price note, signpost plate and pole, arrow-mark text,
+/// forecast boxes) upstream does not draw. The block's presence selects that look on upstream's
+/// lowering, so documents the fork wrote keep it and new drawings keep upstream's.
 pub(super) fn legacy_tool_options(kind: DrawingKind) -> Option<(&'static str, serde_json::Value)> {
     fork_form_kind(kind).then(|| ("projection_annotation", serde_json::json!({})))
 }
 
-/// The upstream annotation kinds with a fork look the fork-form marker selects.
+/// The upstream annotation kinds with a fork look the fork-form marker selects. The icon stamp has
+/// none: its glyph follows its name alone (owner question Q1, answer A).
 const fn fork_form_kind(kind: DrawingKind) -> bool {
     matches!(
         kind,
@@ -400,11 +397,13 @@ const fn fork_form_kind(kind: DrawingKind) -> bool {
 // Owner decision A1: an upstream annotation whose `tool_options.projection_annotation` block is
 // present takes the fork's look, layered on upstream's lowering: the projection's sector and
 // stats box (A2), the note's pin and focus-revealed box, the comment's and the price label's
-// speech bubbles (A5), the price note's boxed price (A4), the signpost's plate and its editor on
-// placement (A7), the arrow marks' text past the tail, and the forecast's boxes (A10). The pin,
-// the tail and the sector are body geometry (`geometry.rs`); the boxes are the drawing's text
-// block, painted by the frame's one text pass ([`fork_text_box`]). New drawings carry no block
-// and keep upstream's rendering; documents the fork wrote get it at restore.
+// speech bubbles (A5), the price note's boxed price on its pane-wide line (A4), the signpost's
+// plate on its pole, the arrow marks' text past the solid arrow's tail, and the forecast's boxes
+// (A10). The fork's note and price note have one anchor ([`fork_form`]). The pin, the tail, the
+// pole and the sector are body geometry (`geometry.rs`); the boxes are the drawing's text block,
+// painted by the frame's one text pass ([`fork_text_box`]). New drawings carry no block and keep
+// upstream's rendering; documents the fork wrote get it at restore. (A7, the signpost's editor on
+// placement, is upstream's own behaviour now.)
 
 /// Note pin: head radius, head center height above the tip, and inner dot radius (CSS px).
 pub(crate) const NOTE_HEAD_RADIUS: f64 = 7.0;
@@ -416,13 +415,18 @@ pub(crate) const TAIL_WIDTH: f64 = 10.0;
 /// Pole a signpost with coincident anchors stands up from its foot (CSS px): the fork's
 /// one-anchor signpost, which restore converts to two coincident anchors.
 pub(crate) const SIGNPOST_POLE: f64 = 40.0;
-/// Upstream's marker glyph radius (CSS px; `geometry.rs` `MarkerGeometry`).
+/// The signpost pennant's radius (CSS px; `geometry.rs` `MarkerGeometry`).
 const MARKER_RADIUS: f64 = 7.0;
 
 /// Whether `drawing` takes its kind's fork look (owner decision A1): the
 /// `tool_options.projection_annotation` block is present on an annotation kind that has one.
+/// The fork's note and price note have exactly one anchor; with two (upstream's pin-and-box note
+/// and tag-and-line price note) the block stays stored but inert and upstream's box paints.
 pub(crate) fn fork_form(drawing: &Drawing) -> bool {
-    drawing.tool_options.projection_annotation.is_some() && fork_form_kind(drawing.kind)
+    drawing.tool_options.projection_annotation.is_some()
+        && fork_form_kind(drawing.kind)
+        && !(matches!(drawing.kind, DrawingKind::Note | DrawingKind::PriceNote)
+            && drawing.points.len() != 1)
 }
 
 /// Whether the fork form paints `drawing`'s text as a box ([`fork_text_box`]) instead of
@@ -444,11 +448,14 @@ pub(crate) fn fork_text_owner(drawing: &Drawing) -> bool {
         )
 }
 
-/// Caller px of the pole a signpost with coincident anchors stands (0 otherwise), at `scale`
-/// caller px per CSS px. Coincidence is a data predicate, so the pole never switches with zoom.
+/// Caller px of the pole a fork-form signpost with coincident anchors stands (0 otherwise), at
+/// `scale` caller px per CSS px. Coincidence is a data predicate, so the pole never switches with
+/// zoom; an upstream-form signpost draws its own post between its anchors.
 pub(crate) fn signpost_pole(drawing: &Drawing, scale: f64) -> f64 {
     match drawing.points.as_slice() {
-        [foot, top] if drawing.kind == DrawingKind::Signpost && foot == top => {
+        [foot, top]
+            if drawing.kind == DrawingKind::Signpost && foot == top && fork_form(drawing) =>
+        {
             SIGNPOST_POLE * scale
         }
         _ => 0.0,
@@ -463,19 +470,14 @@ pub(crate) fn starter_text(drawing: &Drawing) -> Option<&'static str> {
         return None;
     }
     match drawing.kind {
-        DrawingKind::Note => Some("Note"),
+        // A two-anchor note is upstream's box even with the block ([`fork_form`]).
+        DrawingKind::Note if fork_form(drawing) => Some("Note"),
         DrawingKind::Comment => Some("Comment"),
         DrawingKind::Callout => Some("Callout"),
         DrawingKind::Signpost => Some("Signpost"),
         DrawingKind::AnchoredText => Some("Text"),
         _ => None,
     }
-}
-
-/// Whether placing `drawing` opens the text editor beyond its spec's flag: a fork-form signpost
-/// (owner decision A7).
-pub(crate) fn requests_text_editor(drawing: &Drawing) -> bool {
-    drawing.kind == DrawingKind::Signpost && fork_form(drawing)
 }
 
 /// Whether `drawing` paints parts only while focused (hovered or selected): a fork-form note
@@ -634,16 +636,14 @@ pub(crate) fn fork_text_box(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
                 0,
             );
         }
-        Body::Marker(marker) => {
+        Body::IconStamp { center, size } => {
             let Some(direction) = arrow_direction(drawing.kind) else {
                 return;
             };
-            // Past the tail of upstream's glyph (its length is twice its radius).
-            let back = 2.0 * marker.radius + LABEL_GAP * s / 2.0;
-            let anchor = (
-                marker.anchor.0 - direction.0 * back,
-                marker.anchor.1 - direction.1 * back,
-            );
+            // Past the tail edge of upstream's solid arrow icon (its box's far side from the
+            // tip), so the text follows the icon's size.
+            let back = size / 2.0 + LABEL_GAP * s / 2.0;
+            let anchor = (center.0 - direction.0 * back, center.1 - direction.1 * back);
             let alignment = match direction {
                 (_, y) if y < 0.0 => (DrawingTextHAlign::Center, DrawingTextVAlign::Top),
                 (_, y) if y > 0.0 => (DrawingTextHAlign::Center, DrawingTextVAlign::Bottom),
@@ -1156,13 +1156,41 @@ fn simple_annotation(ctx: &PartContext<'_>, parts: &mut DrawingParts) {
     );
 }
 
-/// A built-in icon's vector glyph centered on `center`, `size` caller px across, in the drawing
-/// color: upstream's icon stamp paints it when no raster is registered under a built-in name.
-/// Filled icons are one convex polygon, a disc, or a fan around their center (star, heart:
-/// star-shaped outlines), so paint and hit test cover exactly the icon.
-pub(crate) fn built_in_icon_parts(
+/// The fork's vector glyphs that still paint: those of the four built-in names the solid icon
+/// suite lacks. Every other built-in name paints the suite's icon of that name, saved stamps
+/// included (owner question Q1, answer A).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForkGlyph {
+    Check,
+    Cross,
+    TriangleUp,
+    TriangleDown,
+}
+
+impl ForkGlyph {
+    /// The glyph a stamp named `name` paints when no raster of that name is registered; `None`
+    /// for a name the suite paints or one that names no built-in icon.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match DrawingIcon::from_name(name)? {
+            DrawingIcon::Check => Some(Self::Check),
+            DrawingIcon::Cross => Some(Self::Cross),
+            DrawingIcon::TriangleUp => Some(Self::TriangleUp),
+            DrawingIcon::TriangleDown => Some(Self::TriangleDown),
+            DrawingIcon::Star
+            | DrawingIcon::Heart
+            | DrawingIcon::Circle
+            | DrawingIcon::Square
+            | DrawingIcon::Diamond => None,
+        }
+    }
+}
+
+/// A fork glyph centered on `center`, `size` caller px across, in the drawing color: check and
+/// cross are two strokes, the triangles one convex polygon, so paint and hit test cover exactly
+/// the icon.
+pub(crate) fn fork_glyph_parts(
     ctx: &PartContext<'_>,
-    icon: DrawingIcon,
+    glyph: ForkGlyph,
     center: Point,
     size: f64,
     parts: &mut DrawingParts,
@@ -1172,70 +1200,23 @@ pub(crate) fn built_in_icon_parts(
         size / ctx.scale.max(f64::EPSILON) * ICON_STROKE,
         LineStyle::Solid,
     );
-    match icon {
-        DrawingIcon::Circle => parts.disc(center, size * 0.5, None),
-        DrawingIcon::Square => parts.fill_convex(
-            &[at(-0.4, -0.4), at(0.4, -0.4), at(0.4, 0.4), at(-0.4, 0.4)],
-            None,
-            true,
-        ),
-        DrawingIcon::Diamond => parts.fill_convex(
-            &[at(0.0, -0.5), at(0.5, 0.0), at(0.0, 0.5), at(-0.5, 0.0)],
-            None,
-            true,
-        ),
-        DrawingIcon::TriangleUp => {
+    match glyph {
+        ForkGlyph::TriangleUp => {
             parts.fill_convex(&[at(0.0, -0.45), at(0.5, 0.4), at(-0.5, 0.4)], None, true)
         }
-        DrawingIcon::TriangleDown => {
+        ForkGlyph::TriangleDown => {
             parts.fill_convex(&[at(0.0, 0.45), at(-0.5, -0.4), at(0.5, -0.4)], None, true)
         }
-        DrawingIcon::Check => parts.stroke(
+        ForkGlyph::Check => parts.stroke(
             &[at(-0.36, 0.02), at(-0.1, 0.28), at(0.4, -0.3)],
             stroke,
             false,
         ),
-        DrawingIcon::Cross => {
+        ForkGlyph::Cross => {
             parts.stroke(&[at(-0.32, -0.32), at(0.32, 0.32)], stroke, false);
             parts.stroke(&[at(-0.32, 0.32), at(0.32, -0.32)], stroke, false);
         }
-        DrawingIcon::Star => {
-            let outline = (0..=10)
-                .map(|step| {
-                    let angle =
-                        -std::f64::consts::FRAC_PI_2 + step as f64 * std::f64::consts::PI / 5.0;
-                    let radius = if step % 2 == 0 { 0.5 } else { 0.2 };
-                    at(radius * angle.cos(), radius * angle.sin())
-                })
-                .collect::<Vec<_>>();
-            fan(parts, center, &outline);
-        }
-        DrawingIcon::Heart => {
-            // The parametric heart (x = 16 sin³t, y = 13 cos t − 5 cos 2t − 2 cos 3t − cos 4t, y
-            // up) spans 34 × 29 units around a point it is star-shaped from.
-            let kernel = at(0.0, 0.05);
-            let outline = (0..=HEART_SAMPLES)
-                .map(|step| {
-                    let t = std::f64::consts::TAU * step as f64 / HEART_SAMPLES as f64;
-                    let x = 16.0 * t.sin().powi(3);
-                    let y = 13.0 * t.cos()
-                        - 5.0 * (2.0 * t).cos()
-                        - 2.0 * (3.0 * t).cos()
-                        - (4.0 * t).cos();
-                    at(x / 34.0, -(y + 2.5) / 34.0)
-                })
-                .collect::<Vec<_>>();
-            fan(parts, kernel, &outline);
-        }
     }
-}
-
-/// Fill a closed outline that is star-shaped from `kernel` as one region: the ribbon between the
-/// kernel (repeated) and the outline is a triangle fan, so the executors paint the outline and the
-/// hit test covers exactly its triangles.
-fn fan(parts: &mut DrawingParts, kernel: Point, outline: &[Point]) {
-    let hub = vec![kernel; outline.len()];
-    parts.fill(&hub, outline, None, true);
 }
 
 // --- culling ------------------------------------------------------------------------------------
@@ -1309,6 +1290,7 @@ pub(crate) fn follow_anchor_drag(
     let coincident = matches!(start_points, [foot, top] if foot == top);
     if index == 0
         && drawing.kind == DrawingKind::Signpost
+        && fork_form(drawing)
         && coincident
         && let [foot, top, ..] = points
     {
@@ -1399,7 +1381,8 @@ pub(crate) fn upstream_decoration_extent(engine: &ChartEngine, drawing: &Drawing
         | DrawingKind::ArrowMarkerDown
         | DrawingKind::ArrowMarkerLeft
         | DrawingKind::ArrowMarkerRight => {
-            2.0 * MARKER_RADIUS
+            // The icon box reaches its full size from the tip, then the text sits past it.
+            drawing.icon_size
                 + LABEL_GAP / 2.0
                 + box_reach(engine, drawing, &text(), size, (0.0, 0.0), 0.0)
         }

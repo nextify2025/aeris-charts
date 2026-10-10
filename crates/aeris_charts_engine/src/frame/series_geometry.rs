@@ -1989,6 +1989,32 @@ impl ChartEngine {
         }
     }
 
+    /// The live price line's horizontal span in bitmap px. A full line crosses the pane; a
+    /// partial one runs from the latest bar (`bar_x`) to the edge where the series' price scale
+    /// and its last-value label sit, so it keeps meeting the label wherever that scale is placed.
+    /// `None` when a partial line has no bar or no length.
+    fn live_price_line_span(
+        series: &crate::SeriesEntry,
+        pane: &crate::Pane,
+        bar_x: Option<i32>,
+        width: i32,
+    ) -> Option<(i32, i32)> {
+        match series.price_line_extent {
+            crate::PriceLineExtent::Full => Some((0, width)),
+            crate::PriceLineExtent::Partial => {
+                let bar_x = bar_x?;
+                let left = pane.scale_side(series_scale_target(series))
+                    == Some(crate::PriceScaleSide::Left);
+                let (x0, x1) = if left {
+                    (0, bar_x.min(width))
+                } else {
+                    (bar_x.max(0), width)
+                };
+                (x0 < x1).then_some((x0, x1))
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)] // per-pane signature shared with the other builders
     pub(super) fn build_last_value_line_frame(
         &self,
@@ -2031,22 +2057,20 @@ impl ChartEngine {
                     continue;
                 };
                 let color = self.effective_series_live_color(series, last.color);
-                let x0 = match series.price_line_extent {
-                    crate::PriceLineExtent::Full => 0,
-                    crate::PriceLineExtent::Partial => {
-                        let Some(logical) = self.time_to_index(last.time as f64, false) else {
-                            continue;
-                        };
+                let Some((x0, x1)) = Self::live_price_line_span(
+                    series,
+                    pane,
+                    self.time_to_index(last.time as f64, false).map(|logical| {
                         (self.time_scale.index_to_coordinate(logical) * hpr).round() as i32
-                    }
-                };
-                if x0 >= width {
+                    }),
+                    width,
+                ) else {
                     continue;
-                }
+                };
                 out.push(Prim::HLine {
                     y: (scale.price_to_coordinate(last.value, base_value) * vpr).round() as i32,
                     x0,
-                    x1: width,
+                    x1,
                     width: 1f64.max((series.price_line_width * hpr).floor()) as i32,
                     style: crate::line_style_from_u8(series.price_line_style),
                     color,
@@ -2089,22 +2113,20 @@ impl ChartEngine {
                 series,
                 self.series_bar_color(series, plot, row, baseline),
             );
-            let x0 = match series.price_line_extent {
-                crate::PriceLineExtent::Full => 0,
-                crate::PriceLineExtent::Partial => {
-                    let Some(logical) = plot.index_at(row) else {
-                        continue;
-                    };
+            let Some((x0, x1)) = Self::live_price_line_span(
+                series,
+                pane,
+                plot.index_at(row).map(|logical| {
                     (self.time_scale.index_to_coordinate(logical) * hpr).round() as i32
-                }
-            };
-            if x0 >= width {
+                }),
+                width,
+            ) else {
                 continue;
-            }
+            };
             out.push(Prim::HLine {
                 y: (scale.price_to_coordinate(close, base_value) * vpr).round() as i32,
                 x0,
-                x1: width,
+                x1,
                 // reference horizontal-line-renderer.ts:65 scales lineWidth by the HORIZONTAL ratio
                 // (kept verbatim, including the ratio choice).
                 width: 1f64.max((series.price_line_width * hpr).floor()) as i32,
@@ -2262,8 +2284,10 @@ impl ChartEngine {
         out: &mut Vec<Prim>,
     ) {
         const ANCHOR_RADIUS: f64 = 3.0;
-        const ANCHOR_BORDER_WIDTH: f64 = 1.0;
+        const ANCHOR_BORDER_WIDTH: f64 = 0.75;
         const ANCHOR_BORDER: Color = PRIMARY;
+        // A light ring: whole device pixels, at least one (1 px at 1x and 2x, 2 px at 3x).
+        let border = (ANCHOR_BORDER_WIDTH * vpr).floor().max(1.0);
         let pane = &self.panes[pane_index];
         let anchor_fill = || {
             let fallback = aeris_charts_core::style::DEFAULT_SURFACE_RGB;
@@ -2282,7 +2306,7 @@ impl ChartEngine {
             out.push(Prim::Circle {
                 cx,
                 cy,
-                radius: ((ANCHOR_RADIUS + ANCHOR_BORDER_WIDTH) * vpr) as f32,
+                radius: (ANCHOR_RADIUS * vpr + border) as f32,
                 fill: ANCHOR_BORDER,
                 stroke_width: 0.0,
                 stroke: ANCHOR_BORDER,

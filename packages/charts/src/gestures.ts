@@ -182,9 +182,8 @@ export function install_gestures(chart: chart_impl): () => void {
     wasm.controller_pointer_move(event.pointerId, position.x, position.y,
       event.timeStamp || performance.now(), (event.buttons & 1) !== 0,
       flags(device_code(event.pointerType), event));
-    // The browser already delivers one move per display frame, so a captured stroke takes this
-    // sample now instead of waiting for a prepaint flush that DOM hosts do not have.
-    wasm.controller_flush_coalesced_input();
+    // A captured stroke's coalesced sample reports a pending frame, and frame construction
+    // applies it, so the repaint below draws the stroke live.
     sync_controller_pointer();
   };
   const on_up = (event: PointerEvent) => {
@@ -270,7 +269,6 @@ export function install_gestures(chart: chart_impl): () => void {
       const position = local_xy(touch);
       wasm.controller_pointer_move(touch.identifier, position.x, position.y,
         event.timeStamp || performance.now(), true, packed);
-      wasm.controller_flush_coalesced_input();
     }
     sync_controller_pointer();
   };

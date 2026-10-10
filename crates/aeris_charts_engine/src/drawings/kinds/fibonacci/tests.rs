@@ -8,6 +8,7 @@ use aeris_charts_render::color::Color;
 use aeris_charts_render::draw_list::{LineStyle, Prim, TextAlign};
 
 use super::super::super::DrawingTextLayout;
+use super::super::super::tests::on_tick;
 use super::{FibonacciLabelHAlign, FibonacciToolOptions};
 use crate::{
     ChartEngine, DrawingId, DrawingKind, DrawingMagnetMode, DrawingModifiers, DrawingPoint,
@@ -298,10 +299,10 @@ fn three_anchor_previews_show_their_first_leg_before_the_second_click() {
         let (a, b) = ((200.0, 260.0), (420.0, 150.0));
         chart.drawing_tool_activate(a.0, a.1, DrawingModifiers::default());
         chart.drawing_tool_pointer_move(b.0, b.1, DrawingModifiers::default(), false);
-        // Both ends land on the bar slots under the pointer, at the raw prices.
+        // Both ends land on the bar slots under the pointer, on the price ticks.
         let slot = |(x, y): (f64, f64)| {
             let logical = chart.coordinate_to_logical(x).unwrap().round();
-            (x_of(&chart, logical), y)
+            (x_of(&chart, logical), on_tick(&chart, y))
         };
         let leg = [slot(a), slot(b)];
         let lines = Scene::of(&mut chart).runs(css(INK));
@@ -1239,7 +1240,8 @@ fn full_circles_turn_speed_arcs_into_rings() {
 }
 
 /// `label_v_align` moves the price labels above, onto (beside the line's end) or below their
-/// lines, and the time labels to the pane's top, middle or bottom; unset is upstream's top row.
+/// lines, and the time labels to the pane's top, middle or bottom; unset is upstream's top row,
+/// which clears its level line by the point-label gap plus 0.6 em.
 #[test]
 fn label_v_align_places_level_labels() {
     let mut chart = chart();
@@ -1251,13 +1253,18 @@ fn label_v_align_places_level_labels() {
     );
     let (x0, x1) = (anchor(&chart, id, 0).0, anchor(&chart, id, 1).0);
     let y = y_of(&chart, 103.0);
+    let above = y - 4.0 - 0.6 * chart.options.get().layout.font_size;
     let half = |chart: &mut ChartEngine| Scene::of(chart).text("50.0%").unwrap();
     let (_, x, top_y, align) = half(&mut chart);
-    assert!((top_y - (y - 8.0)).abs() < 0.5 && (x - x1).abs() < 0.5 && align == TextAlign::Right);
+    assert!(
+        (top_y - above).abs() < 1e-3 && (x - x1).abs() < 0.5 && align == TextAlign::Right,
+        "{:?}",
+        (x, top_y, align)
+    );
     for (options, expected) in [
         (
             r#"{"tool_options":{"fibonacci":{"label_v_align":"top"}}}"#,
-            (x1, y - 8.0, TextAlign::Right),
+            (x1, above, TextAlign::Right),
         ),
         (
             r#"{"tool_options":{"fibonacci":{"label_v_align":"bottom"}}}"#,

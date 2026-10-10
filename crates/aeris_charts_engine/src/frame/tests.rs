@@ -7668,6 +7668,42 @@ fn price_line_family_renders_per_series_with_reference_defaults() {
 }
 
 #[test]
+fn a_partial_live_price_line_runs_toward_the_side_its_price_scale_is_on() {
+    let mut chart = two_identical_line_series();
+    chart.series[1].price_line_visible = false;
+    let span = |chart: &mut ChartEngine| {
+        let frame = chart.build_frame();
+        let width = chart.pane_w.round() as i32;
+        frame.panes[0]
+            .main
+            .iter()
+            .find_map(|prim| match prim {
+                Prim::HLine { x0, x1, color, .. } if *color == LINE => Some((*x0, *x1)),
+                _ => None,
+            })
+            .map(|span| (span, width))
+            .expect("the live price line")
+    };
+    // On the right scale: from the latest bar to the right edge.
+    let ((x0, x1), width) = span(&mut chart);
+    assert!(x0 > 0 && x1 == width, "{x0}..{x1} of {width}");
+    let bar_x = x0;
+    // On the left scale: from the left edge (its label) to the latest bar.
+    chart.set_series_price_scale(0, PriceScaleTarget::Left);
+    let ((x0, x1), _) = span(&mut chart);
+    assert_eq!(x0, 0, "the line reaches the left-side label");
+    assert!((x1 - bar_x).abs() <= 1, "{x1} vs bar {bar_x}");
+    // A named scale moved to the left side follows its side too.
+    let moved = chart
+        .add_price_scale(0, "moved", PriceScaleSide::Right, None, true)
+        .unwrap();
+    chart.set_series_price_scale(0, moved);
+    assert_eq!(span(&mut chart).0.1, span(&mut chart).1);
+    assert!(chart.move_price_scale(0, moved, PriceScaleSide::Left, 0));
+    assert_eq!(span(&mut chart).0.0, 0);
+}
+
+#[test]
 fn indicator_outputs_inherit_partial_live_price_lines() {
     let mut chart = two_identical_line_series();
     let sma = chart.add_sma(0, 2).expect("sma output");
@@ -8650,15 +8686,18 @@ fn position_square_controls_have_one_rounded_fill_and_inside_border() {
                                 .iter()
                                 .all(|radius| *radius > 0.0 && *radius == radii[0])
                         );
-                        Some(())
+                        // Squares keep small corners; the entry control is fully round.
+                        Some(radii[0] < *w / 2.0)
                     }
                     _ => None,
                 })
-                .count();
+                .collect::<Vec<_>>();
             assert_eq!(
-                squares, 3,
+                squares.iter().filter(|square| **square).count(),
+                3,
                 "one bordered rounded shape per square position control"
             );
+            assert_eq!(squares.len(), 4, "plus the round entry control");
         }
     }
 }
@@ -13805,79 +13844,96 @@ fn a_steep_label_reaching_far_past_its_anchors_paints_on_the_culled_frame_path()
 
 #[test]
 fn placement_requesting_tools_keep_anchor_handles_and_paint_no_text_chrome() {
+    use crate::drawings::DrawingHandleMode;
     use crate::{DrawingKind, DrawingPoint};
 
-    // Upstream's text annotations (note, comment, price note, anchored text) select like the text
-    // tool; the placement-requesting family tool and the callout keep their anchor handles.
+    // The placement-requesting family tool and the callout keep their anchor handles and paint
+    // no text focus border. Upstream's box annotations show their anchor handles; only the
+    // fork-form note, comment and price note (one anchor with the block) select like the text
+    // tool, as before the merge.
     let is_chrome = |color: Color| color.0 & 0xFFFF_FF00 == PRIMARY.0 & 0xFFFF_FF00;
+    // The 12 px selection handles (round or square) at dpr 1.
+    let handles = |chart: &mut ChartEngine| {
+        chart.build_frame().panes[0]
+            .main
+            .iter()
+            .filter(|prim| matches!(prim, Prim::RoundRect { w, h, .. } if *w == 12.0 && *h == 12.0))
+            .count()
+    };
+    let chrome = |chart: &mut ChartEngine| {
+        chart.build_frame().panes[0]
+            .main
+            .iter()
+            .filter(|prim| matches!(prim, Prim::RectFrame { color, .. } if is_chrome(*color)))
+            .count()
+    };
+    let point = |logical: f64, price: f64| DrawingPoint { logical, price };
     let mut chart = anchor_chart();
     let annotation = chart
         .add_drawing(
             DrawingKind::SimpleAnnotation,
             0,
-            vec![DrawingPoint {
-                logical: 2.0,
-                price: 11.0,
-            }],
+            vec![point(2.0, 11.0)],
             None,
         )
         .unwrap();
-    {
-        let (id, anchors) = (annotation, 1);
-        assert!(chart.drawing_requests_text_edit(id));
-        chart.set_selected_drawing(None);
-        let unselected = frame_discs(&mut chart).len();
-        chart.set_selected_drawing(Some(id));
-        assert_eq!(
-            frame_discs(&mut chart).len() - unselected,
-            anchors * 2,
-            "each anchor paints a border and a fill disc"
-        );
-        let chrome = chart.build_frame().panes[0]
-            .main
-            .iter()
-            .filter(|prim| matches!(prim, Prim::RectFrame { color, .. } if is_chrome(*color)))
-            .count();
-        assert_eq!(chrome, 0, "only the text tools paint the text focus border");
-    }
+    assert!(chart.drawing_requests_text_edit(annotation));
+    chart.set_selected_drawing(None);
+    assert_eq!(handles(&mut chart), 0);
+    chart.set_selected_drawing(Some(annotation));
+    assert_eq!(handles(&mut chart), 1, "one handle on its anchor");
     assert_eq!(
-        DrawingKind::Note.spec().handles,
-        crate::drawings::DrawingHandleMode::None,
-        "a note edits like the text tool"
+        chrome(&mut chart),
+        0,
+        "only the text tools paint the text focus border"
     );
-    // The callout keeps a handle on its tip and on its box (the own line's callout editing).
+    assert!(chart.remove_drawing(annotation));
+
+    let note = |chart: &mut ChartEngine, options: Option<&str>| {
+        let id = chart
+            .add_drawing(DrawingKind::Note, 0, vec![point(2.0, 11.0)], options)
+            .unwrap();
+        let mode = chart.drawing_handle_mode(chart.drawing(id).unwrap());
+        assert!(chart.remove_drawing(id));
+        mode
+    };
+    assert_eq!(
+        note(&mut chart, None),
+        DrawingHandleMode::Anchors,
+        "upstream's note shows its anchor handles"
+    );
+    assert_eq!(
+        note(
+            &mut chart,
+            Some(r#"{"tool_options":{"projection_annotation":{}}}"#)
+        ),
+        DrawingHandleMode::None,
+        "a fork-form note edits like the text tool"
+    );
+
+    // The callout keeps a handle on its tip and on its box.
     let callout = chart
         .add_drawing(
             DrawingKind::Callout,
             0,
-            vec![
-                DrawingPoint {
-                    logical: 1.0,
-                    price: 10.5,
-                },
-                DrawingPoint {
-                    logical: 3.0,
-                    price: 12.0,
-                },
-            ],
+            vec![point(1.0, 10.5), point(3.0, 12.0)],
             None,
         )
         .unwrap();
     assert!(chart.drawing_requests_text_edit(callout));
     chart.set_selected_drawing(None);
-    let unselected = frame_discs(&mut chart).len();
+    assert_eq!(handles(&mut chart), 0);
     chart.set_selected_drawing(Some(callout));
     assert_eq!(
-        frame_discs(&mut chart).len() - unselected,
-        4,
-        "the tip and the box each paint a border and a fill disc"
+        handles(&mut chart),
+        2,
+        "the tip and the box each keep a handle"
     );
-    let chrome = chart.build_frame().panes[0]
-        .main
-        .iter()
-        .filter(|prim| matches!(prim, Prim::RectFrame { color, .. } if is_chrome(*color)))
-        .count();
-    assert_eq!(chrome, 0, "only the text tools paint the text focus border");
+    assert_eq!(
+        chrome(&mut chart),
+        0,
+        "only the text tools paint the text focus border"
+    );
 }
 
 /// The circle prims in the primary pane's main layer as `(cx, radius, fill)`. With the
@@ -14110,11 +14166,18 @@ fn text_tool_selection_paints_a_focus_border_without_anchor_handles() {
     );
     assert!(chart.commit_drawing_text_edit());
 
-    // The trend line keeps its anchor handles on selection (border discs + fill discs).
+    // The trend line keeps its two anchor handles on selection, each one bordered shape.
     chart.set_selected_drawing(Some(line));
     chart.set_hovered_text(None);
-    let discs = frame_discs(&mut chart);
-    assert_eq!(discs.len(), 4, "two anchors × (border disc + fill disc)");
+    let handles = chart.build_frame().panes[0]
+        .main
+        .iter()
+        .filter(|prim| {
+            matches!(prim, Prim::RoundRect { border_color, border_width, .. }
+                if *border_color == PRIMARY && *border_width > 0.0)
+        })
+        .count();
+    assert_eq!(handles, 2, "two anchor handles");
 
     // Deselect/deshover clears everything.
     chart.set_selected_drawing(None);

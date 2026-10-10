@@ -92,6 +92,11 @@
   #controls_strip { min-width: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; padding: 0 20px; scrollbar-width: thin; scrollbar-color: var(--border-secondary) transparent; }
   #inspector .group { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 0; padding: 20px 0; border-bottom: var(--border-width) solid var(--border); scroll-margin-top: 0; }
   #inspector .group[hidden] { display: none; }
+  .icon_picker { display: grid; grid-template-columns: repeat(auto-fill, 32px); gap: 4px; flex: 1 1 100%; min-width: 0; }
+  .icon_picker button { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: var(--border-width) solid transparent; border-radius: var(--radius-small); background: transparent; color: var(--icon); }
+  .icon_picker button:hover { color: var(--icon-active); background: var(--hover-bg); }
+  .icon_picker button[aria-pressed="true"] { color: var(--primary-foreground); background: var(--primary); }
+  .icon_picker svg { width: 20px; height: 20px; }
   #inspector .group h2 { flex-basis: 100%; margin: 0 0 6px; font-size: 13px; font-weight: 600; line-height: 1.4; }
   #inspector label { display: flex; flex: 1 1 100%; gap: 8px; align-items: center; min-width: 0; min-height: 40px; color: var(--text-secondary); font-size: 12px; }
   #inspector label[hidden] { display: none; }
@@ -345,7 +350,7 @@
       <label title="Canvas primitive (plugin platform C-e): the reference vertical-line plugin example, painted with raw Canvas2D calls on the plugin overlay"><input type="checkbox" id="vertline_toggle"> canvas v-line plugin</label>
     </div>
 
-    <div class="group" id="drawings_group" data-caption="Drawings" title="Engine-owned drawing tools (industry-standard): click a tool, then click the chart to place it. Long/Short Position creates its complete position on one click; trend/rect use two anchors; Path finishes on double-click or Enter and Backspace removes its latest pending vertex. Click a drawing to select it — drag its tool-specific controls or body to edit it; Delete/Backspace removes the selection, Escape deselects/cancels. Hold Ctrl to magnet-snap the crosshair and drawing controls to the nearest bar's OHLC; hold Shift to straighten supported tools or constrain a body move to one axis.">
+    <div class="group" id="drawings_group" data-caption="Drawings" title="Engine-owned drawing tools (industry-standard): click a tool, then click the chart to place it. Long/Short Position creates its complete position on one click; trend/rect use two anchors; Path finishes on double-click or Enter and Backspace removes its latest pending vertex. Click a drawing to select it — drag its tool-specific controls or body to edit it; Delete/Backspace removes the selection, Escape deselects/cancels. Hold Ctrl to magnet-snap the crosshair and drawing controls to the nearest bar's OHLC (Ctrl/Cmd-dragging a drawing's body duplicates it instead); hold Shift to straighten supported tools or constrain a body move to one axis.">
       <h2>Drawings</h2>
       <button type="button" data-tool="trend_line" title="Trend line: two-anchor segment">trend</button>
       <button type="button" data-tool="horizontal_line" title="Horizontal line across the pane at a price">h-line</button>
@@ -363,7 +368,7 @@
       <button type="button" data-tool="info_line" title="Info line: segment with one statistics card (price change, percent, ticks, bars, duration, distance, angle)">info line</button>
       <button type="button" data-tool="trend_angle" title="Trend angle: segment with a dotted horizontal reference, an arc, and its signed screen angle">trend angle</button>
       <button type="button" data-tool="cross_line" title="Cross line: horizontal and vertical lines through one anchor">cross line</button>
-      <button type="button" data-tool="arrow_line" title="Arrow: two-anchor segment ending in an arrowhead">arrow</button>
+      <button type="button" data-tool="arrow_line" title="Arrow: two-anchor segment ending in an open chevron">arrow</button>
       <button type="button" data-tool="horizontal_segment" title="Horizontal segment: both anchors share one price">h-segment</button>
       <button type="button" data-tool="vertical_ray" title="Vertical ray: both anchors share one bar; runs through the second to the pane edge">v-ray</button>
       <button type="button" data-tool="vertical_segment" title="Vertical segment: both anchors share one bar">v-segment</button>
@@ -408,18 +413,19 @@
       <button type="button" data-tool="date_price_range" title="Date and price range: click start and end; shows price and time statistics. Shift+click (or Shift+drag) anywhere measures without a tool; click again to finish, then click or Escape to dismiss">date+price</button>
       <button type="button" data-tool="projection" title="Projection: an apex, then a target whose time and price set the projected triangle">projection</button>
       <button type="button" data-tool="anchored_text" title="Anchored text: text pinned to a pane position that stays put while the chart scrolls">anchored text</button>
-      <button type="button" data-tool="note" title="Note: one-line text at a point">note</button>
-      <button type="button" data-tool="price_note" title="Price note: one-line text at a price">price note</button>
-      <button type="button" data-tool="callout" title="Callout: text box with a pointer to a point">callout</button>
-      <button type="button" data-tool="comment" title="Comment: one-line text at a point">comment</button>
+      <button type="button" data-tool="note" title="Note: click the point, then where its text box goes (two clicks); a leader joins them">note</button>
+      <button type="button" data-tool="price_note" title="Price note: a price tag above the first click with a line to the second (two clicks)">price note</button>
+      <button type="button" data-tool="callout" title="Callout: click the point, then the box; a tinted text box with a tail to the point">callout</button>
+      <button type="button" data-tool="comment" title="Comment: speech bubble with its tail on the point">comment</button>
       <button type="button" data-tool="price_label" title="Price label: bubble above the point with its price">price label</button>
-      <button type="button" data-tool="signpost" title="Signpost: a pole marker from its foot to its top">signpost</button>
+      <button type="button" data-tool="signpost" title="Signpost: one click places a text box on a vertical post above the point">signpost</button>
       <button type="button" data-tool="flag_mark" title="Flag mark">flag</button>
-      <button type="button" data-tool="arrow_marker_up" title="Arrow marker up">arrow up</button>
-      <button type="button" data-tool="arrow_marker_down" title="Arrow marker down">arrow down</button>
-      <button type="button" data-tool="arrow_marker_left" title="Arrow marker left">arrow left</button>
-      <button type="button" data-tool="arrow_marker_right" title="Arrow marker right">arrow right</button>
-      <button type="button" data-tool="icon_stamp" title="Icon stamp from the built-in icon set">icon</button>
+      <button type="button" data-tool="arrow_marker_up" title="Arrow marker up: a solid arrow with its tip on the point; drag a corner to resize">arrow up</button>
+      <button type="button" data-tool="arrow_marker_down" title="Arrow marker down: a solid arrow with its tip on the point; drag a corner to resize">arrow down</button>
+      <button type="button" data-tool="arrow_marker_left" title="Arrow marker left: a solid arrow with its tip on the point; drag a corner to resize">arrow left</button>
+      <button type="button" data-tool="arrow_marker_right" title="Arrow marker right: a solid arrow with its tip on the point; drag a corner to resize">arrow right</button>
+      <button type="button" data-tool="icon_stamp" title="Icon stamp: a solid icon from the built-in set (pick one below); drag a corner to resize">icon</button>
+      <div id="icon_picker" class="icon_picker" role="group" aria-label="Built-in icons"></div>
       <button type="button" data-tool="simple_tag" title="Simple tag: dashed line across the pane; its axis tag shows your text or the price">simple tag</button>
       <button type="button" data-tool="simple_annotation" title="Simple annotation: dashed stem with a head under boxed text">annotation</button>
       <!-- B8: projection_annotations — end -->
@@ -1278,7 +1284,44 @@ function arm_drawing_tool(kind) {
 for (const button of drawing_tool_buttons) {
   button.addEventListener("click", () => arm_drawing_tool(button.dataset.tool));
 }
-active_chart_router.set_drawing_tool_listener(sync_drawing_tool_buttons);
+// Icon picker: the chart's built-in solid icons. Their SVG comes from the engine, so the picker
+// shows exactly what the chart paints. Picking one arms an icon stamp carrying that name.
+const icon_picker_buttons = [];
+let picked_icon_name = null;
+function sync_icon_picker(tool) {
+  if (tool !== "icon_stamp") picked_icon_name = null;
+  for (const button of icon_picker_buttons) {
+    button.setAttribute("aria-pressed", String(button.dataset.iconName === picked_icon_name));
+  }
+}
+function add_icon_picker_button(container, name, label, svg) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.dataset.iconName = name;
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.setAttribute("aria-pressed", "false");
+  button.innerHTML = svg;
+  button.addEventListener("click", () => {
+    const disarm = picked_icon_name === name && active_chart_router.active_drawing_tool() === "icon_stamp";
+    picked_icon_name = disarm ? null : name;
+    active_chart_router.set_drawing_tool(disarm ? null : "icon_stamp", {
+      ...drawing_options_from_inputs("icon_stamp"),
+      icon_name: name,
+      icon_size: 32,
+    });
+    sync_icon_picker(disarm ? null : "icon_stamp");
+  });
+  icon_picker_buttons.push(button);
+  container.append(button);
+}
+for (const icon of chart.builtin_drawing_icons()) {
+  add_icon_picker_button(document.getElementById("icon_picker"), icon.name, icon.name.replaceAll("-", " "), icon.svg);
+}
+active_chart_router.set_drawing_tool_listener((tool) => {
+  sync_drawing_tool_buttons(tool);
+  sync_icon_picker(tool);
+});
 // The toolbar follows the common selection-settings model: clicking a drawing loads
 // its style into the inputs, so a later change applies on top of the drawing's current style
 // instead of resetting the rest. (#rrggbb needed for the color inputs; other CSS forms skip.)
